@@ -1,0 +1,26 @@
+[project]
+name = "qv-bench-scripts"
+version = "0.1.0"
+description = "Reproducible Quantum Volume benchmark scripts for Clifft"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "pandas",
+    "qiskit>=1.0",
+    "qiskit-aer",
+    "qulacs",
+    "qsimcirq",
+    "ply",
+    "qiskit-qrack-provider",
+    "pyqrack",
+]
+
+# clifft is intentionally omitted because this workspace builds clifft
+# from source with CLIFFT_MAX_QUBITS=64 for better performance in the
+# qubit range used here. See README for install instructions.
+
+[project.optional-dependencies]
+plot = ["matplotlib", "rsmf>=0.2.1"]
+
+[tool.uv]
+package = false

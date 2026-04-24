@@ -1,0 +1,17 @@
+[project]
+name = "qec-bench-scripts"
+version = "0.1.0"
+description = "Reproducible QEC benchmark scripts for Clifft"
+requires-python = ">=3.12"
+dependencies = [
+    "stim",
+    "pandas",
+    "numpy",
+    "clifft==0.1.0",
+]
+
+[project.optional-dependencies]
+tsim = ["bloqade-tsim[cuda13]>=0.1.2"]
+
+[tool.uv]
+package = false

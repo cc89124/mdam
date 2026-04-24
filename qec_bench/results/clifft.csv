@@ -1,0 +1,25 @@
+benchmark,circuit,distance,rounds,phys_error_rate,shots,peak_active_k,threads,simulator,repeat,status,compile_s,sample_s,effective_shots_per_s,prep_noise,rz_angle
+clifford_bench,d=7 r=7 p=1e-3,7.0,7.0,0.001,1000000,0,16,clifft,0,SUCCESS,0.009045,7.312771,2187953.1,,
+clifford_bench,d=7 r=7 p=1e-3,7.0,7.0,0.001,1000000,0,16,clifft,1,SUCCESS,0.009045,7.321224,2185426.9,,
+clifford_bench,d=7 r=7 p=1e-3,7.0,7.0,0.001,1000000,0,16,clifft,2,SUCCESS,0.009045,7.316535,2186827.7,,
+cultivation_bench,d=3 p=1e-3,3.0,,0.001,1000000,4,16,clifft,0,SUCCESS,0.000965,1.550902,10316574.4,,
+cultivation_bench,d=3 p=1e-3,3.0,,0.001,1000000,4,16,clifft,1,SUCCESS,0.000965,1.543794,10364076.2,,
+cultivation_bench,d=3 p=1e-3,3.0,,0.001,1000000,4,16,clifft,2,SUCCESS,0.000965,1.545139,10355053.3,,
+cultivation_bench,d=5 p=1e-3,5.0,,0.001,1000000,10,16,clifft,0,SUCCESS,0.006137,50.898617,314350.4,,
+cultivation_bench,d=5 p=1e-3,5.0,,0.001,1000000,10,16,clifft,1,SUCCESS,0.006137,50.894043,314378.6,,
+cultivation_bench,d=5 p=1e-3,5.0,,0.001,1000000,10,16,clifft,2,SUCCESS,0.006137,50.895796,314367.8,,
+distillation_bench,prep=0.05,,,,1000000,5,16,clifft,0,SUCCESS,0.002013,10.603729,1508903.1,0.05,
+distillation_bench,prep=0.05,,,,1000000,5,16,clifft,1,SUCCESS,0.002013,10.63825,1504006.8,0.05,
+distillation_bench,prep=0.05,,,,1000000,5,16,clifft,2,SUCCESS,0.002013,10.612536,1507650.9,0.05,
+coherent_noise_bench,d=3 r=1 p=1e-3 rz=0.02,3.0,1.0,0.001,1000000,5,16,clifft,0,SUCCESS,0.000318,0.825017,19393551.1,,0.02
+coherent_noise_bench,d=3 r=1 p=1e-3 rz=0.02,3.0,1.0,0.001,1000000,5,16,clifft,1,SUCCESS,0.000318,0.825789,19375420.2,,0.02
+coherent_noise_bench,d=3 r=1 p=1e-3 rz=0.02,3.0,1.0,0.001,1000000,5,16,clifft,2,SUCCESS,0.000318,0.835514,19149885.2,,0.02
+coherent_noise_bench,d=3 r=3 p=1e-3 rz=0.02,3.0,3.0,0.001,1000000,8,16,clifft,0,SUCCESS,0.000503,9.593755,1667751.6,,0.02
+coherent_noise_bench,d=3 r=3 p=1e-3 rz=0.02,3.0,3.0,0.001,1000000,8,16,clifft,1,SUCCESS,0.000503,9.581465,1669890.8,,0.02
+coherent_noise_bench,d=3 r=3 p=1e-3 rz=0.02,3.0,3.0,0.001,1000000,8,16,clifft,2,SUCCESS,0.000503,9.568818,1672097.9,,0.02
+coherent_noise_bench,d=5 r=1 p=1e-3 rz=0.02,5.0,1.0,0.001,100000,13,16,clifft,0,SUCCESS,0.000931,12.021778,133091.8,,0.02
+coherent_noise_bench,d=5 r=1 p=1e-3 rz=0.02,5.0,1.0,0.001,100000,13,16,clifft,1,SUCCESS,0.000931,12.001234,133319.6,,0.02
+coherent_noise_bench,d=5 r=1 p=1e-3 rz=0.02,5.0,1.0,0.001,100000,13,16,clifft,2,SUCCESS,0.000931,12.017156,133143.0,,0.02
+coherent_noise_bench,d=5 r=5 p=1e-3 rz=0.02,5.0,5.0,0.001,20,24,16,clifft,0,SUCCESS,0.002314,469.212966,0.7,,0.02
+coherent_noise_bench,d=5 r=5 p=1e-3 rz=0.02,5.0,5.0,0.001,20,24,16,clifft,1,SUCCESS,0.002314,467.641136,0.7,,0.02
+coherent_noise_bench,d=5 r=5 p=1e-3 rz=0.02,5.0,5.0,0.001,20,24,16,clifft,2,SUCCESS,0.002314,470.543062,0.7,,0.02

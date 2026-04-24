@@ -1,0 +1,16 @@
+benchmark,circuit,distance,rounds,phys_error_rate,shots,tsim_num_graphs,threads,simulator,repeat,status,compile_s,sample_s,effective_shots_per_s,prep_noise,rz_angle
+clifford_bench,d=7 r=7 p=1e-3,7.0,7.0,0.001,1000000,674,1,tsim,0,SUCCESS,13.049254,3.177404,314722.3,,
+clifford_bench,d=7 r=7 p=1e-3,7.0,7.0,0.001,1000000,674,1,tsim,1,SUCCESS,13.049254,3.088017,323832.4,,
+clifford_bench,d=7 r=7 p=1e-3,7.0,7.0,0.001,1000000,674,1,tsim,2,SUCCESS,13.049254,3.188123,313664.2,,
+cultivation_bench,d=3 p=1e-3,3.0,,0.001,1000000,3903,1,tsim,0,SUCCESS,85.368836,35.91786,27841.3,,
+cultivation_bench,d=3 p=1e-3,3.0,,0.001,1000000,3903,1,tsim,1,SUCCESS,85.368836,35.802084,27931.3,,
+cultivation_bench,d=3 p=1e-3,3.0,,0.001,1000000,3903,1,tsim,2,SUCCESS,85.368836,35.769564,27956.7,,
+distillation_bench,prep=0.05,,,,1000000,600,1,tsim,0,SUCCESS,12.169223,0.678204,1474482.1,0.05,
+distillation_bench,prep=0.05,,,,1000000,600,1,tsim,1,SUCCESS,12.169223,0.65704,1521976.6,0.05,
+distillation_bench,prep=0.05,,,,1000000,600,1,tsim,2,SUCCESS,12.169223,0.665054,1503637.0,0.05,
+coherent_noise_bench,d=3 r=1 p=1e-3 rz=0.02,3.0,1.0,0.001,1000000,18,1,tsim,0,SUCCESS,0.464981,0.071335,14018350.5,,0.02
+coherent_noise_bench,d=3 r=1 p=1e-3 rz=0.02,3.0,1.0,0.001,1000000,18,1,tsim,1,SUCCESS,0.464981,0.069558,14376571.5,,0.02
+coherent_noise_bench,d=3 r=1 p=1e-3 rz=0.02,3.0,1.0,0.001,1000000,18,1,tsim,2,SUCCESS,0.464981,0.068979,14497182.6,,0.02
+coherent_noise_bench,d=5 r=1 p=1e-3 rz=0.02,5.0,1.0,0.001,100000,50,1,tsim,0,SUCCESS,1.924805,0.179557,556927.0,,0.02
+coherent_noise_bench,d=5 r=1 p=1e-3 rz=0.02,5.0,1.0,0.001,100000,50,1,tsim,1,SUCCESS,1.924805,0.175148,570945.7,,0.02
+coherent_noise_bench,d=5 r=1 p=1e-3 rz=0.02,5.0,1.0,0.001,100000,50,1,tsim,2,SUCCESS,1.924805,0.173686,575750.0,,0.02

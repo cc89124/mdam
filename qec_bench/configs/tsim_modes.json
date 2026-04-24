@@ -1,0 +1,64 @@
+{
+  "d=7 r=7 p=1e-3": {
+    "benchmark": "clifford_bench",
+    "supported": true,
+    "chosen_strategy": "default",
+    "probe_compile_s": 5.421,
+    "probe_sample_s": 4.31,
+    "num_graphs": 674,
+    "tsim_version": "0.1.2",
+    "probe_shots": 100
+  },
+  "d=3 p=1e-3": {
+    "benchmark": "cultivation_bench",
+    "supported": true,
+    "chosen_strategy": "cutting",
+    "probe_compile_s": 15.318,
+    "probe_sample_s": 28.667,
+    "num_graphs": 3903,
+    "tsim_version": "0.1.2",
+    "probe_shots": 100
+  },
+  "d=5 p=1e-3": {
+    "benchmark": "cultivation_bench",
+    "supported": false
+  },
+  "prep=0.05": {
+    "benchmark": "distillation_bench",
+    "supported": true,
+    "chosen_strategy": "default",
+    "probe_compile_s": 2.075,
+    "probe_sample_s": 8.063,
+    "num_graphs": 600,
+    "tsim_version": "0.1.2",
+    "probe_shots": 100
+  },
+  "d=3 r=1 p=1e-3 rz=0.02": {
+    "benchmark": "coherent_noise_bench",
+    "supported": true,
+    "chosen_strategy": "cutting",
+    "probe_compile_s": 0.244,
+    "probe_sample_s": 1.811,
+    "num_graphs": 18,
+    "tsim_version": "0.1.2",
+    "probe_shots": 100
+  },
+  "d=3 r=3 p=1e-3 rz=0.02": {
+    "benchmark": "coherent_noise_bench",
+    "supported": false
+  },
+  "d=5 r=1 p=1e-3 rz=0.02": {
+    "benchmark": "coherent_noise_bench",
+    "supported": true,
+    "chosen_strategy": "cutting",
+    "probe_compile_s": 0.382,
+    "probe_sample_s": 2.002,
+    "num_graphs": 50,
+    "tsim_version": "0.1.2",
+    "probe_shots": 100
+  },
+  "d=5 r=5 p=1e-3 rz=0.02": {
+    "benchmark": "coherent_noise_bench",
+    "supported": false
+  }
+}

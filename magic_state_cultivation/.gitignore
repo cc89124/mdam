@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[oc]
+*.egg-info
+build/
+dist/
+wheels/
+.venv/
+
+# IDE / OS
+.vscode/
+.DS_Store
+
+# Generated circuits
+out_*.clifft
+out_*.stim
+
+# Legacy data files
+*_gap_counts.json

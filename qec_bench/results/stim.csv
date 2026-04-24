@@ -1,0 +1,4 @@
+benchmark,circuit,distance,rounds,phys_error_rate,shots,threads,simulator,repeat,status,compile_s,sample_s,effective_shots_per_s
+clifford_bench,d=7 r=7 p=1e-3,7,7,0.001,1000000,16,stim,0,SUCCESS,0.000117,0.813056,19678830.1
+clifford_bench,d=7 r=7 p=1e-3,7,7,0.001,1000000,16,stim,1,SUCCESS,0.000117,0.797066,20073610.6
+clifford_bench,d=7 r=7 p=1e-3,7,7,0.001,1000000,16,stim,2,SUCCESS,0.000117,0.797089,20073033.0

@@ -1,0 +1,9 @@
+{
+  "circuit": "s_proxy",
+  "dcolor": 5,
+  "k": 17,
+  "total_shots": 500000000,
+  "passed_shots": 1038,
+  "logical_errors": 0,
+  "seconds": 804.9
+}
