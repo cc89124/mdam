@@ -360,6 +360,7 @@ def _plot_ic_single(
     # --- Top panel: desaturation ---
     # Color encodes gate; same marker "o" and solid line everywhere.
     _GATE_COLOR = {"T": "tab:blue", "S": "tab:orange"}
+    _GATE_LABEL = {"T": "T-Gate", "S": "S-Proxy"}
 
     def _x_func(stat):
         return (stat.shots + 1) / (stat.shots - stat.discards + 2)
@@ -375,7 +376,10 @@ def _plot_ic_single(
             ),
             "linestyle": "-",
             "marker": "o",
-            "label": group_stats[0].json_metadata["gate"],
+            "label": _GATE_LABEL.get(
+                group_stats[0].json_metadata["gate"],
+                group_stats[0].json_metadata["gate"],
+            ),
         },
         highlight_max_likelihood_factor=1000,
     )
@@ -393,10 +397,6 @@ def _plot_ic_single(
     ax_top.set_xscale("log")
     ax_top.set_yscale("log")
     ax_top.set_ylabel("Logical Error Rate (per Kept Shot)")
-    ax_top.set_title(
-        f"Inject+Cultivate: d={dcolor} Color Code\n"
-        f"c=inject[unitary]+cultivate, noise=uniform"
-    )
     ax_top.grid(True, which="major", axis="y", linewidth=0.8, alpha=0.5, color="gray")
     ax_top.grid(True, which="minor", axis="y", linewidth=0.5, alpha=0.4, color="gray")
     ax_top.grid(True, which="major", axis="x", linewidth=0.5, alpha=0.3, color="gray")
@@ -830,6 +830,7 @@ def plot_e2e_combined(
         # every curve.  Per-noise identification is via inline p-labels
         # placed at the rightmost point of each curve pair.
         _GATE_COLOR = {"T": "tab:blue", "S": "tab:orange"}
+        _GATE_LABEL = {"T": "T-Gate", "S": "S-Proxy"}
 
         def _x_func(stat):
             return (stat.shots + 1) / (stat.shots - stat.discards + 2)
@@ -846,7 +847,10 @@ def plot_e2e_combined(
                 "color": _GATE_COLOR.get(group_stats[0].json_metadata["gate"], "gray"),
                 "linestyle": "-",
                 "marker": "o",
-                "label": group_stats[0].json_metadata["gate"],
+                "label": _GATE_LABEL.get(
+                    group_stats[0].json_metadata["gate"],
+                    group_stats[0].json_metadata["gate"],
+                ),
             },
             highlight_max_likelihood_factor=1000,
         )
@@ -854,10 +858,6 @@ def plot_e2e_combined(
         ax_top.set_xscale("log")
         ax_top.set_yscale("log")
         ax_top.set_ylabel("Infidelity (per Kept Shot)")
-        ax_top.set_title(
-            f"End-to-End Magic State Cultivation: d={dcolor}\n"
-            f"b=Y, c=end2end-inplace-distillation, d2=15, noise=uniform, r2=5"
-        )
         ax_top.grid(True, which="major", axis="y", linewidth=0.8, alpha=0.5, color="gray")
         ax_top.grid(True, which="minor", axis="y", linewidth=0.5, alpha=0.4, color="gray")
         ax_top.grid(True, which="major", axis="x", linewidth=0.5, alpha=0.3, color="gray")
