@@ -152,9 +152,10 @@ def _fmt_count(x: float) -> str:
 
 
 def _fmt_rate(x: float) -> str:
-    """shots/s with k / M suffix (plain text)."""
+    """shots/s with k / M suffix (plain text), 3 sig figs."""
     if x >= 1e6:
-        return f"{x/1e6:.1f}M"
+        # 2.168M -> 2.17M (matches the round-trip to per-shot prose)
+        return f"{x/1e6:.2f}M"
     if x >= 1e4:
         return f"{x/1e3:.0f}k"
     if x >= 1e3:
@@ -194,6 +195,15 @@ def generate_ic_table() -> str:
     rows: list[dict] = []
 
     # Our rows (d=5 only): one per circuit (t_gate, s_proxy).
+    #
+    # The raw `seconds` field in the IC JSON files is per-worker wall-
+    # clock summed across all strata (see run_ic_tiered.py:200), and the
+    # raw `rate = total_shots / seconds` is per-worker throughput.  We
+    # report per-machine quantities by dividing seconds by `parallelism`
+    # (= 16 worker processes on a c6i.8xlarge) and multiplying rate by
+    # the same factor.  This puts both the Clifft and SOFT rows on a
+    # whole-machine grain (one c6i.8xlarge instance vs one 16-H800
+    # cluster).
     for circuit, label in (
         ("t_gate",  r"clifft ($T$-gate)"),
         ("s_proxy", r"clifft ($S$-proxy)"),
@@ -207,14 +217,15 @@ def generate_ic_table() -> str:
                 "total": a["total_shots"],
                 "seconds": a["seconds"],
                 "rate": a["total_shots"] / a["seconds"],
+                "parallelism": 16,  # 16 worker processes on the c6i.8xlarge
                 "per_p": per_p,
             }
         )
 
     # SOFT row: one aggregated row (T-gate only; no S-proxy reported).
-    # Device-hours are backed out from the measured d=5 per-shot time
-    # (Table V of Li et al.) rather than the overall 20-day campaign
-    # figure, which also includes d=3 and other work.
+    # Per-cluster machine-hours are backed out from the measured single-
+    # H800 per-shot time (Table V of Li et al.) rather than the overall
+    # 20-day campaign figure (which also includes d=3 and other work).
     soft_total = sum(r["total"] for r in _SOFT_IC)
     soft_seconds = soft_total * _SOFT_TIME_PER_SHOT_S
     rows.append(
@@ -224,6 +235,7 @@ def generate_ic_table() -> str:
             "total": soft_total,
             "seconds": soft_seconds,
             "rate": 1.0 / _SOFT_TIME_PER_SHOT_S,
+            "parallelism": 16,  # 16 H800s in the published cluster
             "per_p": [r["rate"] for r in _SOFT_IC],  # already sorted 5e-4, 1e-3, 2e-3
         }
     )
@@ -233,7 +245,7 @@ def generate_ic_table() -> str:
     lines.append(r"        \toprule")
     lines.append(
         r"        \textbf{Simulator} & \textbf{Hardware}"
-        r" & \textbf{Total shots} & \textbf{Shots/s} & \textbf{Device-h}"
+        r" & \textbf{Total shots} & \textbf{Shots/s} & \textbf{Machine-h}"
         r" & $\boldsymbol{\epsilon_L}$($p{=}5{\times}10^{-4}$)"
         r" & $\boldsymbol{\epsilon_L}$($p{=}10^{-3}$)"
         r" & $\boldsymbol{\epsilon_L}$($p{=}2{\times}10^{-3}$) \\"
@@ -241,12 +253,15 @@ def generate_ic_table() -> str:
     lines.append(r"        \midrule")
     for r in rows:
         eps = [_fmt_sci(v) for v in r["per_p"]]
+        # Convert per-worker / per-GPU values to per-machine values.
+        machine_rate = r["rate"] * r["parallelism"]
+        machine_seconds = r["seconds"] / r["parallelism"]
         cols = [
             f"        {r['label']}",
             r["hw"],
             _fmt_count(r["total"]),
-            _fmt_rate(r["rate"]),
-            _fmt_hours(r["seconds"]),
+            _fmt_rate(machine_rate),
+            _fmt_hours(machine_seconds),
             eps[0],
             eps[1],
             eps[2],
@@ -326,6 +341,9 @@ def main() -> None:
     caption_note = (
         r"% Note: clifft rows were collected on AWS c6i.8xlarge "
         r"(16 physical cores, Intel Xeon 8375C Ice Lake, 32 vCPU)."
+        "\n"
+        r"% Table I Shots/s and Machine-h are per-machine: one c6i.8xlarge "
+        r"instance for Clifft, one 16-H800 cluster for SOFT."
     )
 
     if args.which in ("ic", "both"):
