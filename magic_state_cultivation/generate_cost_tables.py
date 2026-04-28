@@ -1,8 +1,6 @@
-"""Generate LaTeX cost-comparison tables for magic state cultivation.
+"""Generate the LaTeX cost-comparison table for magic state cultivation.
 
-Produces two tables:
-    I.  Inject+cultivate @ d=5 (clifft vs SOFT).
-    II. End-to-end @ d=3 and d=5 (clifft T-gate vs Gidney S-proxy).
+Produces the inject+cultivate @ d=5 table (clifft vs SOFT).
 
 Usage:
     uv run python generate_cost_tables.py
@@ -11,15 +9,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _IC_DIR = _HERE / "results" / "inject_cultivate"
-_E2E_DIR = _HERE / "results" / "end2end"
-_GIDNEY_CSV = _HERE / "results" / "reference" / "gidney_e2e.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -80,58 +75,6 @@ def _ic_rate_at(rates: dict, circuit: str, dcolor: int, p: float) -> float | Non
     return None
 
 
-def _load_our_e2e() -> list[dict]:
-    rows = []
-    for path in sorted(_E2E_DIR.glob("*.json")):
-        with open(path) as f:
-            d = json.load(f)
-        shots = int(d["shots"])
-        rate = float(d["shots_per_second"])
-        kept = shots - int(d["discards"])
-        cpu_s = shots / rate if rate > 0 else 0.0
-        rows.append(
-            {
-                "circuit": d["circuit"],
-                "dcolor": int(d["dcolor"]),
-                "p": float(d["noise"]),
-                "total": shots,
-                "kept": kept,
-                "errs": int(d["errors"]),
-                "infid": (int(d["errors"]) / kept) if kept else float("nan"),
-                "rate": rate,
-                "seconds": cpu_s,
-            }
-        )
-    return rows
-
-
-def _load_gidney_e2e() -> list[dict]:
-    rows = []
-    with open(_GIDNEY_CSV) as f:
-        reader = csv.DictReader(f, skipinitialspace=True)
-        for row in reader:
-            md = json.loads(row["json_metadata"])
-            shots = int(row["shots"])
-            errs = int(row["errors"])
-            disc = int(row["discards"])
-            secs = float(row["seconds"])
-            kept = shots - disc
-            rows.append(
-                {
-                    "circuit": "s_proxy",
-                    "dcolor": int(md["d1"]),
-                    "p": float(md["p"]),
-                    "total": shots,
-                    "kept": kept,
-                    "errs": errs,
-                    "infid": (errs / kept) if kept else float("nan"),
-                    "rate": shots / secs if secs > 0 else 0.0,
-                    "seconds": secs,
-                }
-            )
-    return rows
-
-
 # ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------
@@ -175,13 +118,8 @@ def _fmt_hours(seconds: float) -> str:
     return f"{h:.1f}"
 
 
-def _fmt_p(p: float) -> str:
-    """Noise probability in math mode."""
-    return f"${p:g}$"
-
-
 # ---------------------------------------------------------------------------
-# Table I: Inject+Cultivate @ d=5
+# Inject+Cultivate cost table @ d=5
 # ---------------------------------------------------------------------------
 
 
@@ -273,88 +211,25 @@ def generate_ic_table() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Table II: End-to-End @ d=3 and d=5
-# ---------------------------------------------------------------------------
-
-
-def generate_e2e_table() -> str:
-    ours = _load_our_e2e()
-    gid = _load_gidney_e2e()
-
-    rows: list[dict] = []
-    for r in ours:
-        if r["circuit"] != "t_gate":
-            continue  # paper shows our T-gate runs (S-proxy serves as baseline)
-        rows.append({**r, "sim": "clifft (ours)", "circuit_label": r"$T$-gate", "_order": 1})
-    for r in gid:
-        rows.append({**r, "sim": "Gidney et al.", "circuit_label": r"$S$-proxy", "_order": 0})
-
-    # Within each d, sort Gidney rows first, then ours; then by noise level.
-    rows.sort(key=lambda r: (r["dcolor"], r["_order"], r["p"]))
-
-    lines = []
-    lines.append(r"    \begin{tabular}{c l l r r r r r r}")
-    lines.append(r"        \toprule")
-    lines.append(
-        r"        $\boldsymbol{d}$ & \textbf{Circuit} & \textbf{Simulator}"
-        r" & $\boldsymbol{p}$ & \textbf{Total shots} & \textbf{Kept} & \textbf{Errors}"
-        r" & $\boldsymbol{\epsilon_L}$ & \textbf{CPU-h} \\"
-    )
-    lines.append(r"        \midrule")
-
-    prev_d = None
-    for r in rows:
-        if prev_d is not None and r["dcolor"] != prev_d:
-            lines.append(r"        \midrule")
-        prev_d = r["dcolor"]
-        cols = [
-            f"        {r['dcolor']}",
-            r["circuit_label"],
-            r["sim"],
-            _fmt_p(r["p"]),
-            _fmt_count(r["total"]),
-            _fmt_count(r["kept"]),
-            _fmt_count(r["errs"]),
-            _fmt_sci(r["infid"]),
-            _fmt_hours(r["seconds"]),
-        ]
-        lines.append(" & ".join(cols) + r" \\")
-    lines.append(r"        \bottomrule")
-    lines.append(r"    \end{tabular}")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--which", choices=("ic", "e2e", "both"), default="both",
-        help="Which table to emit.",
-    )
-    args = parser.parse_args()
+    parser.parse_args()
 
-    # Caption note shared by both tables: our hardware spec.
     caption_note = (
         r"% Note: clifft rows were collected on AWS c6i.8xlarge "
         r"(16 physical cores, Intel Xeon 8375C Ice Lake, 32 vCPU)."
         "\n"
-        r"% Table I Shots/s and Machine-h are per-machine: one c6i.8xlarge "
+        r"% Shots/s and Machine-h are per-machine: one c6i.8xlarge "
         r"instance for Clifft, one 16-H800 cluster for SOFT."
     )
 
-    if args.which in ("ic", "both"):
-        print("% Table I: Inject+Cultivate cost comparison (d=5)")
-        print(generate_ic_table())
-        print(caption_note)
-        print()
-    if args.which in ("e2e", "both"):
-        print("% Table II: End-to-End cost comparison (d=3, d=5)")
-        print(generate_e2e_table())
-        print(caption_note)
+    print("% Inject+Cultivate cost comparison (d=5)")
+    print(generate_ic_table())
+    print(caption_note)
 
 
 if __name__ == "__main__":
