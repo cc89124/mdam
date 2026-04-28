@@ -1,8 +1,6 @@
-"""Generate LaTeX cost-comparison tables for magic state cultivation.
+"""Generate the LaTeX cost-comparison table for magic state cultivation.
 
-Produces two tables:
-    I.  Inject+cultivate @ d=5 (clifft vs SOFT).
-    II. End-to-end @ d=3 and d=5 (clifft T-gate vs Gidney S-proxy).
+Produces the inject+cultivate @ d=5 table (clifft vs SOFT).
 
 Usage:
     uv run python generate_cost_tables.py
@@ -11,15 +9,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _IC_DIR = _HERE / "results" / "inject_cultivate"
-_E2E_DIR = _HERE / "results" / "end2end"
-_GIDNEY_CSV = _HERE / "results" / "reference" / "gidney_e2e.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -80,58 +75,6 @@ def _ic_rate_at(rates: dict, circuit: str, dcolor: int, p: float) -> float | Non
     return None
 
 
-def _load_our_e2e() -> list[dict]:
-    rows = []
-    for path in sorted(_E2E_DIR.glob("*.json")):
-        with open(path) as f:
-            d = json.load(f)
-        shots = int(d["shots"])
-        rate = float(d["shots_per_second"])
-        kept = shots - int(d["discards"])
-        cpu_s = shots / rate if rate > 0 else 0.0
-        rows.append(
-            {
-                "circuit": d["circuit"],
-                "dcolor": int(d["dcolor"]),
-                "p": float(d["noise"]),
-                "total": shots,
-                "kept": kept,
-                "errs": int(d["errors"]),
-                "infid": (int(d["errors"]) / kept) if kept else float("nan"),
-                "rate": rate,
-                "seconds": cpu_s,
-            }
-        )
-    return rows
-
-
-def _load_gidney_e2e() -> list[dict]:
-    rows = []
-    with open(_GIDNEY_CSV) as f:
-        reader = csv.DictReader(f, skipinitialspace=True)
-        for row in reader:
-            md = json.loads(row["json_metadata"])
-            shots = int(row["shots"])
-            errs = int(row["errors"])
-            disc = int(row["discards"])
-            secs = float(row["seconds"])
-            kept = shots - disc
-            rows.append(
-                {
-                    "circuit": "s_proxy",
-                    "dcolor": int(md["d1"]),
-                    "p": float(md["p"]),
-                    "total": shots,
-                    "kept": kept,
-                    "errs": errs,
-                    "infid": (errs / kept) if kept else float("nan"),
-                    "rate": shots / secs if secs > 0 else 0.0,
-                    "seconds": secs,
-                }
-            )
-    return rows
-
-
 # ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------
@@ -152,9 +95,10 @@ def _fmt_count(x: float) -> str:
 
 
 def _fmt_rate(x: float) -> str:
-    """shots/s with k / M suffix (plain text)."""
+    """shots/s with k / M suffix (plain text), 3 sig figs."""
     if x >= 1e6:
-        return f"{x/1e6:.1f}M"
+        # 2.168M -> 2.17M (matches the round-trip to per-shot prose)
+        return f"{x/1e6:.2f}M"
     if x >= 1e4:
         return f"{x/1e3:.0f}k"
     if x >= 1e3:
@@ -174,13 +118,8 @@ def _fmt_hours(seconds: float) -> str:
     return f"{h:.1f}"
 
 
-def _fmt_p(p: float) -> str:
-    """Noise probability in math mode."""
-    return f"${p:g}$"
-
-
 # ---------------------------------------------------------------------------
-# Table I: Inject+Cultivate @ d=5
+# Inject+Cultivate cost table @ d=5
 # ---------------------------------------------------------------------------
 
 
@@ -194,6 +133,15 @@ def generate_ic_table() -> str:
     rows: list[dict] = []
 
     # Our rows (d=5 only): one per circuit (t_gate, s_proxy).
+    #
+    # The raw `seconds` field in the IC JSON files is per-worker wall-
+    # clock summed across all strata (see run_ic_tiered.py:200), and the
+    # raw `rate = total_shots / seconds` is per-worker throughput.  We
+    # report per-machine quantities by dividing seconds by `parallelism`
+    # (= 16 worker processes on a c6i.8xlarge) and multiplying rate by
+    # the same factor.  This puts both the Clifft and SOFT rows on a
+    # whole-machine grain (one c6i.8xlarge instance vs one 16-H800
+    # cluster).
     for circuit, label in (
         ("t_gate",  r"clifft ($T$-gate)"),
         ("s_proxy", r"clifft ($S$-proxy)"),
@@ -207,14 +155,15 @@ def generate_ic_table() -> str:
                 "total": a["total_shots"],
                 "seconds": a["seconds"],
                 "rate": a["total_shots"] / a["seconds"],
+                "parallelism": 16,  # 16 worker processes on the c6i.8xlarge
                 "per_p": per_p,
             }
         )
 
     # SOFT row: one aggregated row (T-gate only; no S-proxy reported).
-    # Device-hours are backed out from the measured d=5 per-shot time
-    # (Table V of Li et al.) rather than the overall 20-day campaign
-    # figure, which also includes d=3 and other work.
+    # Per-cluster machine-hours are backed out from the measured single-
+    # H800 per-shot time (Table V of Li et al.) rather than the overall
+    # 20-day campaign figure (which also includes d=3 and other work).
     soft_total = sum(r["total"] for r in _SOFT_IC)
     soft_seconds = soft_total * _SOFT_TIME_PER_SHOT_S
     rows.append(
@@ -224,6 +173,7 @@ def generate_ic_table() -> str:
             "total": soft_total,
             "seconds": soft_seconds,
             "rate": 1.0 / _SOFT_TIME_PER_SHOT_S,
+            "parallelism": 16,  # 16 H800s in the published cluster
             "per_p": [r["rate"] for r in _SOFT_IC],  # already sorted 5e-4, 1e-3, 2e-3
         }
     )
@@ -233,7 +183,7 @@ def generate_ic_table() -> str:
     lines.append(r"        \toprule")
     lines.append(
         r"        \textbf{Simulator} & \textbf{Hardware}"
-        r" & \textbf{Total shots} & \textbf{Shots/s} & \textbf{Device-h}"
+        r" & \textbf{Total shots} & \textbf{Shots/s} & \textbf{Machine-h}"
         r" & $\boldsymbol{\epsilon_L}$($p{=}5{\times}10^{-4}$)"
         r" & $\boldsymbol{\epsilon_L}$($p{=}10^{-3}$)"
         r" & $\boldsymbol{\epsilon_L}$($p{=}2{\times}10^{-3}$) \\"
@@ -241,67 +191,18 @@ def generate_ic_table() -> str:
     lines.append(r"        \midrule")
     for r in rows:
         eps = [_fmt_sci(v) for v in r["per_p"]]
+        # Convert per-worker / per-GPU values to per-machine values.
+        machine_rate = r["rate"] * r["parallelism"]
+        machine_seconds = r["seconds"] / r["parallelism"]
         cols = [
             f"        {r['label']}",
             r["hw"],
             _fmt_count(r["total"]),
-            _fmt_rate(r["rate"]),
-            _fmt_hours(r["seconds"]),
+            _fmt_rate(machine_rate),
+            _fmt_hours(machine_seconds),
             eps[0],
             eps[1],
             eps[2],
-        ]
-        lines.append(" & ".join(cols) + r" \\")
-    lines.append(r"        \bottomrule")
-    lines.append(r"    \end{tabular}")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Table II: End-to-End @ d=3 and d=5
-# ---------------------------------------------------------------------------
-
-
-def generate_e2e_table() -> str:
-    ours = _load_our_e2e()
-    gid = _load_gidney_e2e()
-
-    rows: list[dict] = []
-    for r in ours:
-        if r["circuit"] != "t_gate":
-            continue  # paper shows our T-gate runs (S-proxy serves as baseline)
-        rows.append({**r, "sim": "clifft (ours)", "circuit_label": r"$T$-gate", "_order": 1})
-    for r in gid:
-        rows.append({**r, "sim": "Gidney et al.", "circuit_label": r"$S$-proxy", "_order": 0})
-
-    # Within each d, sort Gidney rows first, then ours; then by noise level.
-    rows.sort(key=lambda r: (r["dcolor"], r["_order"], r["p"]))
-
-    lines = []
-    lines.append(r"    \begin{tabular}{c l l r r r r r r}")
-    lines.append(r"        \toprule")
-    lines.append(
-        r"        $\boldsymbol{d}$ & \textbf{Circuit} & \textbf{Simulator}"
-        r" & $\boldsymbol{p}$ & \textbf{Total shots} & \textbf{Kept} & \textbf{Errors}"
-        r" & $\boldsymbol{\epsilon_L}$ & \textbf{CPU-h} \\"
-    )
-    lines.append(r"        \midrule")
-
-    prev_d = None
-    for r in rows:
-        if prev_d is not None and r["dcolor"] != prev_d:
-            lines.append(r"        \midrule")
-        prev_d = r["dcolor"]
-        cols = [
-            f"        {r['dcolor']}",
-            r["circuit_label"],
-            r["sim"],
-            _fmt_p(r["p"]),
-            _fmt_count(r["total"]),
-            _fmt_count(r["kept"]),
-            _fmt_count(r["errs"]),
-            _fmt_sci(r["infid"]),
-            _fmt_hours(r["seconds"]),
         ]
         lines.append(" & ".join(cols) + r" \\")
     lines.append(r"        \bottomrule")
@@ -316,27 +217,19 @@ def generate_e2e_table() -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--which", choices=("ic", "e2e", "both"), default="both",
-        help="Which table to emit.",
-    )
-    args = parser.parse_args()
+    parser.parse_args()
 
-    # Caption note shared by both tables: our hardware spec.
     caption_note = (
         r"% Note: clifft rows were collected on AWS c6i.8xlarge "
         r"(16 physical cores, Intel Xeon 8375C Ice Lake, 32 vCPU)."
+        "\n"
+        r"% Shots/s and Machine-h are per-machine: one c6i.8xlarge "
+        r"instance for Clifft, one 16-H800 cluster for SOFT."
     )
 
-    if args.which in ("ic", "both"):
-        print("% Table I: Inject+Cultivate cost comparison (d=5)")
-        print(generate_ic_table())
-        print(caption_note)
-        print()
-    if args.which in ("e2e", "both"):
-        print("% Table II: End-to-End cost comparison (d=3, d=5)")
-        print(generate_e2e_table())
-        print(caption_note)
+    print("% Inject+Cultivate cost comparison (d=5)")
+    print(generate_ic_table())
+    print(caption_note)
 
 
 if __name__ == "__main__":
