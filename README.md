@@ -1,6 +1,6 @@
 # Clifft Benchmark Scripts
 
-Scripts for simulations and benchmarks from the paper introducing [Clifft](https://github.com/unitaryfoundation/clifft), a fast simulator for near-Clifford quantum circuits.
+Scripts for simulations and benchmarks from the [paper](https://arxiv.org/abs/2604.27058) introducing [Clifft](https://github.com/unitaryfoundation/clifft), a fast simulator for near-Clifford quantum circuits.
 
 This repository houses each category of simulation in its own subflorder, with its own `pyproject.toml`, `uv.lock`, and installation flow.
 
