@@ -23,8 +23,9 @@ NOTE the distinctions the columns keep separate (do not conflate):
                       property (pending rotations THIS measurement does not touch).
   * Clifft is compared on active rank / state size, NOT on rotation count.
 
-cultivation_d5 is EXCLUDED (its irreducible all-magic transient exceeds Clifft by
-one -- the documented limit case, README s11). r1 circuits are diagnostic/appendix.
+cultivation_d5 is the all-magic limit: with frame reduction (default on) its RESIDENT
+state is <= clifft at every measurement (max_block 11->10 = parity, not a win); one
+intra-flush TRANSIENT +1 spike remains, shown honestly. r1 are diagnostic/appendix.
 """
 from __future__ import annotations
 
@@ -40,9 +41,13 @@ OUT = "reports/measurement_dependency_trace"
 SEED = 12345
 
 # headline (thesis holds: NC state < Clifft active dense), then appendix r1.
-HEADLINE = ["coherent_d5_r5", "coherent_d3_r3", "distillation", "cultivation_d3"]
+# cultivation_d5 is the all-magic limit: with frame reduction (default on) its
+# RESIDENT state is now <= clifft at every measurement (11->10 = parity, not a win);
+# one intra-flush TRANSIENT +1 spike remains, shown honestly.
+HEADLINE = ["coherent_d5_r5", "coherent_d3_r3", "distillation", "cultivation_d3",
+            "cultivation_d5"]
 APPENDIX = ["coherent_d3_r1", "coherent_d5_r1"]                 # diagnostic only
-CIRCUITS = HEADLINE + APPENDIX                                  # cultivation_d5 EXCLUDED
+CIRCUITS = HEADLINE + APPENDIX
 
 TRACE = {}                       # shared per-run state (single-threaded)
 
