@@ -649,8 +649,20 @@ noise-site pool and is *not* a valid input here.
   including `cultivation_d5` (`5→0`; its peak `max_block` drops `11→10` = `clifft` parity,
   exactly as predicted — *parity, not a win*, since the magic is irreducible). Transient:
   `distillation` (`−2→0`, `2→0`) and `cultivation_d3` (`−1→0`, `1→0`) fully fixed; the only
-  residual is **one** intra-flush transient `+1` spike left on `cultivation_d5` (`11→1`
-  loss measurements). Distribution unchanged within sampling (`max|Δmarginal| ≤ 0.009`);
+  residual is **one** transient `+1` spike left on `cultivation_d5` (`11→1` loss
+  measurements). Distribution unchanged within sampling (`max|Δmarginal| ≤ 0.009`);
   `verify_block` ALL PASS (fidelity 1.0); runtime unchanged (the GF(2) peel is cheap).
+
+  *Why the last spike survives (and what would remove it).* Traced: it is **not**
+  intra-flush — it is the block **carried between two consecutive measurements**. `clifft`
+  drops its active rank `k` at measurement *t*; the dead qubit it sheds is peeled from the
+  near-Clifford block only when `_reduce_dead` next finds its decoupling stabiliser, which
+  here is **cross-block** (it lives in the Clifford frame, not within the single dense
+  block), so the block-local `Z_q⊗Z^{mz}` / `X_q⊗G` scan cannot reach it and the block lags
+  `k` by one measurement. Adding X-type detection to the dense-block scan did *not* help
+  (confirming the residue is genuinely cross-block). Removing this last spike needs the
+  full **tableau-level** reduction (use the frame's stabiliser generators, not just the
+  dense block) — `clifft`'s active reduction proper. Deferred; the **settled** no-loss
+  guarantee already holds everywhere, and this is one momentary `+1` on the all-magic limit.
 * **`coherent_d7_r7`** is not finalised (too slow to gather statistics), though the
   representation and code path are the same verified ones.
