@@ -169,30 +169,32 @@ ACTIVE = dict(getcl=lambda cl, k, ncq: [c // 16 for c in cl],                 # 
               gettt=lambda tt, k, ncq: [(t // 16 if t is not None else None) for t in tt],
               getnc=lambda nc, k, ncq: [1 << q for q in ncq],                 # 2^max_block
               fmt=pow2)
-MEMORY = dict(getcl=lambda cl, k, ncq: cl,                          # 16*2^k
+MEMORY = dict(getcl=lambda cl, k, ncq: cl,            # 16*2^k (dense active state)
               gettt=lambda tt, k, ncq: tt,
-              getnc=lambda nc, k, ncq: [16 * (1 << q) for q in ncq],  # 16*2^block (state only)
+              getnc=lambda nc, k, ncq: nc,             # TOTAL footprint: 16*2^block + metadata
               fmt=hbytes)
 
 
 def overhead_rows():
-    """NC's polynomial Clifford-frame metadata (tableau + unapplied pending) =
-    near_clifft_bytes - 16*2^block. This is the part Clifft's 16*2^k baseline omits
-    (Clifft keeps an O(n^2) tableau too); it is NOT exponential and NOT in the ratio."""
+    """Split NC's TOTAL footprint into the exponential dense magic state (16*2^block)
+    and the polynomial Clifford-frame metadata (tableau + unapplied pending =
+    near_clifft_bytes - 16*2^block). The metadata is the part Clifft's 16*2^k baseline
+    omits (Clifft keeps an O(n^2) tableau too); only the dense state is in ACTIVE-STATE."""
     rows = []
     for c in ORDER:
         _, _, nc, k, ncq = load(c)
-        # overhead = total NC bytes - dense-state bytes; clamp ≥0 (the frame-only
-        # surface_d7_r7 has an empty magic register, so the 16·2^0 floor can exceed it).
-        ov = [max(0, nc[i] - 16 * (1 << ncq[i])) for i in range(len(nc))]
-        pk = max(ov) if ov else 0
-        sm = sum(ov) if ov else 0
-        rows.append([c, hbytes(pk), hbytes(sm)])
+        state = [16 * (1 << q) for q in ncq]
+        # metadata = total - dense state; clamp ≥0 (frame-only surface_d7_r7 has an
+        # empty magic register, so the 16·2^0 floor can exceed its tiny total).
+        ov = [max(0, nc[i] - state[i]) for i in range(len(nc))]
+        rows.append([c, hbytes(max(state) if state else 0),
+                     hbytes(max(ov) if ov else 0),
+                     hbytes(max(nc) if nc else 0)])
     return rows
 
 
 def md_overhead(rows):
-    head = ["circuit", "NC metadata PEAK", "NC metadata SUM"]
+    head = ["circuit", "dense state PEAK", "metadata PEAK", "TOTAL PEAK"]
     out = ["| " + " | ".join(head) + " |",
            "| " + " | ".join(["---"] + ["--:"] * (len(head) - 1)) + " |"]
     for r in rows:
@@ -232,16 +234,17 @@ def write_md(active, memory):
                "transient `+1` at the lone measurement where Clifft's local rank dips "
                "(`cultivation_d5` meas 3: Clifft k=2 -> NC 3) — see the "
                "measurement-dependency report; it never reaches the global peak, so it "
-               "does not change feasibility. **The MEMORY table below now compares the "
-               "dense state only** (`16·2^k` vs `16·2^block`), so it matches the "
-               "ACTIVE-STATE table and has **no spurious `<1x` cell**: NC's polynomial "
-               "Clifford-frame metadata — the part Clifft's `16·2^k` baseline omits "
-               "(Clifft keeps an `O(n^2)` tableau too) — is in its own table and never "
-               "enters the ratio. (Earlier the byte ratio charged NC for that metadata "
-               "while giving Clifft a metadata-free baseline, which made tiny all-magic "
-               "circuits look like a loss even when the exponential state was "
-               "parity-or-smaller, e.g. `coherent_d3_r1` had NC magic `2^0` yet a byte "
-               "SUM `<1x`.)\n")
+               "does not change feasibility. **Two memory views:** the **ACTIVE-STATE "
+               "SIZE** table below is the apples-to-apples *exponential state* comparison "
+               "(`16·2^k` vs `16·2^block`) — parity-or-win everywhere, no `<1x`. The "
+               "**MEMORY** table is the **TOTAL footprint** (NC = dense state + its "
+               "Clifford-frame metadata, shown broken out). A `<1x` MEMORY cell on a tiny "
+               "all-magic circuit (e.g. `cultivation_d3`) is NC's *polynomial metadata* "
+               "exceeding Clifft's tiny `16·2^k` dense model — Clifft keeps an `O(n^2)` "
+               "tableau too but its baseline omits it, so the total comparison is "
+               "conservative against NC there; the exponential state never loses. On real "
+               "(large) circuits the exponential term dominates and NC wins hugely "
+               "(`coherent_d5_r5` total `135 KiB` vs Clifft `256 MiB`).\n")
     out.append("\n## Transient & resident peak `max_block` vs Clifft "
                "(the honest no-regression picture)\n")
     out.append("> `transient` is the headline intra-step high-water (memory-provisioning "
@@ -252,12 +255,20 @@ def write_md(active, memory):
     out.append(md_noreg(noreg_rows()))
     out.append("\n## ACTIVE-STATE SIZE  (dense-equivalent dimension, 2^x — NC = intra-step TRANSIENT peak)\n")
     out.append(md_table(metric_rows(**active)))
-    out.append("\n## MEMORY  (dense state bytes — Clifft `16·2^k` vs NC `16·2^block`, apples-to-apples)\n")
+    out.append("\n## MEMORY  (TOTAL footprint, bytes — Clifft dense `16·2^k` vs NC `16·2^block` + metadata)\n")
+    out.append("> The whole resident footprint each backend holds. NC = dense magic state "
+               "(`16·2^block`) **+** Clifford-frame metadata (tableau + unapplied pending), "
+               "broken out in the table below. `dense/NC` is total vs total; a `<1x` cell "
+               "on a tiny circuit is NC's polynomial metadata vs Clifft's small dense model "
+               "(Clifft's own `O(n^2)` tableau is omitted from its `16·2^k` baseline — so "
+               "this is conservative against NC; the exponential state never loses, see the "
+               "ACTIVE-STATE table).\n")
     out.append(md_table(metric_rows(**memory)))
-    out.append("\n### NC Clifford-frame metadata  (polynomial; NOT exponential, NOT in the ratio)\n")
-    out.append("> The tableau + unapplied-pending bookkeeping NC carries. Clifft keeps an "
-               "`O(n^2)` tableau of the same order but its `16·2^k` baseline omits it, so "
-               "this column is shown for honesty only — it never enters `dense/NC`.\n")
+    out.append("\n### NC footprint breakdown  (dense magic state vs polynomial metadata)\n")
+    out.append("> How the NC TOTAL above splits: the exponential dense state (`16·2^block`, "
+               "the part compared apples-to-apples in ACTIVE-STATE) and the polynomial "
+               "Clifford-frame metadata (tableau + unapplied pending) Clifft's baseline "
+               "omits.\n")
     out.append(md_overhead(overhead_rows()))
     text = "\n".join(out) + "\n"
     open(os.path.join(SRC, "DETAILED_TABLE.md"), "w").write(text)

@@ -62,39 +62,43 @@ def main():
                 f"{r.get('peak_ttn_qubits')} | {r.get('peak_nc_qubits')} | "
                 f"{r.get('peak_nc_qubits_resident')} |")
         lines.append("")
-    lines.append("## Per-step memory: Clifft dense vs TTN vs near-Clifford block\n")
-    lines.append("Linear-scale per-step PNGs are `<circuit>_per_step_linear.png`. "
-                 "Clifft dense = `16*2^k` (dense active state). **The `dense/NC` ratio "
-                 "compares the EXPONENTIAL dense state only** — Clifft `16*2^k` vs "
-                 "near-Clifford `16*2^block` — so it is apples-to-apples (both omit "
-                 "their Clifford-frame metadata; Clifft has an `O(n^2)` tableau too). "
-                 "The **NC metadata** column (Clifford frame + unapplied pending) is the "
-                 "polynomial part Clifft's baseline omits — it is **not** in the ratio. "
-                 "**near-Clifford MAIN = intra-step transient high-water**; (resident) = "
-                 "settled step-boundary. (memory only; correctness covered elsewhere)\n")
+    lines.append("## Per-step TOTAL memory: Clifft dense vs TTN vs near-Clifford\n")
+    lines.append("Linear-scale per-step PNGs are `<circuit>_per_step_linear.png`. This is "
+                 "the **TOTAL resident footprint** each backend holds (the point of this "
+                 "report; the state-only *dimension* view is in `per_step_active_state`). "
+                 "Clifft dense = `16*2^k`; **NC total = `16*2^block` (dense magic state) + "
+                 "metadata** (Clifford frame + unapplied pending), broken out in the next "
+                 "two columns. `dense/NC` is **total vs total**. NOTE: Clifft keeps an "
+                 "`O(n^2)` tableau too, but its `16*2^k` baseline omits it — so on tiny "
+                 "all-magic circuits NC's total can exceed Clifft's dense model (the "
+                 "metadata dominates the small `2^block`); the exponential state alone is "
+                 "parity-or-win (see `per_step_active_state`). **MAIN = transient "
+                 "high-water**; (resident) = settled. (memory only; correctness elsewhere)\n")
     lines.append("### PEAK memory (max over steps)\n")
-    lines.append("| circuit | k | Clifft dense | TTN | NC dense state (transient) | "
-                 "NC dense state (resident) | NC metadata | dense/NC | TTN/NC |")
-    lines.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|")
+    lines.append("| circuit | k | Clifft dense | TTN | NC TOTAL (transient) | "
+                 "NC TOTAL (resident) | – dense state | – metadata | dense/NC | TTN/NC |")
+    lines.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
     for r in rows:
         lines.append(
             f"| {r['circuit']} | {r.get('max_active_idents','?')} | "
             f"{human(r['peak_clifft_bytes'])} | {human(r.get('peak_ttn_bytes'))} | "
-            f"{human(r.get('peak_nc_state_bytes', r.get('peak_nc_bytes')))} | "
-            f"{human(r.get('peak_nc_state_bytes_resident', r.get('peak_nc_bytes_resident')))} | "
+            f"{human(r.get('peak_nc_bytes'))} | "
+            f"{human(r.get('peak_nc_bytes_resident'))} | "
+            f"{human(r.get('peak_nc_state_bytes'))} | "
             f"{human(r.get('peak_nc_overhead_bytes'))} | "
             f"{x(r.get('peak_dense_over_nc'))} | "
             f"{x(r.get('peak_ttn_over_nc'))} |")
     lines.append("\n### SUM memory (area under the per-step curve)\n")
-    lines.append("| circuit | Clifft dense | TTN | NC dense state (transient) | "
-                 "NC dense state (resident) | dense/NC | TTN/NC |")
-    lines.append("|---|--:|--:|--:|--:|--:|--:|")
+    lines.append("| circuit | Clifft dense | TTN | NC TOTAL (transient) | "
+                 "NC TOTAL (resident) | – dense state | dense/NC | TTN/NC |")
+    lines.append("|---|--:|--:|--:|--:|--:|--:|--:|")
     for r in rows:
         lines.append(
             f"| {r['circuit']} | {human(r['sum_clifft_bytes'])} | "
             f"{human(r.get('sum_ttn_bytes'))} | "
-            f"{human(r.get('sum_nc_state_bytes', r.get('sum_nc_bytes')))} | "
-            f"{human(r.get('sum_nc_state_bytes_resident', r.get('sum_nc_bytes_resident')))} | "
+            f"{human(r.get('sum_nc_bytes'))} | "
+            f"{human(r.get('sum_nc_bytes_resident'))} | "
+            f"{human(r.get('sum_nc_state_bytes'))} | "
             f"{x(r.get('sum_dense_over_nc'))} | {x(r.get('sum_ttn_over_nc'))} |")
     text = "\n".join(lines) + "\n"
     (out / "SUMMARY_TABLE.md").write_text(text)

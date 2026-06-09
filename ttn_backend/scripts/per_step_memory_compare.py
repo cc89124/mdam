@@ -393,7 +393,7 @@ def main():
     peak_nc_state = max(nc_state_b) if nc_state_b else None
     sum_nc_state_res = sum(nc_state_b_res) if nc_state_b_res else None
     peak_nc_state_res = max(nc_state_b_res) if nc_state_b_res else None
-    peak_nc_overhead = (max(a - b for a, b in zip(nc_b, nc_state_b))
+    peak_nc_overhead = (max(max(0, a - b) for a, b in zip(nc_b, nc_state_b))
                         if nc_b and nc_state_b else None)
 
     # CSV (skip rewrite in replot mode)
@@ -466,17 +466,20 @@ def main():
         clifft_plot = [b / div for b in clifft_b]
         ttn_plot = ([NAN if b is None else b / div for b in ttn_b]
                     if ttn_b else None)
-        # MAIN NC line = exponential dense-state ONLY (16*2^block), apples-to-apples
-        # with Clifft's 16*2^k (both count only the dense state). The faint dotted line
-        # adds NC's Clifford-frame metadata -- the polynomial part Clifft's own tableau
-        # mirrors but the 2^k baseline omits, shown for honesty, never in the ratio.
-        nc_plot = [b / div for b in nc_state_b] if nc_state_b else None
-        nc_res_plot = [b / div for b in nc_state_b_res] if nc_state_b_res else None
-        nc_meta_plot = [b / div for b in nc_b] if nc_b else None
+        # MAIN NC line = TOTAL resident footprint (magic dense state 16*2^block +
+        # Clifford-frame metadata: tableau + unapplied pending). This is the whole
+        # memory the backend holds -- the point of this report (vs the state-only
+        # dimension view in per_step_active_state). The faint dotted line breaks out
+        # the dense magic state alone (16*2^block); the gap to the solid line is the
+        # polynomial metadata (Clifft keeps an O(n^2) tableau too, omitted from its
+        # 16*2^k baseline, so on tiny circuits NC's total can exceed it -- see README).
+        nc_plot = [b / div for b in nc_b] if nc_b else None
+        nc_res_plot = [b / div for b in nc_b_res] if nc_b_res else None
+        nc_meta_plot = [b / div for b in nc_state_b] if nc_state_b else None
         ylabel = f"memory ({unit}{', log scale' if args.yscale == 'log' else ', linear'})"
-        title = f"Per-step memory: {args.circuit}  (steps 0..{n_steps-1})"
-        nc_label = "near-Clifford dense magic state (16*2^block)"
-        nc_res_label = "near-Clifford (settled resident, 16*2^block)"
+        title = f"Per-step TOTAL memory: {args.circuit}  (steps 0..{n_steps-1})"
+        nc_label = "near-Clifford TOTAL (magic state + Clifford-frame metadata)"
+        nc_res_label = "near-Clifford total (settled resident)"
         clifft_label = "Clifft (dense active-state, 16*2^k)"
         ttn_label = "TTN backend (actual stored)"
 
@@ -491,8 +494,8 @@ def main():
         ax.plot(steps, nc_res_plot, label=nc_res_label, color="seagreen",
                 lw=1.0, ls="--", alpha=0.65)
     if nc_meta_plot is not None:
-        ax.plot(steps, nc_meta_plot, color="seagreen", lw=0.8, ls=":", alpha=0.5,
-                label="NC + Clifford-frame metadata (Clifft's own omitted from its line)")
+        ax.plot(steps, nc_meta_plot, color="seagreen", lw=0.8, ls=":", alpha=0.55,
+                label="NC dense magic state only (16*2^block; metadata excluded)")
     ax.set_yscale(args.yscale)
     ax.set_xlabel("runtime step")
     ax.set_ylabel(ylabel)
@@ -527,9 +530,9 @@ def main():
         peak_nc_state_bytes_resident=peak_nc_state_res,
         peak_nc_overhead_bytes=peak_nc_overhead,
         peak_dense_over_ttn=peak_clifft / peak_ttn if peak_ttn else None,
-        peak_dense_over_nc=peak_clifft / peak_nc_state if peak_nc_state else None,
-        peak_dense_over_nc_full=peak_clifft / peak_nc if peak_nc else None,
-        peak_ttn_over_nc=peak_ttn / peak_nc_state if peak_nc_state else None,
+        peak_dense_over_nc=peak_clifft / peak_nc if peak_nc else None,                # TOTAL
+        peak_dense_over_nc_state=peak_clifft / peak_nc_state if peak_nc_state else None,
+        peak_ttn_over_nc=peak_ttn / peak_nc if peak_nc else None,
         sum_clifft_bytes=sum_clifft,
         sum_ttn_bytes=sum_ttn,
         sum_nc_bytes=sum_nc,
@@ -537,9 +540,9 @@ def main():
         sum_nc_state_bytes=sum_nc_state,
         sum_nc_state_bytes_resident=sum_nc_state_res,
         sum_dense_over_ttn=sum_clifft / sum_ttn if sum_ttn else None,
-        sum_dense_over_nc=sum_clifft / sum_nc_state if sum_nc_state else None,
-        sum_dense_over_nc_full=sum_clifft / sum_nc if sum_nc else None,
-        sum_ttn_over_nc=sum_ttn / sum_nc_state if sum_nc_state else None,
+        sum_dense_over_nc=sum_clifft / sum_nc if sum_nc else None,                    # TOTAL
+        sum_dense_over_nc_state=sum_clifft / sum_nc_state if sum_nc_state else None,
+        sum_ttn_over_nc=sum_ttn / sum_nc if sum_nc else None,
         max_active_idents=max(nact) if nact else 0,
         peak_clifft_qubits=max(nact) if nact else 0,
         peak_ttn_qubits=round(peak_ttn_qubits, 2) if peak_ttn_qubits else None,

@@ -1,54 +1,56 @@
-# Per-step memory (bytes): Clifft dense vs TTN vs near-Clifford
+# Per-step TOTAL memory (bytes): Clifft dense vs TTN vs near-Clifford
 
-Per runtime step, the **resident memory in bytes** each backend holds. Companion to
-`reports/per_step_active_state` (which plots the active-state *dimension*).
+Per runtime step, the **total resident memory in bytes** each backend holds — the whole
+footprint, not just the dense state. This is the point of this report; the **state-only
+(exponential dimension)** comparison is the companion `reports/per_step_active_state`.
 
-## The comparison is the EXPONENTIAL dense state only (apples-to-apples)
+## What is counted
 
-The `dense/NC` ratio compares **only the dense state**:
-
-| backend | dense-state bytes |
+| backend | total resident bytes |
 |---|---|
-| **Clifft** (crimson) | `16 · 2^k` (k = active idents) |
-| **near-Clifford** (green solid) | `16 · 2^block` (largest magic block) |
-| settled resident (green dashed) | `16 · 2^block_resident` |
+| **Clifft** (crimson) | `16 · 2^k` (dense active state; k = active idents) |
+| **TTN** (steelblue) | actual stored tensor bytes |
+| **near-Clifford** (green solid) | **`16 · 2^block`  +  metadata** = dense magic state **+** Clifford frame (tableau) **+** unapplied pending rotations |
 
-Both sides count **only the exponential state**, no Clifford-frame metadata. On this
-metric near-Clifford is **parity-or-win at every circuit** (`cultivation_d3`,
-`cultivation_d5` = parity; everything else a win), exactly matching the dimension table
-in `per_step_active_state` — there is **no `<1x` cell**.
+The green **dotted** line breaks out the dense magic state alone (`16·2^block`); the gap
+up to the solid line is NC's polynomial metadata.
 
-## NC's Clifford-frame metadata is shown separately, NEVER in the ratio
+## Reading the `dense/NC` ratio honestly (total vs total)
 
-`near_clifft_bytes = 16·2^block  +  metadata`, where **metadata** = the Clifford tableau
-(`2n` Pauli images) + the *unapplied* pending rotations (the lazy-deferral buffer; an
-already-flushed rotation is removed from `pending`, so this is never applied history).
-It is the **faint dotted line** in each PNG and the **NC metadata** column in
-`SUMMARY_TABLE.md`.
+`dense/NC` compares the two totals. On large/real circuits the exponential term
+dominates and NC wins hugely (`coherent_d5_r5` total **135 KiB** vs Clifft **256 MiB**).
 
-This metadata is **polynomial** (`O(n²)`), not exponential. **Clifft keeps a tableau of
-the same order**, but its `16·2^k` baseline omits it — so charging it to NC while giving
-Clifft a metadata-free baseline is unfair to NC. That asymmetry (now removed from the
-ratio) is exactly what used to make tiny all-magic circuits look like a memory *loss*
-even when the exponential state was parity-or-smaller — e.g. `coherent_d3_r1` has NC
-magic `2^0` (no magic at all) yet its byte **sum** showed `<1x` purely from counting NC's
-tableau. The dotted line still shows the full footprint, honestly, for anyone who wants
-it; it just does not enter the headline comparison.
+On **tiny all-magic** circuits the ratio can dip **below 1×** — NC's total exceeds
+Clifft's. That is **not** an exponential regression; it is NC's `O(n²)` bookkeeping
+dominating a tiny `2^block` state. Two things to keep in mind:
+
+1. **It is conservative against NC.** Clifft is itself a near-Clifford simulator and
+   keeps a Clifford tableau of the same `O(n²)` order — but its `16·2^k` baseline counts
+   **only the dense state**, not that tableau. So the total comparison charges NC for its
+   bookkeeping while giving Clifft a metadata-free baseline.
+2. **The exponential state never loses.** Compare `16·2^block` vs `16·2^k` (the dotted
+   line, = the `per_step_active_state` dimension table) and NC is **parity-or-win at
+   every circuit**. Example: `coherent_d3_r1` has NC magic `2^0` (no magic at all), yet
+   its *total* byte SUM is `<1×` purely from the tableau — the dense state is infinitely
+   smaller than Clifft's `2^5`.
+
+`pending` holds only **un-applied** rotations: a flushed rotation is removed from it
+(`self.pending = keep` in `_flush_core`), so this metadata is never applied history.
 
 ## PNG lines
 
 - **crimson** — Clifft dense active state `16·2^k`.
-- **steelblue** — TTN backend, actual stored bytes (its own representation; can exceed
-  Clifft — that is the TTN/Clifft story, not NC).
-- **green solid** — near-Clifford dense magic state `16·2^block` (the comparison line).
-- **green dashed** — near-Clifford settled resident.
-- **green dotted (faint)** — near-Clifford + Clifford-frame metadata (Clifft's own
-  tableau omitted from its line).
+- **steelblue** — TTN backend, actual stored bytes (can exceed Clifft — that is the
+  TTN/Clifft story, not NC).
+- **green solid** — near-Clifford **TOTAL** footprint (dense magic state + metadata).
+- **green dashed** — near-Clifford total, settled resident.
+- **green dotted (faint)** — near-Clifford **dense magic state only** (`16·2^block`,
+  metadata excluded); the gap to the solid line is the metadata.
 
 ## Tables
 
-`SUMMARY_TABLE.md` — PEAK and SUM, with `NC dense state`, a separate `NC metadata`
-column, and the apples-to-apples `dense/NC` ratio. Full per-step data in the `*.csv`.
+`SUMMARY_TABLE.md` — PEAK and SUM: `NC TOTAL`, broken out into `dense state` + `metadata`,
+with the total-vs-total `dense/NC`. Full per-step data in the `*.csv`.
 
 ## Regenerate
 
