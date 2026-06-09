@@ -15,30 +15,30 @@ Active-state size = log2(dense-equivalent dimension), in qubits. Clifft = #activ
 
 ## Per-step memory: Clifft dense vs TTN vs near-Clifford block
 
-Linear-scale per-step PNGs are `<circuit>_per_step_linear.png`. Clifft dense = `16*2^k` over concurrently-active idents; TTN = resident bag bytes; near-Clifford = magic blocks + tableau. **near-Clifford MAIN = intra-step transient high-water mark**; the (resident) column is the settled step-boundary value. dense/NC and TTN/NC ratios use the conservative transient peak. (memory only; correctness covered elsewhere)
+Linear-scale per-step PNGs are `<circuit>_per_step_linear.png`. Clifft dense = `16*2^k` (dense active state). **The `dense/NC` ratio compares the EXPONENTIAL dense state only** — Clifft `16*2^k` vs near-Clifford `16*2^block` — so it is apples-to-apples (both omit their Clifford-frame metadata; Clifft has an `O(n^2)` tableau too). The **NC metadata** column (Clifford frame + unapplied pending) is the polynomial part Clifft's baseline omits — it is **not** in the ratio. **near-Clifford MAIN = intra-step transient high-water**; (resident) = settled step-boundary. (memory only; correctness covered elsewhere)
 
 ### PEAK memory (max over steps)
 
-| circuit | k | Clifft dense | TTN | near-Clifford (transient) | near-Clifford (resident) | dense/NC | TTN/NC |
-|---|--:|--:|--:|--:|--:|--:|--:|
-| coherent_d3_r1 | 5 | 512.0 B | 1.1 KiB | 498.0 B | 498.0 B | 1.0× | 2.3× |
-| coherent_d3_r3 | 8 | 4.0 KiB | 11.1 KiB | 1.4 KiB | 1.2 KiB | 2.9× | 8.0× |
-| coherent_d5_r1 | 13 | 128.0 KiB | 46.8 KiB | 2.1 KiB | 2.1 KiB | 61.2× | 22.4× |
-| coherent_d5_r5 | 24 | 256.0 MiB | 217.3 MiB | 135.0 KiB | 71.0 KiB | 1942.2× | 1648.2× |
-| distillation | 5 | 512.0 B | 656.0 B | 230.0 B | 210.0 B | 2.2× | 2.9× |
-| cultivation_d3 | 4 | 256.0 B | 1.2 KiB | 416.0 B | 416.0 B | 0.6× | 2.8× |
-| cultivation_d5 | 10 | 16.0 KiB | 35.9 KiB | 16.2 KiB | 8.9 KiB | 1.0× | 2.2× |
-| surface_d7_r7 | 0 | 16.0 B | n/a | 0.0 B | 0.0 B | n/a | n/a |
+| circuit | k | Clifft dense | TTN | NC dense state (transient) | NC dense state (resident) | NC metadata | dense/NC | TTN/NC |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| coherent_d3_r1 | 5 | 512.0 B | 1.1 KiB | 16.0 B | 16.0 B | 482.0 B | 32.0× | 73.0× |
+| coherent_d3_r3 | 8 | 4.0 KiB | 11.1 KiB | 512.0 B | 256.0 B | 1.2 KiB | 8.0× | 22.2× |
+| coherent_d5_r1 | 13 | 128.0 KiB | 46.8 KiB | 16.0 B | 16.0 B | 2.1 KiB | 8192.0× | 2993.0× |
+| coherent_d5_r5 | 24 | 256.0 MiB | 217.3 MiB | 128.0 KiB | 64.0 KiB | 8.1 KiB | 2048.0× | 1738.0× |
+| distillation | 5 | 512.0 B | 656.0 B | 128.0 B | 64.0 B | 194.0 B | 4.0× | 5.1× |
+| cultivation_d3 | 4 | 256.0 B | 1.2 KiB | 256.0 B | 128.0 B | 288.0 B | 1.0× | 4.6× |
+| cultivation_d5 | 10 | 16.0 KiB | 35.9 KiB | 16.0 KiB | 8.0 KiB | 920.0 B | 1.0× | 2.2× |
+| surface_d7_r7 | 0 | 16.0 B | n/a | 0.0 B | 0.0 B | n/a | n/a | n/a |
 
 ### SUM memory (area under the per-step curve)
 
-| circuit | Clifft dense | TTN | near-Clifford (transient) | near-Clifford (resident) | dense/NC | TTN/NC |
+| circuit | Clifft dense | TTN | NC dense state (transient) | NC dense state (resident) | dense/NC | TTN/NC |
 |---|--:|--:|--:|--:|--:|--:|
-| coherent_d3_r1 | 42.8 KiB | 149.4 KiB | 81.1 KiB | 81.1 KiB | 0.5× | 1.8× |
-| coherent_d3_r3 | 922.0 KiB | 2.3 MiB | 410.0 KiB | 393.8 KiB | 2.2× | 5.9× |
-| coherent_d5_r1 | 33.2 MiB | 12.8 MiB | 1.2 MiB | 1.2 MiB | 27.0× | 10.4× |
-| coherent_d5_r5 | 440.4 GiB | 59.4 GiB | 132.6 MiB | 129.7 MiB | 3401.1× | 458.4× |
-| distillation | 283.1 KiB | 946.9 KiB | 254.1 KiB | 215.9 KiB | 1.1× | 3.7× |
-| cultivation_d3 | 45.9 KiB | 161.1 KiB | 51.5 KiB | 49.6 KiB | 0.9× | 3.1× |
-| cultivation_d5 | 7.8 MiB | 8.1 MiB | 4.0 MiB | 3.9 MiB | 2.0× | 2.0× |
+| coherent_d3_r1 | 42.8 KiB | 149.4 KiB | 4.0 KiB | 4.0 KiB | 10.7× | 37.4× |
+| coherent_d3_r3 | 922.0 KiB | 2.3 MiB | 53.7 KiB | 51.6 KiB | 17.2× | 44.7× |
+| coherent_d5_r1 | 33.2 MiB | 12.8 MiB | 13.4 KiB | 13.4 KiB | 2534.9× | 975.6× |
+| coherent_d5_r5 | 440.4 GiB | 59.4 GiB | 115.1 MiB | 112.5 MiB | 3917.5× | 528.0× |
+| distillation | 283.1 KiB | 946.9 KiB | 92.3 KiB | 89.4 KiB | 3.1× | 10.3× |
+| cultivation_d3 | 45.9 KiB | 161.1 KiB | 22.2 KiB | 21.0 KiB | 2.1× | 7.3× |
+| cultivation_d5 | 7.8 MiB | 8.1 MiB | 3.5 MiB | 3.5 MiB | 2.2× | 2.3× |
 | surface_d7_r7 | 43.0 KiB | n/a | 0.0 B | 0.0 B | n/a | n/a |

@@ -64,33 +64,37 @@ def main():
         lines.append("")
     lines.append("## Per-step memory: Clifft dense vs TTN vs near-Clifford block\n")
     lines.append("Linear-scale per-step PNGs are `<circuit>_per_step_linear.png`. "
-                 "Clifft dense = `16*2^k` over concurrently-active idents; TTN = "
-                 "resident bag bytes; near-Clifford = magic blocks + tableau. "
-                 "**near-Clifford MAIN = intra-step transient high-water mark**; the "
-                 "(resident) column is the settled step-boundary value. dense/NC and "
-                 "TTN/NC ratios use the conservative transient peak. "
-                 "(memory only; correctness covered elsewhere)\n")
+                 "Clifft dense = `16*2^k` (dense active state). **The `dense/NC` ratio "
+                 "compares the EXPONENTIAL dense state only** — Clifft `16*2^k` vs "
+                 "near-Clifford `16*2^block` — so it is apples-to-apples (both omit "
+                 "their Clifford-frame metadata; Clifft has an `O(n^2)` tableau too). "
+                 "The **NC metadata** column (Clifford frame + unapplied pending) is the "
+                 "polynomial part Clifft's baseline omits — it is **not** in the ratio. "
+                 "**near-Clifford MAIN = intra-step transient high-water**; (resident) = "
+                 "settled step-boundary. (memory only; correctness covered elsewhere)\n")
     lines.append("### PEAK memory (max over steps)\n")
-    lines.append("| circuit | k | Clifft dense | TTN | near-Clifford (transient) | "
-                 "near-Clifford (resident) | dense/NC | TTN/NC |")
-    lines.append("|---|--:|--:|--:|--:|--:|--:|--:|")
+    lines.append("| circuit | k | Clifft dense | TTN | NC dense state (transient) | "
+                 "NC dense state (resident) | NC metadata | dense/NC | TTN/NC |")
+    lines.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|")
     for r in rows:
         lines.append(
             f"| {r['circuit']} | {r.get('max_active_idents','?')} | "
             f"{human(r['peak_clifft_bytes'])} | {human(r.get('peak_ttn_bytes'))} | "
-            f"{human(r.get('peak_nc_bytes'))} | "
-            f"{human(r.get('peak_nc_bytes_resident'))} | "
+            f"{human(r.get('peak_nc_state_bytes', r.get('peak_nc_bytes')))} | "
+            f"{human(r.get('peak_nc_state_bytes_resident', r.get('peak_nc_bytes_resident')))} | "
+            f"{human(r.get('peak_nc_overhead_bytes'))} | "
             f"{x(r.get('peak_dense_over_nc'))} | "
             f"{x(r.get('peak_ttn_over_nc'))} |")
     lines.append("\n### SUM memory (area under the per-step curve)\n")
-    lines.append("| circuit | Clifft dense | TTN | near-Clifford (transient) | "
-                 "near-Clifford (resident) | dense/NC | TTN/NC |")
+    lines.append("| circuit | Clifft dense | TTN | NC dense state (transient) | "
+                 "NC dense state (resident) | dense/NC | TTN/NC |")
     lines.append("|---|--:|--:|--:|--:|--:|--:|")
     for r in rows:
         lines.append(
             f"| {r['circuit']} | {human(r['sum_clifft_bytes'])} | "
-            f"{human(r.get('sum_ttn_bytes'))} | {human(r.get('sum_nc_bytes'))} | "
-            f"{human(r.get('sum_nc_bytes_resident'))} | "
+            f"{human(r.get('sum_ttn_bytes'))} | "
+            f"{human(r.get('sum_nc_state_bytes', r.get('sum_nc_bytes')))} | "
+            f"{human(r.get('sum_nc_state_bytes_resident', r.get('sum_nc_bytes_resident')))} | "
             f"{x(r.get('sum_dense_over_nc'))} | {x(r.get('sum_ttn_over_nc'))} |")
     text = "\n".join(lines) + "\n"
     (out / "SUMMARY_TABLE.md").write_text(text)
