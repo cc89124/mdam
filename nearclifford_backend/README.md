@@ -399,22 +399,25 @@ small (see `reports/per_step_flops/FLOPS_TABLE.*`).
 * **All-magic families (factorable → win/parity; irreducible → limit, not a win).**
   `distillation` / `cultivation` inject genuine `T`/magic states — most active qubits
   are real magic, little for the Clifford frame to absorb. They used to *lose*
-  (`max_block ≈ k` plus a pure-overhead factoring scan). Two fixes (§11) close most of
-  that gap: touched-qubit factoring cuts the factoring FLOP, and the `_purge_redundant`
-  `W_M` peel removes the dof each magic measurement consumes (so measured-out qubits no
-  longer sit resident). Peak `max_block` drops `distillation` 5→3, `cultivation_d3`
-  6→4, `cultivation_d5` 14→11, taking `distillation` from a memory loss (dense/NC 0.9×)
-  to a **win** (2.2×) and `cultivation_d3` to parity. `cultivation_d5` improves
-  0.1×→0.5× but **stays a 2× loss vs `clifft`** — its transient `max_block 2^11`
-  exceeds `clifft`'s `2^10`, and even the settled resident `2^10` only *ties*; the
-  magic is irreducible, so near-Clifford does **not** outperform `clifft` here (an
-  honest limit case, not a win). The residual cost on these is the genuine non-Clifford
-  magic, which no representation can remove.
+  (`max_block ≈ k` plus a pure-overhead factoring scan). Three fixes (§11) close that
+  gap: touched-qubit factoring cuts the factoring FLOP, the `_purge_redundant` `W_M`
+  peel removes the dof each magic measurement consumes, and **frame reduction at
+  demotion (`decouple_demote`, default ON) decouples the measured-out residue** (so
+  measured-out qubits no longer sit resident). Peak transient `max_block` drops
+  `distillation` 5→3, `cultivation_d3` 6→4, `cultivation_d5` 14→10, taking
+  `distillation` from a memory loss (dense/NC 0.9×) to a **win** (2.2× memory — and now
+  a **1.4× compute win** too, since the smaller blocks cut the factoring FLOP) and
+  `cultivation_d3` to parity. `cultivation_d5` reaches **parity**: its transient
+  `max_block 2^10` now *equals* `clifft`'s `2^10` (the earlier `2^11` 2×-loss was the
+  pre-reduction number), and the settled resident even dips to `2^9` (a 2× sub-peak
+  factoring win). But the magic is irreducible, so near-Clifford does **not** outperform
+  `clifft` here — parity is the ceiling, an honest limit case, not a win. The residual
+  cost on these is the genuine non-Clifford magic, which no representation can remove.
 
   > **Be honest about the baseline (measured).** "dense" above means the **active-state**
   > baseline `2^k` (`k = clifft peak_rank`), *not* the full `2^N` statevector. Against
   > `2^N` every circuit wins astronomically (the physical ancillas are stabilizer and
-  > absorbed: `distillation` `2^85/2^3`, `cultivation_d5` `2^42/2^11`). Against the
+  > absorbed: `distillation` `2^85/2^3`, `cultivation_d5` `2^42/2^10`). Against the
   > meaningful `2^k`/`clifft` baseline the all-magic picture is mixed and partly
   > negative — the only remaining lever is block factoring, which helps only if the
   > magic actually factors:
@@ -423,16 +426,16 @@ small (see `reports/per_step_flops/FLOPS_TABLE.*`).
   > |---|--:|--:|--:|--:|--:|
   > | distillation | 85 | 5 | 3 | ~10²⁴× | **4× (win — magic factors)** |
   > | cultivation_d3 | 15 | 4 | 4 | 2050× | **1× (parity — irreducible)** |
-  > | cultivation_d5 | 42 | 10 | 11 | 2×10⁹× | **0.5× (LOSS — irreducible + 1-qubit transient over-materialisation)** |
+  > | cultivation_d5 | 42 | 10 | 10 | 4×10⁹× | **1× (parity — irreducible; resident settles 2^9; one sub-peak per-meas +1)** |
   > | coherent_d3_r3 | 26 | 8 | 5 | 2×10⁶× | 8× |
   > | coherent_d5_r5 | 64 | 24 | 13 | 2×10¹⁵× | **2050×** |
   >
   > So near-Clifford is **weakest at the all-magic limit** (where it converges to dense:
-  > `cultivation_d5` is genuinely a 2× *loss* vs `clifft` — transient `2^11` vs `2^10`,
-  > and even the resident `2^10` only ties; the resident drop `11→10` is recovery vs the
-  > *eager* block backend, **not** vs `clifft`) and **strongest on stabilizer-rich
-  > coherent circuits** (`d5_r5` 2050× vs `clifft`). Stating the all-magic loss plainly
-  > makes the stabilizer-rich win credible.
+  > `cultivation_d5` is **parity** vs `clifft` — transient `2^10 = 2^10`, settled
+  > resident `2^9`; frame reduction removed the earlier `2^11` 2×-loss, but the
+  > irreducible magic caps it at parity, never a win) and **strongest on stabilizer-rich
+  > coherent circuits** (`d5_r5` 2050× vs `clifft`). Stating the all-magic parity ceiling
+  > plainly makes the stabilizer-rich win credible.
 
 * **Pure-Clifford + Pauli noise (`surface_d7_r7`).** Compiles to **zero** active
   idents — entirely Pauli-frame — so all of memory, active-state, and FLOP are ~0.
@@ -520,22 +523,24 @@ the true peak and is the secondary metric):
 | coherent_d5_r1 (boundary-free) | **0** / 0 | 13 | pure stabilizer in Z basis — free |
 | coherent_d3_r3 (multi-round) | **5** / 4 | 8 | matches clifft within sampling error (see below) |
 | coherent_d5_r5 (multi-round) | **13** (irreducible) / 12 | 24 | transient `2^13`=128 KB (resident `2^12`=64 KB) vs TTN `χ=2^11`≈134 MB |
-| distillation | **3** / 3 | 5 | all-magic, PASS (purge: was 5) |
-| cultivation_d3 | **4** / 3 | 4 | all-magic, PASS (purge: was 6) |
-| cultivation_d5 (all-magic limit) | **11** / 10 | 10 | **limit case — does NOT beat `clifft`**: transient `11 > k=10` (2× loss); resident `10` only ties (parity). The `11→10` drop is vs *eager*, not `clifft`. |
+| distillation | **3** / 2 | 5 | all-magic, but factors → **win** (4× transient / 8× resident; purge: was 5) |
+| cultivation_d3 | **4** / 3 | 4 | all-magic, PASS (parity transient, 2× resident; purge: was 6) |
+| cultivation_d5 (all-magic limit) | **10** / 9 | 10 | **limit case — does NOT beat `clifft`**: transient `10 = k` (**parity**, frame reduction removed the earlier `11` 2×-loss); resident settles `9`. One **sub-peak** per-meas `+1` (meas 3, k=2) that never reaches the global peak. |
 
 (Most circuits have transient = resident; the gap appears only where a measurement's
 core-flush momentarily forms a block one qubit larger than the post-collapse residue —
 `coherent_d3_r3` 5/4 and `coherent_d5_r5` 13/12.)
 
-> The `distillation`/`cultivation` peaks above are **post-purge** (§11): the
-> `_purge_redundant` `W_M` peel removes the dof each magic measurement consumes, so
-> the all-magic blocks no longer carry measured-out residue — `distillation` 5→3,
-> `cultivation_d3` 6→4, `cultivation_d5` 14→11 (peak `max_block`), turning
-> `distillation` from a memory *loss* into a win (dense/NC 0.9×→2.2×) and
-> `cultivation_d3` to parity. `cultivation_d5` improves 0.1×→0.5× but **remains a 2×
-> loss** vs `clifft` (transient `2^11` > `2^10`; resident `2^10` only ties) — an honest
-> limit case, not a win — with the sampled distribution unchanged.
+> The `distillation`/`cultivation` peaks above are **post-reduction** (§11): the
+> `_purge_redundant` `W_M` peel plus frame reduction (`decouple_demote`, default ON)
+> remove the dof each magic measurement consumes *and* decouple the measured-out
+> residue — `distillation` 5→3, `cultivation_d3` 6→4, `cultivation_d5` 14→10 (peak
+> transient `max_block`), turning `distillation` from a memory *loss* into a win
+> (dense/NC 0.9×→2.2×, plus a 1.4× compute win) and `cultivation_d3` to parity.
+> `cultivation_d5` reaches **parity** (transient `2^10 = 2^10`; resident settles `2^9`),
+> removing the earlier `2^11` 2×-loss — but the irreducible magic caps it at parity, so
+> it still does **not** beat `clifft` (an honest limit case, not a win) — with the
+> sampled distribution unchanged.
 
 > **Multi-round coherent (`coherent_d3_r3`): no systematic bias — matches `clifft`
 > within sampling error.** An earlier note here claimed a "persistent ~1.5 % real
@@ -619,15 +624,18 @@ noise-site pool and is *not* a valid input here.
   inflation: `cultivation_d3`'s 1-live+3-dead block → 1, and peak `max_block` drops
   `distillation` 5→3, `cultivation_d3` 6→4, `cultivation_d5` 14→**11 transient / 10
   resident** (8×–16× less magic memory/FLOP on the all-magic families) with no change
-  to the sampled distribution. (Even at 11/10, `cultivation_d5` does not beat `clifft`'s
-  `k=10` — see §8.4: transient is a 2× loss, resident only parity.)
+  to the sampled distribution. (This `W_M` peel alone leaves `cultivation_d5` at `11/10`;
+  the frame-reduction bullet below takes it to `10/9 = clifft parity`. Either way
+  `cultivation_d5` does **not** beat `clifft`'s `k=10` — parity is the irreducible-magic
+  ceiling; see §8.4.)
 * **Frame reduction at demotion (`decouple_demote`, DEFAULT ON) — no settled
   per-measurement memory loss.** Per-measurement, the near-Clifford state could exceed
   `clifft`'s active rank: a measured-out (demoted) magic qubit can stay entangled in a
   live block because the physical `Z_q` pulls back to a register Pauli **not supported on
   `q`** (traced: index 4's measurement has pullback support `{2,3}`), so the measurement's
   `_purge_redundant` consumes a *different* dof and `q` lingers as dead residue that later
-  flushes re-promote. The frame reduction removes it in two parts, both **exact identity
+  flushes re-promote. The frame reduction removes it in two parts (this is what takes
+  `cultivation_d5` the rest of the way, `11/10 → 10/9 = clifft parity`), both **exact identity
   insertions** (state-exact ⇒ distribution-exact; no rng consumed):
   - **`q∈supp` (the easy case):** make the W-peel collapse onto the **demoted index
     itself** (`r=q`) instead of `supp[0]`, so the just-demoted qubit is the one peeled.
@@ -644,14 +652,20 @@ noise-site pool and is *not* a valid input here.
   equally correct sampler*. Default is ON; pass `decouple_demote=False` for the legacy
   **bit-identical** path (kept for the bit-identical regression check, §9).
 
-  **Measured (gap + marginal harness):** with it on, **every circuit has `nc ≤ clifft` at
-  the settled (resident) level at every measurement** — settled loss count → 0 everywhere,
-  including `cultivation_d5` (`5→0`; its peak `max_block` drops `11→10` = `clifft` parity,
-  exactly as predicted — *parity, not a win*, since the magic is irreducible). Transient:
-  `distillation` (`−2→0`, `2→0`) and `cultivation_d3` (`−1→0`, `1→0`) fully fixed; the only
-  residual is **one** transient `+1` spike left on `cultivation_d5` (`11→1` loss
-  measurements). Distribution unchanged within sampling (`max|Δmarginal| ≤ 0.009`);
-  `verify_block` ALL PASS (fidelity 1.0); runtime unchanged (the GF(2) peel is cheap).
+  **Measured (gap + marginal harness; 15-seed scan, seed-robust):** with it on, **every
+  circuit has `nc ≤ clifft` at the settled (resident) level at every measurement** —
+  settled loss count → 0 everywhere, including `cultivation_d5` (`5→0`; its **global
+  transient peak** `max_block` is `10 = clifft` parity, and the settled resident even dips
+  to `9` — a 2× sub-peak factoring win; *parity is still the headline*, the magic is
+  irreducible so it does not beat `clifft`). Transient: `distillation` (`−2→0`, `2→0`) and
+  `cultivation_d3` (`−1→0`, `1→0`) fully fixed; the only residual is **one per-measurement,
+  SUB-PEAK** transient `+1` on `cultivation_d5` (at the lone measurement where `clifft`'s
+  local rank dips to `k=2` and `nc` is `3`) — it never reaches the global peak `10`, so it
+  does **not** change the memory-provisioning peak (still parity). Frame reduction also
+  **cuts compute** (smaller blocks ⇒ cheaper factoring scan): NC FLOP drops 6–13× vs
+  pre-reduction, flipping `distillation` to a `1.4×` compute win and lifting `coherent_d5_r5`
+  `16×→74×`. Distribution unchanged within sampling (`max|Δmarginal| ≤ 0.009`); `verify_block`
+  ALL PASS (fidelity 1.0); runtime unchanged (the GF(2) peel is cheap).
 
   *Why the last spike survives (and what would remove it).* Traced: it is **not**
   intra-flush — it is the block **carried between two consecutive measurements**. `clifft`
