@@ -79,9 +79,9 @@ def _apply_pauli_local(qubits, vec, xmask, zmask, phase):
     if mz == 0:                                   # diagonal sign is constant i^phase
         if mx == 0:
             return ph * vec
-        out = np.empty_like(vec)
-        out[_arange(k) ^ mx] = ph * vec
-        return out
+        # out[i^mx] = ph*vec[i]  <=>  out[j] = ph*vec[j^mx]  -- a GATHER (fancy read,
+        # faster than the equivalent scatter), since j->j^mx is an involution.
+        return (ph * vec)[_arange(k) ^ mx]
     idx = _arange(k)
     v = idx & mz                                  # fresh array; safe to fold in place
     for sh in (32, 16, 8, 4, 2, 1):
@@ -89,9 +89,7 @@ def _apply_pauli_local(qubits, vec, xmask, zmask, phase):
     sign = ph * (1 - 2 * (v & 1))
     if mx == 0:                                   # identity permutation
         return sign * vec
-    out = np.empty_like(vec)
-    out[idx ^ mx] = sign * vec
-    return out
+    return (sign * vec)[idx ^ mx]                 # gather (see above)
 
 
 class MagicRegister:
