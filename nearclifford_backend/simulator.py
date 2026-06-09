@@ -36,7 +36,7 @@ def pauli_mul(a, b):
     x = xa ^ xb
     z = za ^ zb
     # phase from moving Z_a past X_b: Z X = -X Z, i.e. each (za & xb) bit gives -1=i^2
-    p = (pa + pb + 2 * (bin(za & xb).count("1"))) & 3
+    p = (pa + pb + 2 * (za & xb).bit_count()) & 3
     return (x, z, p)
 
 
@@ -44,7 +44,7 @@ def pauli_commute(a, b):
     """True if a,b commute (symplectic inner product even)."""
     xa, za, _ = a
     xb, zb, _ = b
-    return ((bin(xa & zb).count("1") + bin(za & xb).count("1")) & 1) == 0
+    return (((xa & zb).bit_count() + (za & xb).bit_count()) & 1) == 0
 
 
 class NearClifford:
@@ -56,6 +56,11 @@ class NearClifford:
         self.M = []                 # ordered list of magic qubits
         self.phi = np.array([1.0 + 0j])   # dense over M (initially empty -> scalar 1)
         self.rng = np.random.default_rng(0)
+        # frame-change version (bumped by every Xc/Zc mutation) + pullback-basis cache:
+        # the GF(2) elimination of the frame columns depends only on the frame, so it is
+        # reused across _pullback calls until a Clifford gate changes the frame.
+        self._frame_ver = 0
+        self._pb_cache = None
 
     # ---- Clifford gates: conjugate the tableau (U_C -> G U_C) ----
     # new image of P_i = G (old image) G^dag. We update by applying G's action to
@@ -64,6 +69,7 @@ class NearClifford:
         for i in range(self.n):
             self.Xc[i] = fn(self.Xc[i])
             self.Zc[i] = fn(self.Zc[i])
+        self._frame_ver += 1
 
     def h(self, q):
         bit = 1 << q
@@ -114,6 +120,7 @@ class NearClifford:
     def right_h(self, s):
         """U_C <- U_C H_s. H X_s H = Z_s, H Z_s H = X_s -> swap the X/Z image columns."""
         self.Xc[s], self.Zc[s] = self.Zc[s], self.Xc[s]
+        self._frame_ver += 1
 
     def right_s(self, s, dag=False):
         """U_C <- U_C S_s (or S_s^dag). S X_s S^dag = Y_s, S Z_s S^dag = Z_s, so only
@@ -121,12 +128,14 @@ class NearClifford:
         (Y = i XZ for S; -Y for S^dag)."""
         m = pauli_mul(self.Xc[s], self.Zc[s])      # image(X_s Z_s)
         self.Xc[s] = (m[0], m[1], (m[2] + (3 if dag else 1)) & 3)
+        self._frame_ver += 1
 
     def right_cx(self, c, t):
         """U_C <- U_C CNOT(c,t). CNOT X_c CNOT = X_c X_t and CNOT Z_t CNOT = Z_c Z_t
         (X_t, Z_c fixed) -> Xc[c] *= Xc[t], Zc[t] *= Zc[c]."""
         self.Xc[c] = pauli_mul(self.Xc[c], self.Xc[t])
         self.Zc[t] = pauli_mul(self.Zc[c], self.Zc[t])
+        self._frame_ver += 1
 
     # ---- pull a logical Pauli P back through the frame: P' = U_C^dag P U_C ----
     # If true-P = prod over set bits of (X_i, Z_i), then U_C^dag (true-P) U_C is
@@ -138,26 +147,16 @@ class NearClifford:
     # For our use (P = Z_q single logical), pullback Z_q = the Pauli M s.t.
     #   U_C M U_C^dag = Z_q  ->  M = U_C^dag Z_q U_C. We get M by expressing Z_q in
     #   terms of {Xc[i],Zc[i]} and reading the coefficients as M's (x,z).
-    def _pullback(self, x, z):
-        """Return P' = U_C^dag P U_C as (x',z',phase) for logical P=(x,z,phase0=0).
-        Solve for coefficients c s.t. P = prod_i Xc[i]^{ax_i} Zc[i]^{az_i}."""
-        # Build 2n x 2n symplectic matrix whose columns are (Xc[i] | Zc[i]) in
-        # (x|z) coordinates; solve for the combination giving target (x|z).
+    def _pullback_basis(self):
+        """GF(2) elimination basis of the frame columns (Xc|Zc), each as a 2n-bit
+        vector (x bits then z bits). Depends ONLY on the frame, so it is cached and
+        rebuilt only when a Clifford gate bumps `_frame_ver`."""
+        c = self._pb_cache
+        if c is not None and c[0] == self._frame_ver:
+            return c[1]
         n = self.n
-        cols = []
-        for i in range(n):
-            cols.append((self.Xc[i][0], self.Xc[i][1]))
-        for i in range(n):
-            cols.append((self.Zc[i][0], self.Zc[i][1]))
-        # GF(2) solve: find coeff bits b (len 2n) with sum b_j col_j = (x,z)
-        rows = []   # each row: 2n-bit colmask folded? We do elimination over 2n eqs.
-        # represent each column as a 2n-bit vector (x bits then z bits)
-        cvec = []
-        for (cx_, cz_) in cols:
-            v = cx_ | (cz_ << n)
-            cvec.append(v)
-        target = x | (z << n)
-        # Gaussian elimination to express target as XOR of cvec subset
+        cvec = [self.Xc[i][0] | (self.Xc[i][1] << n) for i in range(n)]
+        cvec += [self.Zc[i][0] | (self.Zc[i][1] << n) for i in range(n)]
         basis = []           # (pivotbit, vec, coeffmask)
         for j, v in enumerate(cvec):
             cur = v; cm = 1 << j
@@ -167,6 +166,15 @@ class NearClifford:
             if cur:
                 pb = (cur & -cur).bit_length() - 1
                 basis.append((pb, cur, cm))
+        self._pb_cache = (self._frame_ver, basis)
+        return basis
+
+    def _pullback(self, x, z):
+        """Return P' = U_C^dag P U_C as (x',z',phase) for logical P=(x,z,phase0=0).
+        Solve for coefficients c s.t. P = prod_i Xc[i]^{ax_i} Zc[i]^{az_i}."""
+        n = self.n
+        basis = self._pullback_basis()         # cached per frame version
+        target = x | (z << n)
         # reduce target
         curt = target; coeff = 0
         for (pb, bv, bcm) in basis:
@@ -282,6 +290,7 @@ class NearClifford:
         # pivot: old stabilizer becomes destabilizer; new stabilizer = (-1)^out Pm
         self.Xc[p] = Sp
         self.Zc[p] = (Pm[0], Pm[1], (Pm[2] + 2 * out) & 3)
+        self._frame_ver += 1                 # frame changed -> invalidate pullback cache
         return out
 
     # ---- measure Z_q ; returns 0/1 outcome (samples), collapses state ----

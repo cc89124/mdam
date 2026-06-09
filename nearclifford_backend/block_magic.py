@@ -48,9 +48,26 @@ def _vec_cx(vec, jc, jt):
     return vec[perm]
 
 
+_ARANGE_CACHE = {}
+
+
+def _arange(k):
+    """Cached np.arange(2^k) (read-only; callers only XOR/AND it into fresh arrays)."""
+    a = _ARANGE_CACHE.get(k)
+    if a is None:
+        a = np.arange(1 << k, dtype=np.int64)
+        _ARANGE_CACHE[k] = a
+    return a
+
+
 def _apply_pauli_local(qubits, vec, xmask, zmask, phase):
     """Apply i^phase * X^x Z^z (global masks) restricted to a block's `qubits`
-    to its `vec`. qubits[j] is bit j (LSB) of the block vector."""
+    to its `vec`. qubits[j] is bit j (LSB) of the block vector.
+
+    Fast paths (algebraically identical to the general scatter below):
+      * mz==0  -> the Z-parity sign is the constant i^phase (no per-amp parity scan);
+      * mx==0  -> X^0 is the identity permutation, so no scatter (just scale);
+    and `vec[arange]` == `vec`, so the gather is dropped."""
     k = len(qubits)
     mx = mz = 0
     for j, q in enumerate(qubits):
@@ -58,13 +75,22 @@ def _apply_pauli_local(qubits, vec, xmask, zmask, phase):
             mx |= 1 << j
         if (zmask >> q) & 1:
             mz |= 1 << j
-    idx = np.arange(1 << k, dtype=np.int64)
-    v = idx & mz
+    ph = 1j ** phase
+    if mz == 0:                                   # diagonal sign is constant i^phase
+        if mx == 0:
+            return ph * vec
+        out = np.empty_like(vec)
+        out[_arange(k) ^ mx] = ph * vec
+        return out
+    idx = _arange(k)
+    v = idx & mz                                  # fresh array; safe to fold in place
     for sh in (32, 16, 8, 4, 2, 1):
         v ^= v >> sh
-    sign = (1j ** phase) * (1 - 2 * (v & 1))
+    sign = ph * (1 - 2 * (v & 1))
+    if mx == 0:                                   # identity permutation
+        return sign * vec
     out = np.empty_like(vec)
-    out[idx ^ mx] = sign * vec[idx]
+    out[idx ^ mx] = sign * vec
     return out
 
 

@@ -61,7 +61,7 @@ def _conj_cx(P, c, t):
 
 
 def _commute_xz(ax, az, bx, bz):
-    return ((bin(ax & bz).count("1") + bin(az & bx).count("1")) & 1) == 0
+    return (((ax & bz).bit_count() + (az & bx).bit_count()) & 1) == 0
 
 
 class LazyNearClifford(NearClifford):
@@ -151,7 +151,7 @@ class LazyNearClifford(NearClifford):
             for (x, z, p, theta) in flush:
                 xp, zp, pp = self._pullback(x, z)
                 supp |= xp
-            self.max_M = max(self.max_M, bin(supp).count("1"))
+            self.max_M = max(self.max_M, supp.bit_count())
             return
         for (x, z, p, theta) in flush:       # append order preserved
             self._flush_one(x, z, theta)
