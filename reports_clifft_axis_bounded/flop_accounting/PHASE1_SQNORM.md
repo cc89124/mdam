@@ -1,5 +1,14 @@
 # Phase 1 — eliminate the repeated measurement sqnorm (bounded backend)
 
+> **Baseline frozen**: commit `a0e67f7`, tag `phase1-sqnorm` (branch `feat/multicnot-parity-rewrite`).
+> Reproduce: `python reports_clifft_axis_bounded/flop_accounting/scripts/phase1_verify.py`
+> (bit-exact NEW vs reconstructed-OLD), `…/phase1_sqnorm_trace.py` (sqnorm before/after),
+> `…/phase1_bounded_flop.py` (FLOP before/after, all 9 circuits, complete normalize accounting).
+> The original (pre-Phase-1) backend is reconstructed inline in those harnesses (`OLD_measure_z`),
+> so both versions run from this one checkout. `_purge_verify=True` keeps the residual-product
+> assertion live in verification mode.
+
+
 Two changes, both **bit-exact** (verified per-seed vs the original code). Nothing observable
 changes: measurement records, peak resident rank (the hard memory bound), and the Born
 probability sequence are identical to fp; only the FLOP drops. clifft is **not touched**.

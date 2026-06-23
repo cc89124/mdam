@@ -16,7 +16,7 @@ from nearclifford_backend.clifft_axis import budget as _bud
 from nearclifford_backend.clifft_axis.bounded import compile_bounded, CliftAxisBoundedNearClifford as C
 
 COEF = {'rot:offdiag': 12, 'rot:offdiag-scalar': 12, 'collapse:offdiag': 12,
-        'rot:diag': 6, 'rot:diag0': 6, 'rot:diag-scalar': 6, 'collapse:diag': 6, 'collapse:diag0': 6,
+        'rot:diag': 6, 'rot:diaghalf': 3, 'rot:diag0': 6, 'rot:diag-scalar': 6, 'collapse:diag': 6, 'collapse:diag0': 6,
         'meas': 10, 'exp': 10, 'reduce:verify': 10, 'sqnorm': 2, 'normalize': 2, 'purge:h': 5, 'purge:s': 3,
         'purge:cnot': 0, 'reduce:cnot': 0, 'drop': 0, 'promote': 0, 'reduce:gf2scan': 0,
         'init': 0, 'post-reduce': 0}

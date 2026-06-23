@@ -57,6 +57,9 @@ class CliftAxisNearClifford(VirtualAxisNearClifford):
     # chunk size (complex words) for the in-place pairwise sweeps. Bounds the
     # transient scratch so peak-live = resident + O(_CHUNK), never 2*resident.
     _CHUNK = 1 << 11
+    # PHASE-2 STEP-1: strided single-axis-Z half-array rotation fast path. ON by default;
+    # the verifier flips it OFF to reconstruct the pre-Step-1 parity kernel for bit-exact A/B.
+    _step1_diaghalf = True
 
     def __init__(self, n):
         super().__init__(n)
@@ -179,6 +182,21 @@ class CliftAxisNearClifford(VirtualAxisNearClifford):
                 return
             m_even = alpha + bph
             m_odd = alpha - bph
+            # PHASE-2 STEP-1 strided single-axis-Z fast path (rotations only). A Hermitian
+            # Z-generator rotation (pp in {0,2}) has |m_even| = 1, so factor m_even out as an
+            # UNOBSERVABLE global phase and multiply ONLY the bit=1 half by m_odd/m_even on a
+            # CONTIGUOUS strided VIEW -- half the amplitudes, fully vectorised (no arange /
+            # parity / boolean-mask gather).  This is clifft's array_rot form (3*2^k half-array)
+            # and the kernel the localized rotations of Step 2/3 will land in.  Records and Born
+            # probabilities are global-phase invariant, so dropping m_even is bit-exact on every
+            # observable (verified by the per-seed record/p0 suite).
+            if (self._step1_diaghalf and where.startswith("rot") and (mz & (mz - 1)) == 0
+                    and abs(abs(m_even) - 1.0) < 1e-9):
+                self.budget.charge(N, 0, where + ":diaghalf")
+                jbit = mz.bit_length() - 1
+                v = phi.reshape(-1, 2, 1 << jbit)
+                v[:, 1, :] *= (m_odd / m_even)        # bit_j=1 half; bit_j=0 half = dropped phase
+                return
             if CH == 0:                      # strict scalar (slack 0): no numpy work array
                 self.budget.charge(N, 0, where + ":diag-scalar")
                 for s in range(N):
