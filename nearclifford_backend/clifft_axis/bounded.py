@@ -47,6 +47,112 @@ def compile_bounded(stim_text, **kwargs):
 
 
 class CliftAxisBoundedNearClifford(CliftAxisNearClifford):
+    # PHASE-2 STEP-2: localize a single-axis X/Y rotation generator to a diagonal Z_a (one
+    # H/S, frame-folded) instead of the off-diagonal butterfly. ON by default; verifier flips
+    # it OFF to reconstruct the pre-Step-2 off-diagonal flush for bit-exact A/B.
+    _step2_localize = True
+    _loc_undo = False             # False = frame-fold (1 H, FLOP-optimal); the incremental inverse-frame
+    #                               makes the post-fold _pullback an O(1) lookup, so the old cache-recompute
+    #                               thrash (the d5_r5 wall regression) is gone. True = undo (2 H, no frame
+    #                               change) retained as fallback if the inverse-frame is ever disabled.
+    _loc_min_size = 1 << 14       # localize only at rank >= 14 (phi.size >= 2^14). Below this the
+    #                               localizer's strided sweeps + O(n) incremental inverse-frame update
+    #                               per fold lose wall to the butterfly -- decisively so at large n / low
+    #                               rank (e.g. d5_r5: n=72, peak rank 13 -> excluded, wall 224->194ms back
+    #                               to butterfly). The RY rank-16 regime stays localized (ry_d3_r1 FLOP
+    #                               win fully retained at 12.85M = 1.05x clifft-unfused). Measured-tuned
+    #                               (phase2_gate_sweep.py); both fallbacks (undo / butterfly) preserved.
+
+    def _flush_one(self, x, z, theta, phase=0):
+        """Flush one pending rotation. STEP-2: if the pulled-back generator is single-axis with
+        X-character (X_a or Y_a -- mx one bit, mz subset {a}), localize it to sign*Z_a with the
+        VERIFIED measurement localizer `_localize_to_Z` (applies V=H/S to phi, folds V^dag into
+        the Clifford frame, conjugates the generator -- the exact RY/CZ-safe machinery), then
+        apply the diagonal R_{Z_a}(sign*theta) via the Step-1 strided half-array kernel.  Else
+        fall back to the off-diagonal butterfly."""
+        xp, zp, pp = self._pullback(x, z)
+        pp = (pp + phase) & 3
+        mx, mz = self._masks(xp, zp, promote=True, where="rot")
+        if len(self.M) > self.max_M:
+            self.max_M = len(self.M)
+        if self.cap is not None and len(self.M) > self.cap:
+            from nearclifford_backend.backend import MagicCapExceeded
+            raise MagicCapExceeded(-1, len(self.M))
+        c = np.cos(theta / 2.0)
+        s = np.sin(theta / 2.0)
+        # STEP-3 (gated): apply an off-axis rotation as V^dag . diagonal R_Z . V on phi, with V a
+        # local Clifford mapping the generator to Z_a -- and UNDO V on the array (V . R_Z . V^dag)
+        # rather than folding V^dag into the frame.  The frame is UNCHANGED, so the cached
+        # _pullback_basis is NOT invalidated (the 94%-of-overhead recompute is avoided) and there
+        # is NO frame/sign-into-frame path (the RY/CZ bug class is out of scope) -- it is literally
+        # the same off-diagonal rotation computed with strided H/CNOT kernels instead of a fancy
+        # butterfly.  Gate on rank so small registers (where the butterfly is already cheap) keep it.
+        if (self._step2_localize and mx != 0 and self.phi.size >= self._loc_min_size
+                and self._flush_offdiag_localized(xp, zp, pp, mx, mz, c, s)):
+            return
+        self._pauli_lincomb_inplace(mx, mz, pp, alpha=c, beta=(-1j * s), where="rot")
+
+    @staticmethod
+    def _conj(P, g):
+        if g[0] == "h":
+            return _conj_h(P, g[1])
+        if g[0] == "s":
+            return _conj_s(P, g[1], g[2])
+        return _conj_cx(P, g[1], g[2])
+
+    def _flush_offdiag_localized(self, xp, zp, pp, mx, mz, c, s):
+        """Apply R_{P'}(theta) for off-diagonal P' = i^pp X^xp Z^zp via V . R_{Z_a} . V^dag on phi,
+        with V the COLLAPSE-FIRST localizer (ONE H, weight-independent): CNOT-collapse the X-string
+        onto pivot a (free permutations), one S^dag if a is Y, ONE H (X_a->Z_a), CNOT-collapse the
+        Z-string onto a (free).  V is built SYMBOLICALLY and verified to map P' -> +-Z_a before any
+        phi touch; on failure return False (caller uses the butterfly).  V is UNDONE on the array
+        (frame untouched -> no _pullback_basis recompute, no frame/sign-into-frame bug class).
+        Returns True iff applied."""
+        P = (xp, zp, pp)
+        xsupp = [ss for ss in _support(xp, zp) if ss in self.M and (xp >> ss) & 1]
+        if not xsupp:
+            return False
+        a = xsupp[0]
+        W = []
+        for b in xsupp:                                     # 1. collapse X-string onto a (free)
+            if b != a:
+                g = ("cx", a, b); W.append(g); P = self._conj(P, g)
+        if (P[0] >> a) & 1 and (P[1] >> a) & 1:             # 2. a is Y -> S^dag makes it pure X
+            g = ("s", a, True); W.append(g); P = self._conj(P, g)
+        g = ("h", a); W.append(g); P = self._conj(P, g)     # 3. the ONE H: X_a -> Z_a
+        for b in [ss for ss in self.M if ss != a and (P[1] >> ss) & 1]:
+            g = ("cx", b, a); W.append(g); P = self._conj(P, g)   # 4. collapse Z-string onto a
+        if P[0] != 0 or P[1] != (1 << a):                   # verify P' -> +-Z_a (else bail)
+            return False
+        sign = 1.0 if (P[2] & 3) == 0 else -1.0
+        idx = self.M.index
+        if self._loc_undo:
+            for g in W:                                     # apply V to phi (strided; CNOTs free)
+                if g[0] == "h":
+                    self._h_axis(idx(g[1]))
+                elif g[0] == "s":
+                    self._s_axis(idx(g[1]), g[2])
+                else:
+                    self._cnot_axes(idx(g[1]), idx(g[2]))
+            self._pauli_lincomb_inplace(0, 1 << idx(a), 0, alpha=c, beta=(-1j * s * sign), where="rot")
+            for g in reversed(W):                           # UNDO V (frame untouched): 2 H, no cache hit
+                if g[0] == "h":
+                    self._h_axis(idx(g[1]))
+                elif g[0] == "s":
+                    self._s_axis(idx(g[1]), not g[2])
+                else:
+                    self._cnot_axes(idx(g[1]), idx(g[2]))
+        else:
+            for g in W:                                     # apply V to phi AND fold V^dag to frame
+                if g[0] == "h":
+                    self._h_axis(idx(g[1])); self.right_h(g[1])
+                elif g[0] == "s":
+                    self._s_axis(idx(g[1]), g[2]); self.right_s(g[1], dag=(not g[2]))
+                else:
+                    self._cnot_axes(idx(g[1]), idx(g[2])); self.right_cx(g[1], g[2])
+            self._pauli_lincomb_inplace(0, 1 << idx(a), 0, alpha=c, beta=(-1j * s * sign), where="rot")
+        return True
+
     # ================================================================= #
     #  CAPACITY-BUFFER STORAGE.  phi is ALWAYS storage[:sz] -- a contiguous prefix view.
     #  promote grows the logical size in place (zero the new MSB block); drop shrinks via
@@ -164,6 +270,8 @@ class CliftAxisBoundedNearClifford(CliftAxisNearClifford):
                     zr = self.Zc[q]
                     self.Zc[q] = (zr[0], zr[1], (zr[2] + 2) & 3)
                     self._frame_ver += 1
+                    if self._inv_enabled:
+                        self._inv_fold_x(q)
                 changed = True
                 break
 
@@ -192,6 +300,8 @@ class CliftAxisBoundedNearClifford(CliftAxisNearClifford):
             zr = self.Zc[q]
             self.Zc[q] = (zr[0], zr[1], (zr[2] + 2) & 3)
             self._frame_ver += 1
+            if self._inv_enabled:
+                self._inv_fold_x(q)
 
     def _support_bits(self):
         """OR and AND over the indices of all nonzero amplitudes, in bounded chunks (O(_CHUNK)

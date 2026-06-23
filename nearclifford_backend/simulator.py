@@ -47,6 +47,36 @@ def pauli_commute(a, b):
     return (((xa & zb).bit_count() + (za & xb).bit_count()) & 1) == 0
 
 
+# ---------------------------------------------------------------------------
+# Pauli conjugations  P -> G P G^dag  (tuples over all qubits).  Used by the
+# incremental inverse-frame (each rule exhaustively verified vs _pullback in
+# scripts/phase2_invframe_derive.py on n=1..4).
+# ---------------------------------------------------------------------------
+def _pconj_h(P, q):
+    x, z, p = P
+    xq = (x >> q) & 1; zq = (z >> q) & 1; b = 1 << q
+    return ((x & ~b) | (zq << q), (z & ~b) | (xq << q), (p + 2 * (xq & zq)) & 3)
+
+
+def _pconj_s(P, q, dag):
+    x, z, p = P
+    xq = (x >> q) & 1
+    return (x, z ^ (xq << q), (p + xq * (3 if dag else 1)) & 3)
+
+
+def _pconj_cx(P, c, t):
+    x, z, p = P
+    xc = (x >> c) & 1; zt = (z >> t) & 1; bc = 1 << c; bt = 1 << t
+    x2 = (x & ~bt) | ((((x >> t) & 1) ^ xc) << t)        # X_c -> X_c X_t
+    z2 = (z & ~bc) | ((((z >> c) & 1) ^ zt) << c)        # Z_t -> Z_c Z_t
+    return (x2, z2, p)
+
+
+def _pconj_x(P, q):
+    x, z, p = P
+    return (x, z, (p + 2 * ((z >> q) & 1)) & 3)          # X Z X = -Z
+
+
 class NearClifford:
     def __init__(self, n):
         self.n = n
@@ -61,6 +91,19 @@ class NearClifford:
         # reused across _pullback calls until a Clifford gate changes the frame.
         self._frame_ver = 0
         self._pb_cache = None
+        # ---- incremental inverse-frame (shadow): Ax[i]=U_C^dag X_i U_C, Az[i]=U_C^dag Z_i U_C.
+        # Maintained O(1)/gate (forward) or O(n)/gate (right-fold) so _pullback is an O(1) lookup
+        # instead of an O(n^2) GF(2) recompute.  OFF by default; clifft_axis enables it. A frame
+        # mutation we do not have an incremental rule for (e.g. _ag_measure projection) sets
+        # _inv_dirty, and the next pullback rebuilds the images ONCE from the basis method.
+        self._inv_enabled = False
+        self._inv_verify = False           # cross-check every pullback vs the basis (test mode)
+        self._inv_dirty = False
+        self._inv_ax = [(1 << i, 0, 0) for i in range(n)]
+        self._inv_az = [(0, 1 << i, 0) for i in range(n)]
+        self._inv_recompute = 0            # full rebuilds (should be ~ #stabilizer-measurements)
+        self._inv_update = 0               # incremental gate updates
+        self._inv_lookup = 0               # O(1) pullback lookups
 
     # ---- Clifford gates: conjugate the tableau (U_C -> G U_C) ----
     # new image of P_i = G (old image) G^dag. We update by applying G's action to
@@ -82,6 +125,8 @@ class NearClifford:
             p2 = (p + 2 * (xq & zq)) & 3      # Y -> -Y
             return (x2, z2, p2)
         self._apply_clifford_to_all(fn)
+        if self._inv_enabled:
+            self._inv_fwd_h(q)
 
     def s(self, q, dag=False):
         bit = 1 << q
@@ -93,6 +138,8 @@ class NearClifford:
             p2 = (p + (xq * (1 if not dag else 3))) & 3   # +i for S, -i(=+3) for Sdag
             return (x, z2, p2)
         self._apply_clifford_to_all(fn)
+        if self._inv_enabled:
+            self._inv_fwd_s(q, dag)
 
     def cx(self, c, t):
         bc = 1 << c; bt = 1 << t
@@ -106,6 +153,8 @@ class NearClifford:
             z2 = (z & ~bc) | (((zc ^ zt) & 1) << c)
             return (x2, z2, p)
         self._apply_clifford_to_all(fn)
+        if self._inv_enabled:
+            self._inv_fwd_cx(c, t)
 
     def cz(self, a, b):
         self.h(b); self.cx(a, b); self.h(b)
@@ -121,6 +170,8 @@ class NearClifford:
         """U_C <- U_C H_s. H X_s H = Z_s, H Z_s H = X_s -> swap the X/Z image columns."""
         self.Xc[s], self.Zc[s] = self.Zc[s], self.Xc[s]
         self._frame_ver += 1
+        if self._inv_enabled:
+            self._inv_right(lambda P: _pconj_h(P, s))
 
     def right_s(self, s, dag=False):
         """U_C <- U_C S_s (or S_s^dag). S X_s S^dag = Y_s, S Z_s S^dag = Z_s, so only
@@ -129,6 +180,8 @@ class NearClifford:
         m = pauli_mul(self.Xc[s], self.Zc[s])      # image(X_s Z_s)
         self.Xc[s] = (m[0], m[1], (m[2] + (3 if dag else 1)) & 3)
         self._frame_ver += 1
+        if self._inv_enabled:
+            self._inv_right(lambda P: _pconj_s(P, s, not dag))
 
     def right_cx(self, c, t):
         """U_C <- U_C CNOT(c,t). CNOT X_c CNOT = X_c X_t and CNOT Z_t CNOT = Z_c Z_t
@@ -136,6 +189,8 @@ class NearClifford:
         self.Xc[c] = pauli_mul(self.Xc[c], self.Xc[t])
         self.Zc[t] = pauli_mul(self.Zc[c], self.Zc[t])
         self._frame_ver += 1
+        if self._inv_enabled:
+            self._inv_right(lambda P: _pconj_cx(P, c, t))
 
     # ---- pull a logical Pauli P back through the frame: P' = U_C^dag P U_C ----
     # If true-P = prod over set bits of (X_i, Z_i), then U_C^dag (true-P) U_C is
@@ -169,7 +224,74 @@ class NearClifford:
         self._pb_cache = (self._frame_ver, basis)
         return basis
 
+    # ------------------------------------------------------------------ #
+    #  Incremental inverse-frame: O(1) pullback lookup (no GF(2) recompute) #
+    # ------------------------------------------------------------------ #
+    def _inv_rebuild(self):
+        """Rebuild the inverse images from the basis method (the ONLY full recompute; happens
+        after a mutation with no incremental rule, e.g. _ag_measure)."""
+        self._inv_recompute += 1
+        self._inv_ax = [self._pullback_via_basis(1 << i, 0) for i in range(self.n)]
+        self._inv_az = [self._pullback_via_basis(0, 1 << i) for i in range(self.n)]
+        self._inv_dirty = False
+
+    def _inv_subst(self, x, z, p=0):
+        """U_C^dag P U_C via X_j->Ax[j], Z_j->Az[j] (an O(weight) product of stored images)."""
+        out = (0, 0, p)
+        ax = self._inv_ax; az = self._inv_az
+        xi = x
+        while xi:
+            j = (xi & -xi).bit_length() - 1; xi &= xi - 1
+            out = pauli_mul(out, ax[j])
+        zi = z
+        while zi:
+            j = (zi & -zi).bit_length() - 1; zi &= zi - 1
+            out = pauli_mul(out, az[j])
+        return out
+
+    # ---- incremental inverse-frame updates per mutation (rules verified in derive script) ----
+    def _inv_fwd_h(self, q):                            # forward H_q: U_C -> H_q U_C
+        self._inv_ax[q], self._inv_az[q] = self._inv_az[q], self._inv_ax[q]
+        self._inv_update += 1
+
+    def _inv_fwd_s(self, q, dag):                       # forward S_q^(dag): only Ax[q] changes
+        Q = _pconj_s((1 << q, 0, 0), q, not dag)        # G^dag X_q G with G = S^(dag)
+        self._inv_ax[q] = self._inv_subst(Q[0], Q[1], Q[2])
+        self._inv_update += 1
+
+    def _inv_fwd_cx(self, c, t):                        # forward CX(c,t)
+        a = pauli_mul(self._inv_ax[c], self._inv_ax[t])
+        b = pauli_mul(self._inv_az[c], self._inv_az[t])
+        self._inv_ax[c] = a; self._inv_az[t] = b
+        self._inv_update += 1
+
+    def _inv_right(self, fn):                           # right-fold: conjugate every image by G^dag
+        self._inv_ax = [fn(P) for P in self._inv_ax]
+        self._inv_az = [fn(P) for P in self._inv_az]
+        self._inv_update += 1
+
+    def _inv_fold_x(self, q):                           # Pauli fold U_C -> U_C X_q
+        self._inv_right(lambda P: _pconj_x(P, q))
+
     def _pullback(self, x, z):
+        """P' = U_C^dag P U_C as (x',z',phase) for logical P=(x,z,0).  Uses the incremental
+        inverse-frame (O(weight) lookup) when enabled; else the GF(2) basis method.  In verify
+        mode the lookup is cross-checked against the basis method on every call."""
+        if self._inv_enabled:
+            if self._inv_dirty:
+                self._inv_rebuild()
+            self._inv_lookup += 1
+            res = self._inv_subst(x, z)
+            if self._inv_verify:
+                truth = self._pullback_via_basis(x, z)
+                if res != truth:
+                    raise AssertionError(
+                        f"inverse-frame pullback({x},{z})={res} != basis {truth} "
+                        f"(frame_ver {self._frame_ver})")
+            return res
+        return self._pullback_via_basis(x, z)
+
+    def _pullback_via_basis(self, x, z):
         """Return P' = U_C^dag P U_C as (x',z',phase) for logical P=(x,z,phase0=0).
         Solve for coefficients c s.t. P = prod_i Xc[i]^{ax_i} Zc[i]^{az_i}."""
         n = self.n
@@ -291,6 +413,8 @@ class NearClifford:
         self.Xc[p] = Sp
         self.Zc[p] = (Pm[0], Pm[1], (Pm[2] + 2 * out) & 3)
         self._frame_ver += 1                 # frame changed -> invalidate pullback cache
+        if self._inv_enabled:                # AG projection has no incremental rule -> lazy rebuild
+            self._inv_dirty = True
         return out
 
     # ---- measure Z_q ; returns 0/1 outcome (samples), collapses state ----

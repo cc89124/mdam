@@ -57,7 +57,7 @@ def clifft_flop(circ, seed=1):
 # ---- bounded charge `where` -> (FLOP/word, category) ----
 BCOEF = {'rot:offdiag': (12, 'offdiag_rot'), 'rot:offdiag-scalar': (12, 'offdiag_rot'),
          'collapse:offdiag': (12, 'born_sqnorm'),
-         'rot:diaghalf': (3, 2, 0, 1), 'rot:diag': (6, 'diag_rot'), 'rot:diag0': (6, 'diag_rot'), 'rot:diag-scalar': (6, 'diag_rot'),
+         'rot:diaghalf': (3, 'diag_rot'), 'rot:diag': (6, 'diag_rot'), 'rot:diag0': (6, 'diag_rot'), 'rot:diag-scalar': (6, 'diag_rot'),
          'collapse:diag': (6, 'born_sqnorm'), 'collapse:diag0': (6, 'born_sqnorm'),
          'meas': (10, 'born_sqnorm'), 'exp': (10, 'born_sqnorm'), 'reduce:verify': (10, 'purge'),
          'sqnorm': (2, 'born_sqnorm'), 'normalize': (2, 'born_sqnorm'),

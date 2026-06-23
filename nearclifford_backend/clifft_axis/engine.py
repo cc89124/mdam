@@ -63,6 +63,12 @@ class CliftAxisNearClifford(VirtualAxisNearClifford):
 
     def __init__(self, n):
         super().__init__(n)
+        # clifft_axis ENABLES the incremental inverse-frame (global NearClifford default is OFF):
+        # every frame mutation updates Ax[i]=U_C^dag X_i U_C / Az[i]=U_C^dag Z_i U_C in O(1)..O(n)
+        # so _pullback is an O(weight) lookup instead of the O(n^2) GF(2) basis recompute. A fresh
+        # engine is built per shot (_reset), so the inverse images re-init to identity each shot and
+        # this flag is re-armed on every warmed shot; the _pullback_via_basis path stays as fallback.
+        self._inv_enabled = True
         # placeholder budget (cap = 2^n, NOT enforced) until the backend tightens it
         # to the genuine clifft active rank via set_clifft_budget(prog.peak_rank).
         self.budget = DenseMemoryBudget(n, enforce=False)
