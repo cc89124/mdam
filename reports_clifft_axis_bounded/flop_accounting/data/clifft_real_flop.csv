@@ -1,0 +1,12 @@
+circuit,k,num_meas,clifft_REAL_FLOP,bounded_REAL_FLOP,clifft_over_bounded
+coherent_d3_r1,5,17,2258,,
+coherent_d3_r3,8,33,59282,20458,2.898
+coherent_d5_r1,13,49,1728498,,
+coherent_d5_r5,24,145,18926788594,48270794,392.096
+coherent_rx_d3_r1,14,17,837610,497284,1.684
+coherent_rx_d3_r3,14,33,2490346,3134196,0.795
+coherent_ry_d3_r1,16,17,24401464,21948980,1.112
+coherent_ry_d3_r3,16,33,72657464,63391300,1.146
+cultivation_d3,4,21,1780,5992,0.297
+cultivation_d5,10,112,211154,821144,0.257
+distillation,5,85,1882,1704,1.104
