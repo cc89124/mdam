@@ -505,10 +505,11 @@ ttn_backend/
     test_ttn_transport.py
     test_rasl_symplectic.py
   docs/
-    TTN_BACKEND.md
-    TTN_MEMORY_DIAGNOSIS.md
-    RASL_METHOD_AND_RESULTS.md
+    TTN_BACKEND_OVERVIEW.md
     TTN_METHOD_DETAILED.md
+    STAGED_TRANSPORT_AND_RESIDENT_FLOOR.md
+    MULTICNOT_PARITY_REWRITE.md
+    RASL_METHOD_AND_RESULTS.md
 ```
 
 핵심 runtime은 `ttn_backend/core.py`에 있다.

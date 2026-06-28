@@ -1,0 +1,16 @@
+bench,seed,meas,full_rot,exec_rot,deferred_rot,immediate_reduction,tail_executed_later,tail_dead_at_shot_end,peak_off,peak_on,peak_delta,maxM_off,maxM_on,maxM_delta
+coherent_d5_r5,7,72,355,355,0,0,0,0,24576,24576,0,13,13,0
+coherent_d5_r5,42,72,355,355,0,0,0,0,24576,24576,0,13,13,0
+coherent_d5_r5,123,72,355,355,0,0,0,0,24576,24576,0,13,13,0
+coherent_d3_r3,7,16,57,57,0,0,0,0,256,256,0,5,5,0
+coherent_d3_r3,42,16,57,57,0,0,0,0,256,256,0,5,5,0
+coherent_d3_r3,123,16,57,57,0,0,0,0,256,256,0,5,5,0
+cultivation_d5,7,15,91,91,0,0,0,0,1024,1024,0,10,10,0
+cultivation_d5,42,15,91,91,0,0,0,0,1024,1024,0,10,10,0
+cultivation_d5,123,15,91,91,0,0,0,0,1024,1024,0,10,10,0
+coherent_ry_d3_r3,7,33,153,153,0,0,0,0,65536,65536,0,16,16,0
+coherent_ry_d3_r3,42,33,153,153,0,0,0,0,65536,65536,0,16,16,0
+coherent_ry_d3_r3,123,33,153,153,0,0,0,0,65536,65536,0,16,16,0
+distillation,7,5,10,10,0,0,0,0,32,32,0,4,4,0
+distillation,42,5,10,10,0,0,0,0,32,32,0,4,4,0
+distillation,123,5,10,10,0,0,0,0,32,32,0,4,4,0

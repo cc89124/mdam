@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import cmath
 import math
+import time
 
 import numpy as np
 
@@ -75,16 +76,121 @@ class MagicCapExceeded(Exception):
         self.step = step; self.M = M
 
 
+# ===========================================================================
+#  S1 PRECOMPILED DISPATCH (feature-flagged, default OFF; authoritative path
+#  preserved).  Each executable step is compiled ONCE per prog into a record
+#  (hid, a1, a2, sign, payload, step) with a small-int handler id and any dict
+#  fields / rotation angles pre-extracted (all shot-invariant).  The runtime
+#  loop then dispatches on the int -- NO _opname (enum->str), NO inst.as_dict()
+#  per step, NO string compares.  It replays the SAME frame/nc/rng calls in the
+#  SAME order as run_shot, so it is record-bit-identical by construction.
+# ===========================================================================
+(H_FRAME_H, H_FRAME_S, H_FRAME_CNOT, H_FRAME_CZ, H_FRAME_SWAP,
+ H_APPLY_PAULI, H_NOISE, H_NOISE_BLOCK, H_READOUT_NOISE,
+ H_MEAS_DORM_STATIC, H_MEAS_DORM_RANDOM,
+ H_EXPAND, H_EXPAND_ROT, H_PHASE,
+ H_ARRAY_H, H_ARRAY_S, H_ARRAY_ROT, H_ARRAY_U2,
+ H_ARRAY_CNOT, H_ARRAY_CZ, H_ARRAY_MULTI_CNOT, H_ARRAY_MULTI_CZ, H_ARRAY_U4,
+ H_MEAS_DIAG, H_MEAS_INTERFERE, H_ARRAY_SWAP, H_SWAP_MEAS) = range(27)
+
+
 class NearCliffordBackend:
+    # S1 precompiled-dispatch fast path: default OFF (authoritative run_shot runs verbatim).
+    compiled_dispatch = False
+
     def __init__(self, prog=None, magic_cap=None, lazy=False, resource_only=False,
-                 block=False, decouple_demote=True):
+                 block=False, decouple_demote=True, drop_dead=True,
+                 structure_once=True, structure_once_debug=False,
+                 structure_once_exclude_feedback=False, targeted_peel=True,
+                 virtual_axis=False, clifft_axis=False, clifft_axis_enforce=True,
+                 clifft_axis_bounded=False, lazy_magic_dense=False,
+                 clifft_axis_policy3=False, deferred_stabilizer_seed=False):
         # Stateless across progs; run_shot/sample size the simulator per prog.
+        # EXPERIMENTAL (default-off): defer the born |+> as a dormant stabilizer seed
+        # (no U_C H-fold, no dense axis) so the flush-time operator stays Z-parity diagonal
+        # while keeping the lazy measurement-driven rank schedule. authoritative path preserved.
+        self.deferred_stabilizer_seed = deferred_stabilizer_seed
         self.last_max_M = 0
+        self._dispatch_cache = {}      # id(prog) -> (prog, precompiled records) for S1
         self.magic_cap = magic_cap     # if set, abort a shot when |M| exceeds it
         self._cur_step = -1
         self.lazy = lazy               # defer rotations, materialise only the core
         self.resource_only = resource_only  # measure core sizes without dense cost (lazy)
         self.block = block             # block-factored magic register (implies lazy)
+        # drop_dead (lazy/block only; DEFAULT ON): prune rotations that are NEVER flushed.
+        # A one-off structure pass (cached per program) records which rotation uids ever
+        # enter a measurement's anticommuting core; the complement are never-flushed = pure
+        # dead weight in `pending` (the memory floor that does not decrease at circuit end)
+        # and droppable record-bit-identically. Removes them from `pending` on every shot
+        # -> shrinks the overhead floor AND the per-step core scans / conjugations. It does
+        # NOT change max_block (dead rotations never become magic) nor the dense FLOP
+        # counters (they never touch the magic register), so active-state / flops figures
+        # are invariant; only the total-memory footprint drops. Diagnostics that COUNT the
+        # dead rotations (measurement_dependency_trace) pass drop_dead=False.
+        self.drop_dead = drop_dead
+        # structure_once (lazy/block only; DEFAULT ON): the anticommuting core flushed at
+        # each measurement is also outcome-independent, so the SAME cached structure pass
+        # that finds the dead uids ALSO records a {meas_idx -> core uids} table. At runtime
+        # each measurement looks the core up and gathers it from the pending uid map instead
+        # of re-scanning all pending with _core_indices / _commute_xz. Single-shot fast path
+        # (no batching yet). Auto-DISABLED on feedback circuits (cultivation_d5) and if the
+        # two discovery seeds disagree. structure_once_debug cross-checks every measurement's
+        # precomputed core against a live scan and falls back on any mismatch.
+        self.structure_once = structure_once
+        self.structure_once_debug = structure_once_debug
+        # targeted_peel (block + structure_once only; DEFAULT ON): the SAME discovery
+        # pre-pass also records, per factor()-call, which qubits actually peel, so at
+        # runtime factor probes only those (O(s*2^b)) instead of the whole block/support
+        # (O(b*2^b)) -- the dominant flop_norm. State-exact by construction (factor(only=)
+        # never changes amplitudes). Set False for the baseline (full factor scan).
+        self.targeted_peel = targeted_peel
+        self.last_peel_mismatch = 0
+        # virtual_axis (DEFAULT OFF): monolithic dense magic register kept at the genuine
+        # independent (clifft) rank via a full-register parity reduction after every
+        # magic measurement -- no physical-support blocks, no transient 2^B. Distribution-
+        # exact (not bit-identical). Mutually exclusive with `block`; implies lazy.
+        self.virtual_axis = virtual_axis
+        if virtual_axis:
+            self.lazy = True
+            self.block = False
+        # clifft_axis (DEFAULT OFF): the Clifft-axis compatibility engine -- the dense
+        # parity-reduced register (as virtual_axis) but with STRICTLY in-place pairwise
+        # kernels and a HARD memory budget (peak live complex words <= 2^k_clifft, where
+        # k_clifft = prog.peak_rank). Implies lazy; mutually exclusive with block/virtual_axis.
+        # MODE NAMING (mutually-exclusive Clifft-axis engines):
+        #  * clifft_axis_bounded -> CliftAxisBoundedNearClifford: the canonical bounded
+        #    engine (reduction-before-materialize via measurement localize-and-drop; peak
+        #    materialized dense rank <= k_clifft; hard memory guard).
+        #  * lazy_magic_dense (== legacy clifft_axis) -> CliftAxisNearClifford: the
+        #    materialize-before-reduce ORACLE -- correctness/diagnostic ONLY, makes NO
+        #    memory-bound claim (peak |M| can exceed k_clifft, e.g. d3_r3 12 > 8).
+        self.clifft_axis = clifft_axis or lazy_magic_dense or clifft_axis_bounded
+        self.clifft_axis_bounded = clifft_axis_bounded
+        self.clifft_axis_enforce = clifft_axis_enforce
+        # clifft_axis_policy3 (DEFAULT OFF): the Step-B1 persistent-split engine -- born-basis
+        # axes + diagonal T/T^dag dispatch (clifft_axis/policy3.py). Selected only with
+        # clifft_axis_bounded; otherwise the committed bounded path runs verbatim.
+        self.clifft_axis_policy3 = clifft_axis_policy3
+        if self.clifft_axis:
+            self.lazy = True
+            self.block = False
+            self.virtual_axis = False
+        # In THIS backend every recorded-bit-conditioned op is an OP_APPLY_PAULI that acts
+        # on the Pauli FRAME only (never the active tableau/rotations), so feedback provably
+        # cannot make the per-measurement cores outcome-dependent -- and the multi-seed core
+        # agreement test below confirms it per circuit (cultivation_d5 included). The static
+        # feedback flag is therefore an OPT-IN conservative lever, not the default gate: set
+        # this True to also exclude any circuit that contains conditional Paulis.
+        self.structure_once_exclude_feedback = structure_once_exclude_feedback
+        self._struct_cache = {}        # id(prog) -> (prog, info dict)
+        self._structure_pass = False   # True while running the discovery shots
+        # last-shot counters (copied off the sim at the end of run_shot)
+        self.last_commute_xz = 0
+        self.last_dynamic_core_scan = 0
+        self.last_fastpath_lookup = 0
+        self.last_fast_mismatch = 0
+        self.last_structure_once_enabled = False
+        self.last_prepass_ms = 0.0
         # frame-reduction (block only): peel the demoted index at each magic measurement
         # so dead residue does not linger -> removes the per-measurement memory loss
         # (distillation/cultivation_d3 fully; cultivation_d5 partially). State-exact
@@ -100,13 +206,41 @@ class NearCliffordBackend:
         self.record = {}
         self.slot2id = {}                  # active slot -> NearClifford qubit index
         self._next_q = 0
-        if self.block:
+        if self.clifft_axis_bounded and getattr(self, "clifft_axis_policy3", False):
+            from nearclifford_backend.clifft_axis.policy3 import (
+                CliftAxisPolicy3NearClifford)
+            sim_cls = CliftAxisPolicy3NearClifford
+        elif self.clifft_axis_bounded:
+            from nearclifford_backend.clifft_axis.bounded import (
+                CliftAxisBoundedNearClifford)
+            sim_cls = CliftAxisBoundedNearClifford
+        elif self.clifft_axis:
+            from nearclifford_backend.clifft_axis.engine import CliftAxisNearClifford
+            sim_cls = CliftAxisNearClifford
+        elif self.virtual_axis:
+            from nearclifford_backend.virtual_axis.virtual_axis_runtime import (
+                VirtualAxisNearClifford)
+            sim_cls = VirtualAxisNearClifford
+        elif self.block:
             sim_cls = BlockLazyNearClifford
         elif self.lazy:
             sim_cls = LazyNearClifford
         else:
             sim_cls = NearClifford
+        # carry the bounded engine's capacity buffer over from the previous shot so its
+        # capacity settles at 2^r_max (high-water materialized rank) and warmed shots never
+        # realloc -- the storage is the ONLY exponential object and is reused, not regrown.
+        retained = getattr(getattr(self, "nc", None), "_storage", None)
         self.nc = sim_cls(count_idents(prog))
+        if self.clifft_axis:
+            # tighten the hard memory budget to clifft's active rank (= prog.peak_rank).
+            self.nc.set_clifft_budget(int(getattr(prog, "peak_rank", count_idents(prog))),
+                                      enforce=self.clifft_axis_enforce)
+        if self.clifft_axis_bounded:
+            self.nc._adopt_storage(retained)
+            # EXPERIMENTAL deferred stabilizer seed (default-off): per-qubit dormant seed
+            self.nc._deferred_seed = self.deferred_stabilizer_seed
+            self.nc._dormant_seed = {}
         if self.lazy and self.magic_cap is not None:
             self.nc.cap = self.magic_cap
         if self.lazy and self.resource_only and not self.block:
@@ -121,13 +255,92 @@ class NearCliffordBackend:
         self.slot2id[slot] = q
         return q
 
+    # --------------------------------------- structure pre-pass (dead uids + cores)
+    @staticmethod
+    def _has_feedback(prog):
+        """True iff `prog` conditions any op on a measurement record. In this backend that
+        is exclusively OP_APPLY_PAULI with a non-None condition_idx -- a recorded-bit-
+        controlled Pauli routed to the FRAME (not the active tableau/rotations). It is an
+        informational flag; whether it disables structure-once is controlled by
+        structure_once_exclude_feedback (default False -- the core-agreement test governs)."""
+        for k in range(len(prog)):
+            inst = prog[k]
+            if _opname(inst.opcode) == "OP_APPLY_PAULI":
+                if ds_mod._d(inst).get("condition_idx") is not None:
+                    return True
+        return False
+
+    _STRUCT_SEEDS = (0x57704c7, 0x57704c8, 0x57704c9)
+
+    def _structure_for(self, prog):
+        """Cached structure of `prog`: the never-flushed (dead) uids AND the per-measurement
+        anticommuting core uids. Found by K full discovery shots on independent seeds. The
+        flush structure is outcome-independent iff the per-measurement cores AGREE across all
+        K seeds (cores_seed_invariant) -- that is the correctness gate for structure-once:
+        only a conditional ACTIVE-state op could break it, and this backend has none (all
+        feedback is Pauli-frame), so the cores agree for every benchmark circuit. If they did
+        not agree, structure-once is disabled and we fall back to the live core scan."""
+        cached = self._struct_cache.get(id(prog))
+        if cached is not None and cached[0] is prog:
+            return cached[1]
+        feedback = self._has_feedback(prog)
+        t0 = time.perf_counter()
+        self._structure_pass = True
+        try:
+            flushed = []; counts = []; cores = []; mcounts = []; peels = []
+            for sd in self._STRUCT_SEEDS:
+                self.run_shot(prog, sd)
+                flushed.append(frozenset(self.nc._flushed_uids))
+                counts.append(self.nc._rot_uid)
+                cores.append(self.nc._record_cores)
+                mcounts.append(self.nc._meas_ctr)
+                peels.append(dict(getattr(self.nc, "mag", None)._record_peels)
+                             if self.block else {})
+        finally:
+            self._structure_pass = False
+        prepass_ms = (time.perf_counter() - t0) * 1e3
+        cnt_ok = len(set(counts)) == 1
+        flush_ok = all(f == flushed[0] for f in flushed)
+        # dead-drop validity: flush-sets + rotation counts agree across all seeds
+        dead = (set(range(counts[0])) - flushed[0]) if (cnt_ok and flush_ok) else set()
+        # structure-once validity: per-measurement cores seed-invariant (+ optional exclusion)
+        cores_ok = cnt_ok and len(set(mcounts)) == 1 and all(c == cores[0] for c in cores)
+        enabled = cores_ok and not (self.structure_once_exclude_feedback and feedback)
+        # targeted-peel table: UNION the recorded actual-peel sets across discovery seeds.
+        # A superset `only=` is always safe (factor(only=S) is state-exact) and is the
+        # complete set whenever the schedule is shot-invariant; peels_ok is an invariance
+        # diagnostic, not a correctness gate (a miss only enlarges a block).
+        fast_peels = {}
+        for p in peels:
+            for ci, qs in p.items():
+                fast_peels.setdefault(ci, set()).update(qs)
+        peels_ok = all(p == peels[0] for p in peels)
+        info = dict(dead=dead, fast_cores=(cores[0] if enabled else None),
+                    fast_peels=(fast_peels if enabled else None), peels_seed_invariant=peels_ok,
+                    enabled=enabled, feedback=feedback, cores_seed_invariant=cores_ok,
+                    n_meas=mcounts[0], n_rot=counts[0], prepass_ms=prepass_ms)
+        self._struct_cache[id(prog)] = (prog, info)
+        return info
+
+    def _dead_uids_for(self, prog):
+        """Back-compat shim: just the never-flushed (dead) uid set."""
+        return self._structure_for(prog)["dead"]
+
     def _birth(self, slot):
         """clifft EXPAND creates the active leg in |+> = (|0>+|1>)/sqrt2 (see
         core._expand_method: tensor = [INV_SQRT2, INV_SQRT2]). We realise |+> by an
         H on the freshly-allocated |0> qubit -- a Clifford (free, into the tableau).
-        This is state-prep, NOT a circuit gate, so the Pauli frame is NOT updated."""
+        This is state-prep, NOT a circuit gate, so the Pauli frame is NOT updated.
+
+        EXPERIMENTAL (deferred_stabilizer_seed): record the |+> as a dormant seed WITHOUT an
+        H-fold into U_C and WITHOUT a dense axis -- so U_C stays clean (flush-time Z_q pulls
+        back to a Z-parity, not X) and the rank does not grow at birth. The |+> tensor factor
+        is materialised lazily only when a measurement core actually promotes the qubit."""
         q = self._new_q(slot)
-        self.nc.h(q)
+        if getattr(self.nc, "_deferred_seed", False):
+            self.nc._dormant_seed[q] = "PLUS"
+        else:
+            self.nc.h(q)
         return q
 
     def _track_M(self):
@@ -229,9 +442,42 @@ class NearCliffordBackend:
         """step_recorder(step, self) -- optional per-step hook, called at the top of
         each step (state as of after steps 0..step-1) and once after the last step.
         Used by the per-step memory comparison to sample the live representation."""
+        # S1 fast path (default OFF): integer-dispatch the precompiled prog.  Only for real
+        # full shots (no step_recorder / max_steps / structure pass); else run authoritative.
+        if (self.compiled_dispatch and step_recorder is None and max_steps is None
+                and not self._structure_pass):
+            return self._run_shot_compiled(prog, seed)
+        # Resolve the cached structure (dead uids + per-measurement cores) BEFORE _reset --
+        # the discovery passes drive their own run_shot/_reset and must skip this branch.
+        dead = None; fast_cores = None; fast_peels = None; so_enabled = False
+        if self.lazy and not self._structure_pass and (self.drop_dead or self.structure_once):
+            info = self._structure_for(prog)
+            self.last_prepass_ms = info["prepass_ms"]
+            if self.drop_dead:
+                dead = info["dead"]
+            if self.structure_once and info["enabled"]:
+                fast_cores = info["fast_cores"]
+                so_enabled = True
+                if self.block and self.targeted_peel:
+                    fast_peels = info["fast_peels"]
+        self.last_structure_once_enabled = so_enabled
         rng = np.random.default_rng(seed)
         self._reset(prog)
         self.nc.rng = rng
+        if self._structure_pass:
+            self.nc._flushed_uids = set()     # discovery: log every flushed uid
+            self.nc._record_cores = {}        # discovery: record per-measurement cores
+            if self.block:
+                self.nc.mag._record_peels = {}   # discovery: record per-call peel sets
+        else:
+            if dead is not None:
+                self.nc._dead_uids = dead     # real shot: prune the never-flushed
+            if fast_cores is not None:
+                self.nc._fast_cores = fast_cores            # real shot: core lookup table
+                self.nc._debug_compare = self.structure_once_debug
+            if fast_peels is not None:
+                self.nc.mag._fast_peels = fast_peels        # real shot: targeted peel table
+                self.nc.mag._peel_debug = self.structure_once_debug
         total = len(prog)
         run_steps = total if max_steps is None else min(total, int(max_steps))
         noise_sampler = ds_mod.ClifftNoiseSampler(prog, rng)
@@ -440,6 +686,244 @@ class NearCliffordBackend:
         if step_recorder is not None:
             step_recorder(run_steps, self)
         self.last_max_M = self.max_M
+        # copy off the per-shot core/commute counters (lazy sims only)
+        self.last_commute_xz = getattr(self.nc, "_cnt_commute_xz", 0)
+        self.last_dynamic_core_scan = getattr(self.nc, "_cnt_dynamic_core_scan", 0)
+        self.last_fastpath_lookup = getattr(self.nc, "_cnt_fastpath_lookup", 0)
+        self.last_fast_mismatch = getattr(self.nc, "_fast_mismatch_count", 0)
+        self.last_peel_mismatch = getattr(getattr(self.nc, "mag", None),
+                                          "_peel_mismatch", 0)
+        return self.record
+
+    # ------------------------------------------------- S1 precompiled dispatch
+    def _precompile_dispatch(self, prog):
+        """Compile prog ONCE into integer-dispatch records (cached per prog).  Pre-extracts
+        every inst.as_dict() field and rotation angle (all shot-invariant), so the runtime
+        loop never calls _opname / inst.as_dict / string compares.  Unknown ops and IGNORE_OPS
+        are dropped here (matching run_shot's skip / fall-through)."""
+        cached = self._dispatch_cache.get(id(prog))
+        if cached is not None and cached[0] is prog:
+            return cached[1]
+        recs = []
+        entries = getattr(prog, "readout_noise", None)
+        for step in range(len(prog)):
+            inst = prog[step]
+            name = _opname(inst.opcode)
+            if name in ds_mod.IGNORE_OPS:
+                continue
+            a1 = int(inst.axis_1); a2 = int(inst.axis_2)
+            flags = int(getattr(inst, "flags", 0))
+            sign = 1 if (flags & _FLAG_SIGN) else 0
+            if name == "OP_FRAME_H": recs.append((H_FRAME_H, a1, a2, sign, None, step))
+            elif name in ("OP_FRAME_S", "OP_FRAME_S_DAG"): recs.append((H_FRAME_S, a1, a2, sign, None, step))
+            elif name == "OP_FRAME_CNOT": recs.append((H_FRAME_CNOT, a1, a2, sign, None, step))
+            elif name == "OP_FRAME_CZ": recs.append((H_FRAME_CZ, a1, a2, sign, None, step))
+            elif name == "OP_FRAME_SWAP": recs.append((H_FRAME_SWAP, a1, a2, sign, None, step))
+            elif name == "OP_APPLY_PAULI":
+                d = ds_mod._d(inst); cond = d.get("condition_idx"); mask = d.get("cp_mask_idx")
+                if cond is not None and mask is not None:
+                    recs.append((H_APPLY_PAULI, a1, a2, sign, (int(cond), int(mask)), step))
+            elif name == "OP_NOISE":
+                d = ds_mod._d(inst); site = d.get("noise_site_idx")
+                if site is not None:
+                    recs.append((H_NOISE, a1, a2, sign, (int(site),), step))
+            elif name == "OP_NOISE_BLOCK":
+                d = ds_mod._d(inst)
+                start = d.get("start_site", d.get("noise_site_idx", d.get("block_idx")))
+                count = d.get("count", 1)
+                if start is not None:
+                    recs.append((H_NOISE_BLOCK, a1, a2, sign, (int(start), int(count)), step))
+            elif name == "OP_READOUT_NOISE":
+                d = ds_mod._d(inst); ei = d.get("readout_noise_idx")
+                if ei is not None and entries is not None:
+                    e = entries[int(ei)]
+                    recs.append((H_READOUT_NOISE, a1, a2, sign, (int(e["meas_idx"]), float(e["prob"])), step))
+            elif name in ("OP_MEAS_DORMANT_STATIC", "OP_MEAS_DORMANT_STATIC_FORCED"):
+                d = ds_mod._d(inst); recs.append((H_MEAS_DORM_STATIC, a1, a2, sign, (int(d.get("classical_idx", 0)),), step))
+            elif name in ("OP_MEAS_DORMANT_RANDOM", "OP_MEAS_DORMANT_RANDOM_FORCED"):
+                d = ds_mod._d(inst); recs.append((H_MEAS_DORM_RANDOM, a1, a2, sign, (int(d.get("classical_idx", 0)),), step))
+            elif name == "OP_EXPAND": recs.append((H_EXPAND, a1, a2, sign, None, step))
+            elif name in ("OP_EXPAND_T", "OP_EXPAND_T_DAG"):
+                recs.append((H_EXPAND_ROT, a1, a2, sign, (_T_ANGLE if name == "OP_EXPAND_T" else -_T_ANGLE,), step))
+            elif name == "OP_EXPAND_ROT":
+                d = ds_mod._d(inst)
+                recs.append((H_EXPAND_ROT, a1, a2, sign, (cmath.phase(complex(d["weight_re"], d["weight_im"])),), step))
+            elif name == "OP_PHASE_T": recs.append((H_PHASE, a1, a2, sign, (_T_ANGLE,), step))
+            elif name == "OP_PHASE_T_DAG": recs.append((H_PHASE, a1, a2, sign, (-_T_ANGLE,), step))
+            elif name == "OP_PHASE_ROT":
+                d = ds_mod._d(inst)
+                recs.append((H_PHASE, a1, a2, sign, (cmath.phase(complex(d["weight_re"], d["weight_im"])),), step))
+            elif name == "OP_ARRAY_H": recs.append((H_ARRAY_H, a1, a2, sign, None, step))
+            elif name == "OP_ARRAY_S": recs.append((H_ARRAY_S, a1, a2, sign, (False,), step))
+            elif name == "OP_ARRAY_S_DAG": recs.append((H_ARRAY_S, a1, a2, sign, (True,), step))
+            elif name == "OP_ARRAY_T": recs.append((H_ARRAY_ROT, a1, a2, sign, (_T_ANGLE,), step))
+            elif name == "OP_ARRAY_T_DAG": recs.append((H_ARRAY_ROT, a1, a2, sign, (-_T_ANGLE,), step))
+            elif name == "OP_ARRAY_ROT":
+                d = ds_mod._d(inst)
+                recs.append((H_ARRAY_ROT, a1, a2, sign, (cmath.phase(complex(d["weight_re"], d["weight_im"])),), step))
+            elif name == "OP_ARRAY_U2": recs.append((H_ARRAY_U2, a1, a2, sign, (inst,), step))
+            elif name == "OP_ARRAY_CNOT": recs.append((H_ARRAY_CNOT, a1, a2, sign, None, step))
+            elif name == "OP_ARRAY_CZ": recs.append((H_ARRAY_CZ, a1, a2, sign, None, step))
+            elif name == "OP_ARRAY_MULTI_CNOT":
+                d = ds_mod._d(inst); recs.append((H_ARRAY_MULTI_CNOT, a1, a2, sign, (int(d["mask"]),), step))
+            elif name == "OP_ARRAY_MULTI_CZ":
+                d = ds_mod._d(inst); recs.append((H_ARRAY_MULTI_CZ, a1, a2, sign, (int(d["mask"]),), step))
+            elif name == "OP_ARRAY_U4": recs.append((H_ARRAY_U4, a1, a2, sign, (inst,), step))
+            elif name in ("OP_MEAS_ACTIVE_DIAGONAL", "OP_MEAS_ACTIVE_DIAGONAL_FORCED"):
+                d = ds_mod._d(inst); recs.append((H_MEAS_DIAG, a1, a2, sign, (int(d.get("classical_idx", 0)),), step))
+            elif name in ("OP_MEAS_ACTIVE_INTERFERE", "OP_MEAS_ACTIVE_INTERFERE_FORCED"):
+                d = ds_mod._d(inst); recs.append((H_MEAS_INTERFERE, a1, a2, sign, (int(d.get("classical_idx", 0)),), step))
+            elif name == "OP_ARRAY_SWAP": recs.append((H_ARRAY_SWAP, a1, a2, sign, None, step))
+            elif name in ("OP_SWAP_MEAS_INTERFERE", "OP_SWAP_MEAS_INTERFERE_FORCED"):
+                d = ds_mod._d(inst); recs.append((H_SWAP_MEAS, a1, a2, sign, (int(d.get("classical_idx", 0)),), step))
+            # unknown opcode: drop (matches run_shot fall-through)
+        self._dispatch_cache[id(prog)] = (prog, recs)
+        return recs
+
+    def _run_shot_compiled(self, prog, seed):
+        """S1 compiled event loop.  Prologue/epilogue mirror run_shot verbatim; the inner loop
+        replays the SAME frame/nc/rng calls in the SAME order via integer dispatch."""
+        # ---- prologue (identical to run_shot) ----
+        dead = None; fast_cores = None; fast_peels = None; so_enabled = False
+        if self.lazy and not self._structure_pass and (self.drop_dead or self.structure_once):
+            info = self._structure_for(prog)
+            self.last_prepass_ms = info["prepass_ms"]
+            if self.drop_dead:
+                dead = info["dead"]
+            if self.structure_once and info["enabled"]:
+                fast_cores = info["fast_cores"]; so_enabled = True
+                if self.block and self.targeted_peel:
+                    fast_peels = info["fast_peels"]
+        self.last_structure_once_enabled = so_enabled
+        rng = np.random.default_rng(seed)
+        self._reset(prog)
+        self.nc.rng = rng
+        if dead is not None:
+            self.nc._dead_uids = dead
+        if fast_cores is not None:
+            self.nc._fast_cores = fast_cores
+            self.nc._debug_compare = self.structure_once_debug
+        if fast_peels is not None:
+            self.nc.mag._fast_peels = fast_peels
+            self.nc.mag._peel_debug = self.structure_once_debug
+        noise_sampler = ds_mod.ClifftNoiseSampler(prog, rng)
+        recs = self._precompile_dispatch(prog)
+        frame = self.frame; nc = self.nc; record = self.record; slot2id = self.slot2id
+        # ---- compiled event loop ----
+        for (hid, a1, a2, sign, payload, step) in recs:
+            self._cur_step = step
+            if hid == H_FRAME_H: frame.h(a1)
+            elif hid == H_FRAME_S: frame.s_gate(a1)
+            elif hid == H_FRAME_CNOT: frame.cnot(a1, a2)
+            elif hid == H_FRAME_CZ: frame.cz(a1, a2)
+            elif hid == H_FRAME_SWAP: frame.swap(a1, a2)
+            elif hid == H_APPLY_PAULI:
+                cond, mask = payload
+                if int(record.get(cond, 0)) == 1:
+                    ds_mod._apply_cp_mask(prog, mask, frame, rng)
+            elif hid == H_NOISE:
+                ds_mod._apply_noise_site(prog, payload[0], frame, rng, noise_sampler)
+            elif hid == H_NOISE_BLOCK:
+                start, count = payload
+                for s in range(start, start + count):
+                    ds_mod._apply_noise_site(prog, s, frame, rng, noise_sampler)
+            elif hid == H_READOUT_NOISE:
+                midx, prob = payload
+                if float(rng.random()) < prob:
+                    record[midx] = int(record.get(midx, 0)) ^ 1
+            elif hid == H_MEAS_DORM_STATIC:
+                record[payload[0]] = frame.xb(a1) ^ sign
+            elif hid == H_MEAS_DORM_RANDOM:
+                m_abs = int(rng.integers(0, 2))
+                record[payload[0]] = m_abs ^ sign
+                frame.set_xz(a1, m_abs, 0)
+            elif hid == H_EXPAND:
+                self._birth(a1)
+            elif hid == H_EXPAND_ROT:
+                self._birth(a1); self._rot(a1, payload[0])
+            elif hid == H_PHASE:
+                q = slot2id.get(a1)
+                if q is not None: nc.apply_rotation(0, 1 << q, payload[0])
+                self._track_M()
+            elif hid == H_ARRAY_H:
+                q = slot2id.get(a1)
+                if q is not None: nc.h(q)
+                frame.h(a1)
+            elif hid == H_ARRAY_S:
+                q = slot2id.get(a1)
+                if q is not None: nc.s(q, dag=payload[0])
+                frame.s_gate(a1)
+            elif hid == H_ARRAY_ROT:
+                self._rot(a1, payload[0])
+            elif hid == H_ARRAY_U2:
+                self._apply_u2(prog, payload[0], a1)
+            elif hid == H_ARRAY_CNOT:
+                u = slot2id.get(a1); v = slot2id.get(a2)
+                if u is not None and v is not None: nc.cx(u, v)
+                frame.cnot(a1, a2)
+            elif hid == H_ARRAY_CZ:
+                u = slot2id.get(a1); v = slot2id.get(a2)
+                if u is not None and v is not None: nc.cz(u, v)
+                frame.cz(a1, a2)
+            elif hid == H_ARRAY_MULTI_CNOT:
+                mask = payload[0]; tgt_slot = a1; tgt = slot2id.get(tgt_slot)
+                for ctrl_slot in ds_mod._bits(mask):
+                    if ctrl_slot == tgt_slot:
+                        continue
+                    c = slot2id.get(ctrl_slot)
+                    if tgt is not None and c is not None: nc.cx(c, tgt)
+                    frame.cnot(ctrl_slot, tgt_slot)
+                self._track_M()
+            elif hid == H_ARRAY_MULTI_CZ:
+                mask = payload[0]
+                for tgt_slot in ds_mod._bits(mask):
+                    if tgt_slot == a1:
+                        continue
+                    u = slot2id.get(a1); v = slot2id.get(tgt_slot)
+                    if u is not None and v is not None: nc.cz(u, v)
+                    frame.cz(a1, tgt_slot)
+            elif hid == H_ARRAY_U4:
+                self._apply_u4(prog, payload[0], a1, a2)
+            elif hid == H_MEAS_DIAG:
+                q = slot2id.get(a1)
+                if q is None: continue
+                b = nc.measure_z(q)
+                del slot2id[a1]; self._reduce_dead()
+                m_abs = b ^ frame.xb(a1)
+                record[payload[0]] = m_abs ^ sign
+                frame.set_xz(a1, m_abs, 0)
+                self._track_M()
+            elif hid == H_MEAS_INTERFERE:
+                q = slot2id.get(a1)
+                if q is None: continue
+                nc.h(q)
+                b_x = nc.measure_z(q)
+                del slot2id[a1]; self._reduce_dead()
+                m_abs = b_x ^ frame.zb(a1)
+                record[payload[0]] = m_abs ^ sign
+                frame.set_xz(a1, m_abs, 0)
+                self._track_M()
+            elif hid == H_ARRAY_SWAP:
+                self._swap_slots(a1, a2); frame.swap(a1, a2)
+            elif hid == H_SWAP_MEAS:
+                self._swap_slots(a1, a2); frame.swap(a1, a2)
+                q = slot2id.get(a2)
+                if q is None: continue
+                nc.h(q)
+                b_x = nc.measure_z(q)
+                del slot2id[a2]; self._reduce_dead()
+                m_abs = b_x ^ frame.zb(a2)
+                record[payload[0]] = m_abs ^ sign
+                frame.set_xz(a2, m_abs, 0)
+                self._track_M()
+        # ---- epilogue (identical to run_shot) ----
+        self.last_max_M = self.max_M
+        self.last_commute_xz = getattr(self.nc, "_cnt_commute_xz", 0)
+        self.last_dynamic_core_scan = getattr(self.nc, "_cnt_dynamic_core_scan", 0)
+        self.last_fastpath_lookup = getattr(self.nc, "_cnt_fastpath_lookup", 0)
+        self.last_fast_mismatch = getattr(self.nc, "_fast_mismatch_count", 0)
+        self.last_peel_mismatch = getattr(getattr(self.nc, "mag", None),
+                                          "_peel_mismatch", 0)
         return self.record
 
     def _swap_slots(self, a1, a2):
@@ -542,9 +1026,20 @@ def _u4_decompose(U):
         if abs(b) > 1e-12: ops.append(("rot1", (0, 0, 1, b)))   # Rz
         if _check_u4(ops, U):
             return ops
+    # A fused U4 node reached the bounded backend.  Even when the matrix de-fuses exactly
+    # (it does, e.g. R_Y noise -> (A_lo (x) B_hi).CZ -- verified), the APPLICATION path is
+    # incompatible with the deferred-rotation engine: _apply_u4 sets the new frame with a
+    # raw frame.set_xz that does NOT conjugate the lazy engine's pending rotations (unlike
+    # frame.h/s/cz), so any off-axis (R_X/R_Y) pending content is corrupted -> silently
+    # wrong results (measured: coherent_d3_r* R_Y peak rank collapses to 3, prob |D|~0.99).
+    # R_Z survives only because its pending rotations are Z-diagonal.  The fix is NOT a
+    # smarter de-fusion but to forbid the fusion: compile the bounded backend with
+    # clifft_axis.bounded.compile_bounded (bytecode_passes=None) so rotations stay unfused
+    # and route through frame.h/s/cz.  Fail LOUD here rather than mis-apply.
     raise NotImplementedError(
-        "U4 node is not (1q-on-lo).(CNOT|CZ); generic 2q decomposition not "
-        "implemented (no such node occurs in the QEC benchmark circuits).")
+        "fused U4 node reached clifft_axis_bounded; the de-fusion application is "
+        "incompatible with deferred off-axis rotations (frame.set_xz does not conjugate "
+        "pending). Compile with clifft_axis.bounded.compile_bounded (no fusion).")
 
 
 def _extract_1q_on_lo(V):

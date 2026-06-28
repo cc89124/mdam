@@ -1,0 +1,129 @@
+=== cultivation_d5: 91 pending-rotation flushes (T materializations) ===
+
+  i batch rank  Xw  Zw pureZ          supp cmuPrev         since
+  0     0    0   1   0 False          (0,)                 start
+  1     0    1   1   0 False          (1,) commute         start
+  2     0    2   1   0 False          (2,) commute         start
+  3     0    3   1   0 False          (3,) commute         start
+  4     0    4   3   0 False     (0, 1, 2) commute         start
+  5     0    4   3   0 False     (1, 2, 3) commute         start
+  6     0    4   3   0 False     (0, 1, 3) commute         start
+  7     0    4   3   0 False     (0, 2, 3) commute         start
+  8     1    3   1   0 False          (4,) commute    magic-meas
+  9     1    4   3   0 False     (1, 2, 4) commute    magic-meas
+ 10     1    4   3   0 False     (1, 3, 4) commute    magic-meas
+ 11     1    4   3   0 False     (2, 3, 4) commute    magic-meas
+ 12     2    3   2   0 False        (2, 4) commute    magic-meas
+ 13     2    3   2   0 False        (3, 4) commute    magic-meas
+ 14     3    2   2   0 False        (3, 4) commute    magic-meas
+ 15     4    1   1   0 False          (5,) commute    magic-meas
+ 16     4    2   1   0 False          (6,) commute    magic-meas
+ 17     4    3   1   0 False          (7,) commute    magic-meas
+ 18     4    4   3   0 False     (5, 6, 7) commute    magic-meas
+ 19     4    4   1   0 False          (8,) commute    magic-meas
+ 20     4    5   1   0 False          (9,) commute    magic-meas
+ 21     4    6   1   0 False         (10,) commute    magic-meas
+ 22     4    7   1   0 False         (11,) commute    magic-meas
+ 23     4    8   1   0 False         (12,) commute    magic-meas
+ 24     4    9   3   0 False    (8, 9, 10) commute    magic-meas
+ 25     4    9   1   0 False         (13,) commute    magic-meas
+ 26     4   10   3   0 False   (8, 10, 12) commute    magic-meas
+ 27     4   10   7   0 False(5, 6, 9, 10,  commute    magic-meas
+ 28     4   10   5   0 False(4, 5, 7, 8, 1 commute    magic-meas
+ 29     4   10   5   0 False(4, 6, 7, 8, 1 commute    magic-meas
+ 30     4   10   5   0 False(4, 9, 10, 11, commute    magic-meas
+ 31     4   10   5   0 False(5, 6, 8, 9, 1 commute    magic-meas
+ 32     4   10   5   0 False(4, 9, 10, 12, commute    magic-meas
+ 33     4   10   5   0 False(4, 5, 6, 11,  commute    magic-meas
+ 34     5    9   1   0 False         (14,) commute    magic-meas
+ 35     5   10   3   0 False    (5, 6, 14) commute    magic-meas
+ 36     5   10   3   0 False    (5, 7, 14) commute    magic-meas
+ 37     5   10   3   0 False    (6, 7, 14) commute    magic-meas
+ 38     5   10   3   0 False    (5, 8, 14) commute    magic-meas
+ 39     5   10   3   0 False    (5, 9, 14) commute    magic-meas
+ 40     5   10   3   0 False   (5, 10, 14) commute    magic-meas
+ 41     5   10   3   0 False   (5, 11, 14) commute    magic-meas
+ 42     5   10   3   0 False   (5, 12, 14) commute    magic-meas
+ 43     5   10   5   0 False(5, 8, 9, 10,  commute    magic-meas
+ 44     5   10   3   0 False   (5, 13, 14) commute    magic-meas
+ 45     5   10   5   0 False(5, 8, 10, 12, commute    magic-meas
+ 46     5   10   7   0 False(6, 9, 10, 11, commute    magic-meas
+ 47     5   10   4   0 False(7, 8, 10, 14) commute    magic-meas
+ 48     5   10   6   0 False(5, 6, 7, 8, 1 commute    magic-meas
+ 49     5   10   6   0 False(5, 9, 10, 11, commute    magic-meas
+ 50     5   10   5   0 False(6, 8, 9, 12,  commute    magic-meas
+ 51     5   10   6   0 False(5, 9, 10, 12, commute    magic-meas
+ 52     5   10   4   0 False(6, 11, 13, 14 commute    magic-meas
+ 53     5   10   1   0 False         (14,) commute    magic-meas
+ 54     5   10   3   0 False    (5, 6, 14) commute    magic-meas
+ 55     5   10   3   0 False    (5, 7, 14) commute    magic-meas
+ 56     5   10   3   0 False    (6, 7, 14) commute    magic-meas
+ 57     5   10   3   0 False    (5, 8, 14) commute    magic-meas
+ 58     5   10   3   0 False    (5, 9, 14) commute    magic-meas
+ 59     5   10   3   0 False   (5, 10, 14) commute    magic-meas
+ 60     5   10   3   0 False   (5, 11, 14) commute    magic-meas
+ 61     5   10   3   0 False   (5, 12, 14) commute    magic-meas
+ 62     5   10   5   0 False(5, 8, 9, 10,  commute    magic-meas
+ 63     5   10   3   0 False   (5, 13, 14) commute    magic-meas
+ 64     5   10   5   0 False(5, 8, 10, 12, commute    magic-meas
+ 65     5   10   7   0 False(6, 9, 10, 11, commute    magic-meas
+ 66     5   10   4   0 False(7, 8, 10, 14) commute    magic-meas
+ 67     5   10   6   0 False(5, 6, 7, 8, 1 commute    magic-meas
+ 68     5   10   6   0 False(5, 9, 10, 11, commute    magic-meas
+ 69     5   10   5   0 False(6, 8, 9, 12,  commute    magic-meas
+ 70     5   10   6   0 False(5, 9, 10, 12, commute    magic-meas
+ 71     5   10   4   0 False(6, 11, 13, 14 commute    magic-meas
+ 72     6    9   1   0 False         (15,) commute    magic-meas
+ 73     6   10   2   2 False(5, 6, 14, 15) commute    magic-meas
+ 74     6   10   2   2 False(5, 7, 14, 15) commute    magic-meas
+ 75     6   10   3   0 False    (6, 7, 15) commute    magic-meas
+ 76     7    9   2   1 False    (5, 8, 15) commute    magic-meas
+ 77     7    9   2   1 False    (5, 9, 15) commute    magic-meas
+ 78     7    9   2   1 False   (5, 10, 15) commute    magic-meas
+ 79     7    9   4   1 False(5, 8, 9, 10,  commute    magic-meas
+ 80     8    8   2   1 False   (5, 12, 15) commute    magic-meas
+ 81     8    8   3   1 False(5, 10, 12, 15 commute    magic-meas
+ 82     9    7   3   0 False   (7, 10, 15) commute    magic-meas
+ 83     9    7   4   1 False(5, 6, 7, 10,  commute    magic-meas
+ 84    10    6   2   1 False   (5, 11, 15) commute    magic-meas
+ 85    10    6   4   1 False(5, 9, 10, 11, commute    magic-meas
+ 86    10    6   3   0 False    (6, 9, 15) commute    magic-meas
+ 87    11    5   2   1 False   (5, 13, 15) commute    magic-meas
+ 88    11    5   5   0 False(6, 9, 10, 13, commute    magic-meas
+ 89    13    3   3   1 False(5, 10, 13, 15 commute    magic-meas
+ 90    14    2   2   0 False      (13, 15) commute    magic-meas
+
+=== per flush-batch (a batch = rotations flushed before one measurement, SAME frame) ===
+ batch  nrot  allCommute  anyOffdiag  rank  needH(1/0)
+     0     8        True        True     0           1
+     1     4        True        True     3           1
+     2     2        True        True     3           1
+     3     1        True        True     2           1
+     4    19        True        True     1           1
+     5    38        True        True     9           1
+     6     4        True        True     9           1
+     7     4        True        True     9           1
+     8     2        True        True     8           1
+     9     2        True        True     7           1
+    10     3        True        True     6           1
+    11     2        True        True     5           1
+    13     1        True        True     3           1
+    14     1        True        True     2           1
+
+  per-batch min-H (GF2 X-rank): b0:4(n8), b1:3(n4), b2:2(n2), b3:1(n1), b4:10(n19), b5:10(n38), b6:3(n4), b7:3(n4), b8:2(n2), b9:2(n2), b10:3(n3), b11:2(n2), b13:1(n1), b14:1(n1)
+
+=== H-amortization verdict (cultivation_d5) ===
+  q (rotations)                    = 91
+  off-diagonal generators          = 91/91
+  #flush-batches                   = 14
+  H-sweeps, per-rotation policy    = 91   (1 per rotation)
+  H-sweeps, per-batch simul-diag   = 47   (Sigma GF2 X-rank per batch)
+  H-sweeps, commuting-run          = 25   (2 runs, ranks [16, 9])
+  H-sweeps, single global basis    = 16   (X-rank of all 91, ignores meas/rank changes)
+
+  projected FLOP (Sigma over each rotation's own 2^rank):
+    current butterfly (c=12)       =    659.6k   (4.00x clifft)
+    A per-rotation  (4q+3q)        =    384.8k   (2.33x clifft)  H=91
+    B per-batch     (4*SigmaXrank+3q) =    269.9k   (1.64x clifft)  H=47
+    C commuting-run                =    267.3k   (1.62x clifft)  H=25
+    clifft diagonal-T (3q)         =    164.9k   (1.00x)

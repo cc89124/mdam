@@ -1,0 +1,14 @@
+{
+  "container": "dict {uid: list}  (nearclifford_backend/lazy.py:74)",
+  "ordering": "insertion order == increasing uid; list(pending.values()) is increasing-uid (lazy.py:70-73)",
+  "entry_layout": ["x", "z", "phase", "theta", "uid"],
+  "fields": {
+    "x":     {"index":0,"type":"int bitmask","meaning":"physical Pauli X-support (per qubit)","set_by":"apply_rotation (lazy.py:142)","mutated_by":"_conj_h/_conj_s/_conj_cx on every Clifford (lazy.py:111-134); S2 in-place (bounded.py h/s/cx)"},
+    "z":     {"index":1,"type":"int bitmask","meaning":"physical Pauli Z-support","set_by":"apply_rotation","mutated_by":"same as x"},
+    "phase": {"index":2,"type":"int mod 4","meaning":"accumulated i^phase from lazy h/s/cz conjugation (e.g. Y=i^1 XZ)","set_by":"apply_rotation sets 0","mutated_by":"_conj_*; forwarded to _flush_one as `phase` (engine.py _do_flush)"},
+    "theta": {"index":3,"type":"float","meaning":"rotation angle (R=cos(th/2)I - i sin(th/2) P)","set_by":"apply_rotation","mutated_by":"never"},
+    "uid":   {"index":4,"type":"int","meaning":"monotonic creation id (lazy.py:138-139 _rot_uid++)","set_by":"apply_rotation","mutated_by":"never (stable identity)"}
+  },
+  "no_separate_applied_flag": "there is NO field tracking whether a rotation was applied to dense state; presence in `pending` == not-yet-flushed; removal (del pending[uid]) == consumed (lazy.py:226)",
+  "dead_alive": "dead = never-flushed uids dropped at apply_rotation (lazy.py:140-141, _dead_uids); alive = in pending; consumed = del from pending during _do_flush"
+}

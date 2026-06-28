@@ -1,0 +1,14 @@
+{
+  "full_shot_bit_identical": true,
+  "benchmarks": 9,
+  "seeds": [
+    7,
+    8,
+    9,
+    42,
+    123
+  ],
+  "comparison": "compiled_core=True vs authoritative oracle (fused OFF)",
+  "mismatches": 0,
+  "note": "measure_z outcome sequence identical all benches x all seeds"
+}

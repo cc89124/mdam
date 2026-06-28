@@ -1,0 +1,977 @@
+"""clifft_axis_bounded: the canonical bounded engine.
+
+Adds to the dense Clifft-axis engine the MEASUREMENT LOCALIZE-AND-DROP that the lazy
+dense engine lacked (the cause of coherent_d3_r3's monotonic 3->5->7->...->12 growth):
+after a magic measurement, the measured Pauli P' = U_C^dag Z_q U_C (restricted to the
+magic register) is localized to a single Z_r by a block-local Clifford W (H/S^dag,H to
+turn each support Pauli into Z, then CNOTs to collapse the Z-string onto r), W is applied
+to phi and W^dag folded into the frame (an EXACT identity insertion -- the physical state
+is unchanged), so qubit r is left in a definite Z-eigenstate (the measurement fixed it)
+and compress drops it. This RELEASES the measured degree of freedom every magic
+measurement, so the active rank tracks clifft's active_k_history (which DECREASES after
+each measurement) instead of accumulating.
+
+This is the dense port of block_magic.BlockLazyNearClifford._purge_redundant (verified
+there); applied after the Born collapse it consumes no RNG and is state-exact, so the
+measurement record is identical to the lazy_magic_dense oracle.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+from nearclifford_backend.simulator import pauli_commute
+from nearclifford_backend.block_magic import _support
+from nearclifford_backend.lazy import _conj_h, _conj_s, _conj_cx
+from nearclifford_backend.clifft_axis.engine import CliftAxisNearClifford
+
+
+# ================================================================= #
+#  FUSED MEASUREMENT: symbolic Pauli-sum operator algebra over the   #
+#  (would-be) r_mat magic-bit layout.  Used ONLY to (a) contract the #
+#  measured axis into a Born scalar on phi_in and (b) build the      #
+#  survivor on the r_out register -- the 2^{r_mat} array is NEVER    #
+#  allocated.  Each operator is a dict {(x,z): complex coeff}, the   #
+#  Pauli stored as exactly X^x Z^z (any Y phase folded into coeff).  #
+# ================================================================= #
+def _fpopc(v):
+    return bin(int(v)).count("1")
+
+
+def _fmul(A, B):
+    """Operator product A*B (A applied AFTER B): (X^xa Z^za)(X^xb Z^zb) =
+    (-1)^<za,xb> X^(xa^xb) Z^(za^zb)."""
+    out = {}
+    for (xa, za), ca in A.items():
+        for (xb, zb), cb in B.items():
+            x = xa ^ xb
+            z = za ^ zb
+            ph = (-1.0) ** _fpopc(za & xb)
+            out[(x, z)] = out.get((x, z), 0j) + ca * cb * ph
+    return {k: v for k, v in out.items() if abs(v) > 1e-14}
+
+
+def _fdag(A):
+    """Hermitian conjugate of a Pauli sum: (c X^x Z^z)^dag = conj(c) (-1)^<x,z> X^x Z^z."""
+    return {(x, z): np.conj(c) * ((-1.0) ** _fpopc(x & z)) for (x, z), c in A.items()}
+
+
+def _apply_xz(x, z, v):
+    """(X^x Z^z) v for a length-2^k vector v (Z applied first: no X^x Z^z sign on |0>^new)."""
+    idx = np.arange(v.size, dtype=np.int64)
+    p = idx & z
+    for sh in (32, 16, 8, 4, 2, 1):
+        p ^= p >> sh
+    signs = 1.0 - 2.0 * (p & 1)
+    return (signs * v)[idx ^ x]
+
+
+def compile_bounded(stim_text, **kwargs):
+    """Compile a circuit for the clifft_axis_bounded backend WITHOUT gate fusion.
+
+    The bounded engine defers magic rotations (lazy `pending`) and reconciles them with
+    the Clifford frame only through frame.h/s/cz, which conjugate `pending`.  clifft's
+    default fused compile emits OP_ARRAY_U2 / OP_ARRAY_U4 nodes whose de-fusion in
+    backend._apply_u2/_apply_u4 advances the frame with a raw frame.set_xz that does NOT
+    conjugate `pending`; for off-axis (R_X/R_Y) noise this corrupts the deferred rotations
+    -> silently wrong results (measured: coherent_d3_r* R_Y peak rank collapses 10->3,
+    prob |D|~0.99).  R_Z noise is unaffected (its pending rotations are Z-diagonal), so the
+    default compile happens to work for the Z-axis benchmarks -- but bytecode_passes=None
+    is verified bit-for-bit identical on every Z benchmark (rank/resident/records) AND is
+    the only correct path for X/Y noise, so it is the canonical compile here.
+
+    This forbids the rotation . entangling-Clifford fusion (and all other bytecode fusion);
+    `clifft.compile`'s HIR passes still run, so peak_rank is unchanged.
+    """
+    import clifft
+    return clifft.compile(stim_text, bytecode_passes=None, **kwargs)
+
+
+class CliftAxisBoundedNearClifford(CliftAxisNearClifford):
+    # PHASE-2 STEP-2: localize a single-axis X/Y rotation generator to a diagonal Z_a (one
+    # H/S, frame-folded) instead of the off-diagonal butterfly. ON by default; verifier flips
+    # it OFF to reconstruct the pre-Step-2 off-diagonal flush for bit-exact A/B.
+    _step2_localize = True
+    _loc_undo = False             # False = frame-fold (1 H, FLOP-optimal); the incremental inverse-frame
+    #                               makes the post-fold _pullback an O(1) lookup, so the old cache-recompute
+    #                               thrash (the d5_r5 wall regression) is gone. True = undo (2 H, no frame
+    #                               change) retained as fallback if the inverse-frame is ever disabled.
+    # FUSED MEASUREMENT (default ON): contract the measured axis into a branch map instead of
+    # materializing the 2^{r_mat}=2^{r_out+1} transient.  The diagonal-magic measurement is run
+    # as  Born p0 on phi_in (2^{r_in})  +  survivor on the r_out register (2^{r_out}), so the
+    # measured axis is NEVER a dense-array axis (peak dense rank = r_out, not r_out+1).  Falls
+    # back to the materialize-localize-drop path (now the verification ORACLE) for every case it
+    # does not cover (stabilizer / deterministic / off-diagonal / structure-discovery shots).
+    _fused_measure = True
+    # COMPILED CORE (default OFF): run the measurement-core numerical hot path in a SINGLE C++ call
+    # (direct general-Pauli branch-pair executor, no per-rotation localization).  When OFF the
+    # authoritative oracle path runs verbatim.  Toggled by the backend `compiled_core` feature flag.
+    _compiled_core = False
+    _compiled_executor = None
+    # S2 COMPILED FRAME (default OFF): defer the per-Clifford tableau conjugation
+    # (_apply_clifford_to_all) into a buffer and flush the whole measurement-segment in ONE
+    # C++ call (clifford_conj_seq), and mutate `pending` IN PLACE instead of rebuilding the
+    # dict every gate.  Valid because with the incremental inverse-frame the hot pullback uses
+    # Ax/Az (not Xc/Zc), so nothing reads Xc/Zc between measurements; _flush_tableau is called
+    # at the top of measure_z / statevector before any Xc/Zc read.  Bit-identical to the
+    # tuple-based path; RNG and the numerical core are untouched.  Toggled by the backend.
+    _compiled_frame = False
+    # hang-guard: if the symbolic core Pauli sum exceeds this many terms, fall back to the oracle
+    # (a high-rank off-diagonal core can grow ~2^{#off-axis rotations}; the oracle materializes it
+    # in bounded 2^{r_mat} memory faster than the symbolic contraction).  Correctness-neutral.
+    _fused_max_terms = 1 << 14
+    _loc_min_size = 1 << 14       # localize only at rank >= 14 (phi.size >= 2^14). Below this the
+    #                               localizer's strided sweeps + O(n) incremental inverse-frame update
+    #                               per fold lose wall to the butterfly -- decisively so at large n / low
+    #                               rank (e.g. d5_r5: n=72, peak rank 13 -> excluded, wall 224->194ms back
+    #                               to butterfly). The RY rank-16 regime stays localized (ry_d3_r1 FLOP
+    #                               win fully retained at 12.85M = 1.05x clifft-unfused). Measured-tuned
+    #                               (phase2_gate_sweep.py); both fallbacks (undo / butterfly) preserved.
+
+    def __init__(self, n):
+        super().__init__(n)
+        self._tab_gates = []          # S2: deferred (gate, q1, q2) tableau conjugations
+
+    # ================================================================= #
+    #  S2: deferred + batched tableau conjugation (compiled frame kernel) #
+    # ----------------------------------------------------------------- #
+    #  h/s/cx defer the Xc/Zc conjugation (one C++ seq call per segment)  #
+    #  and mutate `pending` in place (no per-gate dict rebuild).  The     #
+    #  inverse-frame (Ax/Az) is still updated per gate so _pullback stays #
+    #  an O(weight) lookup; _flush_tableau is invoked before any Xc/Zc    #
+    #  read (measure_z / statevector).  Active only when _compiled_frame. #
+    # ================================================================= #
+    def h(self, q):
+        if not self._compiled_frame:
+            return super().h(q)
+        self._tab_gates.append((0, q, 0))             # G_H
+        self._frame_ver += 1
+        if self._inv_enabled:
+            self._inv_fwd_h(q)
+        for r in self.pending.values():
+            r[0], r[1], r[2] = _conj_h((r[0], r[1], r[2]), q)
+
+    def s(self, q, dag=False):
+        if not self._compiled_frame:
+            return super().s(q, dag)
+        self._tab_gates.append((2 if dag else 1, q, 0))   # G_SDAG / G_S
+        self._frame_ver += 1
+        if self._inv_enabled:
+            self._inv_fwd_s(q, dag)
+        for r in self.pending.values():
+            r[0], r[1], r[2] = _conj_s((r[0], r[1], r[2]), q, dag)
+
+    def cx(self, c, t):
+        if not self._compiled_frame:
+            return super().cx(c, t)
+        self._tab_gates.append((3, c, t))             # G_CX
+        self._frame_ver += 1
+        if self._inv_enabled:
+            self._inv_fwd_cx(c, t)
+        for r in self.pending.values():
+            r[0], r[1], r[2] = _conj_cx((r[0], r[1], r[2]), c, t)
+
+    def _flush_tableau(self):
+        """Apply the deferred segment of Clifford gates to Xc/Zc in ONE C++ call.  Xc/Zc stay
+        Python tuples (readers unchanged); pack -> clifford_conj_seq -> unpack happens only here
+        (once per measurement, not once per gate)."""
+        g = self._tab_gates
+        if not g:
+            return
+        from nearclifford_backend.clifft_axis import compiled_frame as CF
+        n = self.n
+        W = (n + 63) // 64 if n > 0 else 1          # uint64 words per Pauli mask (n may exceed 64)
+        M = 2 * n                                    # Xc rows 0..n-1, Zc rows n..2n-1
+        X = np.zeros(M * W, dtype=np.uint64)
+        Z = np.zeros(M * W, dtype=np.uint64)
+        Pp = np.empty(M, dtype=np.int32)
+        Xc = self.Xc; Zc = self.Zc
+        MASK = (1 << 64) - 1
+        if W == 1:                                   # fast path n<=64
+            for i in range(n):
+                xx, zz, pp = Xc[i]; X[i] = xx; Z[i] = zz; Pp[i] = pp
+                xx, zz, pp = Zc[i]; X[n + i] = xx; Z[n + i] = zz; Pp[n + i] = pp
+        else:
+            for i in range(n):
+                xx, zz, pp = Xc[i]; Pp[i] = pp
+                for w in range(W):
+                    X[i * W + w] = (xx >> (64 * w)) & MASK; Z[i * W + w] = (zz >> (64 * w)) & MASK
+                xx, zz, pp = Zc[i]; Pp[n + i] = pp
+                base = (n + i) * W
+                for w in range(W):
+                    X[base + w] = (xx >> (64 * w)) & MASK; Z[base + w] = (zz >> (64 * w)) & MASK
+        gt = np.fromiter((t[0] for t in g), dtype=np.int32, count=len(g))
+        q1 = np.fromiter((t[1] for t in g), dtype=np.int32, count=len(g))
+        q2 = np.fromiter((t[2] for t in g), dtype=np.int32, count=len(g))
+        CF.conj_seq(X, Z, Pp, W, gt, q1, q2)
+        if W == 1:
+            for i in range(n):
+                Xc[i] = (int(X[i]), int(Z[i]), int(Pp[i]))
+                Zc[i] = (int(X[n + i]), int(Z[n + i]), int(Pp[n + i]))
+        else:
+            for i in range(n):
+                xx = zz = 0
+                for w in range(W):
+                    xx |= int(X[i * W + w]) << (64 * w); zz |= int(Z[i * W + w]) << (64 * w)
+                Xc[i] = (xx, zz, int(Pp[i]))
+                xx = zz = 0; base = (n + i) * W
+                for w in range(W):
+                    xx |= int(X[base + w]) << (64 * w); zz |= int(Z[base + w]) << (64 * w)
+                Zc[i] = (xx, zz, int(Pp[n + i]))
+        self._tab_gates = []
+
+    def statevector(self):
+        if self._compiled_frame:
+            self._flush_tableau()
+        return super().statevector()
+
+    def _flush_one(self, x, z, theta, phase=0):
+        """Flush one pending rotation. STEP-2: if the pulled-back generator is single-axis with
+        X-character (X_a or Y_a -- mx one bit, mz subset {a}), localize it to sign*Z_a with the
+        VERIFIED measurement localizer `_localize_to_Z` (applies V=H/S to phi, folds V^dag into
+        the Clifford frame, conjugates the generator -- the exact RY/CZ-safe machinery), then
+        apply the diagonal R_{Z_a}(sign*theta) via the Step-1 strided half-array kernel.  Else
+        fall back to the off-diagonal butterfly."""
+        xp, zp, pp = self._pullback(x, z)
+        pp = (pp + phase) & 3
+        mx, mz = self._masks(xp, zp, promote=True, where="rot")
+        if len(self.M) > self.max_M:
+            self.max_M = len(self.M)
+        if self.cap is not None and len(self.M) > self.cap:
+            from nearclifford_backend.backend import MagicCapExceeded
+            raise MagicCapExceeded(-1, len(self.M))
+        c = np.cos(theta / 2.0)
+        s = np.sin(theta / 2.0)
+        # STEP-3 (gated): apply an off-axis rotation as V^dag . diagonal R_Z . V on phi, with V a
+        # local Clifford mapping the generator to Z_a -- and UNDO V on the array (V . R_Z . V^dag)
+        # rather than folding V^dag into the frame.  The frame is UNCHANGED, so the cached
+        # _pullback_basis is NOT invalidated (the 94%-of-overhead recompute is avoided) and there
+        # is NO frame/sign-into-frame path (the RY/CZ bug class is out of scope) -- it is literally
+        # the same off-diagonal rotation computed with strided H/CNOT kernels instead of a fancy
+        # butterfly.  Gate on rank so small registers (where the butterfly is already cheap) keep it.
+        if (self._step2_localize and mx != 0 and self.phi.size >= self._loc_min_size
+                and self._flush_offdiag_localized(xp, zp, pp, mx, mz, c, s)):
+            return
+        self._pauli_lincomb_inplace(mx, mz, pp, alpha=c, beta=(-1j * s), where="rot")
+
+    @staticmethod
+    def _conj(P, g):
+        if g[0] == "h":
+            return _conj_h(P, g[1])
+        if g[0] == "s":
+            return _conj_s(P, g[1], g[2])
+        return _conj_cx(P, g[1], g[2])
+
+    def _flush_offdiag_localized(self, xp, zp, pp, mx, mz, c, s):
+        """Apply R_{P'}(theta) for off-diagonal P' = i^pp X^xp Z^zp via V . R_{Z_a} . V^dag on phi,
+        with V the COLLAPSE-FIRST localizer (ONE H, weight-independent): CNOT-collapse the X-string
+        onto pivot a (free permutations), one S^dag if a is Y, ONE H (X_a->Z_a), CNOT-collapse the
+        Z-string onto a (free).  V is built SYMBOLICALLY and verified to map P' -> +-Z_a before any
+        phi touch; on failure return False (caller uses the butterfly).  V is UNDONE on the array
+        (frame untouched -> no _pullback_basis recompute, no frame/sign-into-frame bug class).
+        Returns True iff applied."""
+        P = (xp, zp, pp)
+        xsupp = [ss for ss in _support(xp, zp) if ss in self.M and (xp >> ss) & 1]
+        if not xsupp:
+            return False
+        a = xsupp[0]
+        W = []
+        for b in xsupp:                                     # 1. collapse X-string onto a (free)
+            if b != a:
+                g = ("cx", a, b); W.append(g); P = self._conj(P, g)
+        if (P[0] >> a) & 1 and (P[1] >> a) & 1:             # 2. a is Y -> S^dag makes it pure X
+            g = ("s", a, True); W.append(g); P = self._conj(P, g)
+        g = ("h", a); W.append(g); P = self._conj(P, g)     # 3. the ONE H: X_a -> Z_a
+        for b in [ss for ss in self.M if ss != a and (P[1] >> ss) & 1]:
+            g = ("cx", b, a); W.append(g); P = self._conj(P, g)   # 4. collapse Z-string onto a
+        if P[0] != 0 or P[1] != (1 << a):                   # verify P' -> +-Z_a (else bail)
+            return False
+        sign = 1.0 if (P[2] & 3) == 0 else -1.0
+        idx = self.M.index
+        if self._loc_undo:
+            for g in W:                                     # apply V to phi (strided; CNOTs free)
+                if g[0] == "h":
+                    self._h_axis(idx(g[1]))
+                elif g[0] == "s":
+                    self._s_axis(idx(g[1]), g[2])
+                else:
+                    self._cnot_axes(idx(g[1]), idx(g[2]))
+            self._pauli_lincomb_inplace(0, 1 << idx(a), 0, alpha=c, beta=(-1j * s * sign), where="rot")
+            for g in reversed(W):                           # UNDO V (frame untouched): 2 H, no cache hit
+                if g[0] == "h":
+                    self._h_axis(idx(g[1]))
+                elif g[0] == "s":
+                    self._s_axis(idx(g[1]), not g[2])
+                else:
+                    self._cnot_axes(idx(g[1]), idx(g[2]))
+        else:
+            for g in W:                                     # apply V to phi AND fold V^dag to frame
+                if g[0] == "h":
+                    self._h_axis(idx(g[1])); self.right_h(g[1])
+                elif g[0] == "s":
+                    self._s_axis(idx(g[1]), g[2]); self.right_s(g[1], dag=(not g[2]))
+                else:
+                    self._cnot_axes(idx(g[1]), idx(g[2])); self.right_cx(g[1], g[2])
+            self._pauli_lincomb_inplace(0, 1 << idx(a), 0, alpha=c, beta=(-1j * s * sign), where="rot")
+        return True
+
+    # ================================================================= #
+    #  CAPACITY-BUFFER STORAGE.  phi is ALWAYS storage[:sz] -- a contiguous prefix view.
+    #  promote grows the logical size in place (zero the new MSB block); drop shrinks via
+    #  size/memmove after moving the dropped axis to the MSB.  NO ndarray.resize, which
+    #  reallocs a fresh buffer (measured: grow -> 2^(r+1), shrink -> 2^(r-1) transient).
+    #  The backend retains the buffer across shots so its capacity settles at the high-water
+    #  2^r_max <= 2^k_clifft and warmed shots NEVER realloc -> the storage is the only
+    #  exponential object and peak amplitude memory = 2^r_max.
+    # ================================================================= #
+    def _adopt_storage(self, retained=None):
+        """Establish the capacity buffer at shot start, reusing the backend's high-water
+        buffer when its capacity is in [sz, cap] (so warmed shots never realloc)."""
+        sz = self.phi.size
+        cap = self.budget.cap
+        if retained is not None and sz <= retained.size <= cap:
+            self._storage = retained
+        else:
+            self._storage = np.empty(max(1, sz), dtype=np.complex128)
+        self._storage[:sz] = self.phi
+        self._sz = sz
+        self.phi = self._storage[:sz]
+
+    def _ensure_inited(self):
+        """Lazy adopt: a fresh engine (no backend wiring, e.g. unit tests) or any path that
+        reassigned phi to a non-storage array re-establishes the prefix-view invariant."""
+        st = getattr(self, "_storage", None)
+        if st is None or getattr(self.phi, "base", None) is not st:
+            self._adopt_storage(st)
+
+    def _grow_capacity(self, need):
+        """High-water grow of the BACKING buffer -- one transient (old+new), only when the
+        logical size first exceeds capacity (shot 1 / a new peak rank). Warmed shots skip."""
+        if need > self._storage.size:
+            bigger = np.empty(need, dtype=np.complex128)
+            bigger[:self._sz] = self._storage[:self._sz]
+            self._storage = bigger
+            self.phi = self._storage[:self._sz]
+
+    def _promote(self, q):
+        """Grow logical size 2^r -> 2^(r+1) IN PLACE: the new qubit is appended as the MSB in
+        |0>, so the existing amplitudes stay in the low half and the new high block is zeroed
+        in storage (no resize realloc, no second buffer)."""
+        if q in self.M:
+            return
+        self._ensure_inited()
+        new_size = self._sz * 2
+        self.budget.charge(new_size, 0, "promote")        # resident 2^(r+1) <= 2^k (enforced)
+        self._grow_capacity(new_size)                     # realloc only on a new high-water
+        seed = getattr(self, "_dormant_seed", None)
+        if getattr(self, "_deferred_seed", False) and seed is not None and seed.get(q) == "PLUS":
+            # deferred |+> materialisation: new MSB qubit = (|0>+|1>)/sqrt2 -> high block = low
+            # block (copy), then scale BOTH halves by 1/sqrt2.  (a) -> (a/sqrt2, a/sqrt2).
+            self._storage[self._sz:new_size] = self._storage[:self._sz]
+            self._storage[:new_size] *= self._INV_SQRT2
+            seed.pop(q, None)
+        else:
+            self._storage[self._sz:new_size] = 0.0        # new MSB qubit = |0>: high block zero
+        self._sz = new_size
+        self.M.append(q)
+        self.phi = self._storage[:self._sz]
+
+    def _swap_axes(self, j1, j2):
+        """Exchange magic-register bits j1, j2 IN PLACE (swap the (bit_j1=0,bit_j2=1) and
+        (bit_j1=1,bit_j2=0) strided sub-blocks via the temp-free 3-op swap) -- a pure
+        permutation, no amplitude temporary."""
+        if j1 == j2:
+            return
+        r = self._sz.bit_length() - 1
+        t = self.phi.reshape([2] * r)
+        a1 = r - 1 - j1
+        a2 = r - 1 - j2
+        s01 = [slice(None)] * r; s01[a1] = slice(0, 1); s01[a2] = slice(1, 2)
+        s10 = [slice(None)] * r; s10[a1] = slice(1, 2); s10[a2] = slice(0, 1)
+        a = t[tuple(s01)]; b = t[tuple(s10)]
+        a += b; b *= -1.0; b += a; a -= b
+
+    def _drop_axis_inplace(self, j, fold_x_qubit=None):
+        """Drop a product axis with NO resize and NO compaction gather: move it to the MSB
+        (in-place strided swap), so the kept branch is a CONTIGUOUS half and the drop is
+        pure size bookkeeping -- branch 0 keeps the prefix; branch 1 does ONE disjoint
+        in-storage memmove of the high half down to the prefix (no new array). Pops M (the
+        dropped/localized axis) internally; returns the kept eigen-bit (0/1) or None."""
+        self._ensure_inited()
+        sq0 = self._branch_sqnorm(j, 0)
+        sq1 = self._branch_sqnorm(j, 1)
+        if sq1 < 1e-20:
+            keep = 0
+        elif sq0 < 1e-20:
+            keep = 1
+        else:
+            return None
+        r = self._sz.bit_length() - 1
+        msb = r - 1
+        if j != msb:
+            self._swap_axes(j, msb)                        # dropped axis -> MSB (contiguous half)
+            self.M[j], self.M[msb] = self.M[msb], self.M[j]
+        half = self._sz >> 1
+        if keep == 1:                                      # kept = high half -> memmove to prefix
+            self._storage[:half] = self._storage[half:self._sz]   # disjoint ranges, no temp
+        self.budget.charge(half, 0, "drop")
+        self._sz = half
+        self.M.pop()                                       # remove the MSB = localized/product axis
+        self.phi = self._storage[:self._sz]
+        return keep
+
+    # ---- compress that correctly handles |1> product axes, fully in place ----
+    def _compress_magic(self):
+        """Drop every product magic axis IN PLACE (no amplitude-sized copy). A qubit found
+        in product |1> is dropped by folding X_q into the FRAME (U_C <- U_C X_q, i.e. negate
+        Zc[q]'s phase) so the bare |0>_q represents the physical |1>_q -- the base version
+        rejoins a |1> qubit to |0>_{notM}, SILENTLY LOSING the |1> (harmless in the lazy
+        engine where measured qubits stay entangled, but exposed by the purge's deliberate
+        localization of the measured dof to a product Z-eigenstate that may be |1>)."""
+        changed = True
+        while changed and self.M:
+            changed = False
+            for a in range(len(self.M)):
+                q = self.M[a]                         # phi bit a <-> qubit M[a] (M[0]=LSB)
+                keep = self._drop_axis_inplace(a)     # swaps a->MSB, drops, pops M internally
+                if keep is None:
+                    continue
+                if keep == 1:                         # |1> -> fold X_q into the frame
+                    zr = self.Zc[q]
+                    self.Zc[q] = (zr[0], zr[1], (zr[2] + 2) & 3)
+                    self._frame_ver += 1
+                    if self._inv_enabled:
+                        self._inv_fold_x(q)
+                changed = True
+                break
+
+    # ---- PHASE-1: drop the just-localized measured axis directly (no O(k) product rescan) ----
+    _purge_verify = False        # set True in verification to assert no residual product axis
+
+    def _drop_localized_core(self, q, keep):
+        """Swap axis q to the MSB, drop it (branch `keep` survives), pop M, and -- for a kept
+        |1> branch -- fold X_q into the frame.  Mirrors _compress_magic's drop + |1>-X-fold
+        EXACTLY, but takes a KNOWN keep (no _branch_sqnorm product test)."""
+        self._ensure_inited()
+        j = self.M.index(q)
+        r = self._sz.bit_length() - 1
+        msb = r - 1
+        if j != msb:
+            self._swap_axes(j, msb)                            # dropped axis -> MSB (contiguous)
+            self.M[j], self.M[msb] = self.M[msb], self.M[j]
+        half = self._sz >> 1
+        if keep == 1:                                          # kept = high half -> memmove down
+            self._storage[:half] = self._storage[half:self._sz]   # disjoint ranges, no temp
+        self.budget.charge(half, 0, "drop")
+        self._sz = half
+        self.M.pop()                                           # remove MSB = q
+        self.phi = self._storage[:self._sz]
+        if keep == 1:                                          # |1> product -> fold X_q into frame
+            zr = self.Zc[q]
+            self.Zc[q] = (zr[0], zr[1], (zr[2] + 2) & 3)
+            self._frame_ver += 1
+            if self._inv_enabled:
+                self._inv_fold_x(q)
+
+    def _support_bits(self):
+        """OR and AND over the indices of all nonzero amplitudes, in bounded chunks (O(_CHUNK)
+        transient -- no 2^r index array).  Axis a's branch_1 is empty iff bit a is clear in OR;
+        its branch_0 is empty iff bit a is set in AND.  This is the CHEAP gate (one pass) that
+        flags candidate product axes; the exact branch-sqnorm threshold then confirms each."""
+        phi = self.phi
+        N = phi.size
+        CH = min(self._CHUNK, N)
+        self.budget.charge(N, CH, "sqnorm")        # one |.|>tol pass, charge like a sqnorm
+        or_bits = 0
+        and_bits = -1                              # all-ones; AND narrows it
+        any_nz = False
+        for s in range(0, N, CH):
+            e = min(s + CH, N)
+            nz = np.nonzero(np.abs(phi[s:e]) > 1e-10)[0]
+            if nz.size == 0:
+                continue
+            nz = nz + s
+            or_bits |= int(np.bitwise_or.reduce(nz))
+            and_bits &= int(np.bitwise_and.reduce(nz))
+            any_nz = True
+        return (or_bits, and_bits) if any_nz else (0, 0)
+
+    def _drop_residual_products(self):
+        """Drop every remaining product Z-eigenstate axis (a measurement can disentangle a
+        SECOND qubit beyond the localized r -- e.g. distillation).  The product-axis set is
+        invariant under dropping a product axis, so the cheap _support_bits gate finds every
+        candidate in one pass; each candidate is confirmed with the EXACT branch-sqnorm < 1e-20
+        threshold (matching _drop_axis_inplace) before dropping.  Common case: one gate pass,
+        no candidate, zero branch-sqnorms -- no O(k) rescan."""
+        while self.M:
+            if self._sz <= 1:
+                break
+            or_bits, and_bits = self._support_bits()
+            target = None
+            for a in range(len(self.M)):
+                bit = 1 << a
+                if not (or_bits & bit):
+                    empty = 1                      # branch_1 empty -> keep 0
+                elif and_bits & bit:
+                    empty = 0                      # branch_0 empty -> keep 1
+                else:
+                    continue
+                if self._branch_sqnorm(a, empty) < 1e-20:     # exact confirm
+                    target = (self.M[a], 1 - empty)           # keep = surviving branch
+                    break
+            if target is None:
+                break
+            self._drop_localized_core(*target)
+
+    def _drop_localized(self, q, keep):
+        """Drop the just-localized measured axis q (KNOWN product, branch `keep` survives),
+        then sweep for any residual product axes.  Replaces the O(k)-sqnorm-per-rank
+        _compress_magic rescan: the guaranteed axis r is dropped with no sqnorm, and the cheap
+        support gate handles the rare second product axis."""
+        self._drop_localized_core(q, keep)
+        self._drop_residual_products()
+
+    def _assert_no_residual_product(self):
+        """Verification-only guard: after _drop_localized (direct drop of r + residual sweep),
+        the original O(k) _compress_magic scan must drop NOTHING -- i.e. the cheap support gate
+        found exactly what the full scan would.  A non-zero drop here means a missed product
+        axis, so raise loudly instead of silently leaving a dead resident axis."""
+        before = len(self.M)
+        self._compress_magic()
+        if len(self.M) != before:
+            raise AssertionError(
+                f"_drop_localized left {before - len(self.M)} residual product axis/axes at "
+                f"measurement {self._meas_log_ctr}: drops/meas==1 invariant violated")
+
+    # ---- the localize-and-drop releases the measured dof every magic measurement, so
+    #      the cross-register parity reduction (_reduce_full, whose _find_z_stab .ravel()s
+    #      two half-size COMPLEX slices -- the last amplitude-sized transient) is redundant:
+    #      the active rank already tracks clifft WITHOUT it (verified: rank/correctness
+    #      identical with _reduce_full disabled on every benchmark). Drop it. ----
+    def _reduce_full(self):
+        return
+
+    # ---- LOCALIZE the measured Pauli to a single Z_r BEFORE the Born ----------
+    def _localize_to_Z(self, xp, zp, pp, prefer=None):
+        """Apply a block-local Clifford W (the view-based temp-free H/S/CNOT) that maps the
+        magic-register Pauli P' = i^pp X^xp Z^zp to sign*Z_r, applying W to phi and folding
+        W^dag into the frame (EXACT identity insertion), and tracking the sign by conjugating
+        P through W (phase-exact, the R_Y-critical part). Returns (r, sign in {+1,-1}); or
+        (None, ev) when P' has no magic support (a deterministic +-1 outcome). Doing this
+        BEFORE the Born makes the measurement single-axis -> the Born is a strided-slice norm
+        and the collapse a strided-slice zero, both with ZERO amplitude-sized temporary."""
+        supp = [s for s in _support(xp, zp) if s in self.M]
+        if not supp:
+            ev = float(np.real(1j ** (pp & 3)))      # P' = i^pp on |0>_{notM} -> +-1
+            return None, (1.0 if ev >= 0 else -1.0)
+        r = prefer if (prefer is not None and prefer in supp) else supp[0]
+        W = []
+        for s in supp:
+            xb = (xp >> s) & 1
+            zb = (zp >> s) & 1
+            if xb and zb:                            # local Y (=XZ) -> S^dag then H -> Z
+                W += [("s", s, True), ("h", s)]
+            elif xb:                                 # local X -> H -> Z
+                W += [("h", s)]
+        for s in supp:
+            if s != r:
+                W.append(("cx", s, r))               # CNOT(ctrl=s,tgt=r): Z_s Z_r -> Z_r
+        P = (xp, zp, pp)
+        for g in W:                                  # apply to phi, conjugate P, fold frame
+            if g[0] == "h":
+                self._h_axis(self.M.index(g[1])); P = _conj_h(P, g[1]); self.right_h(g[1])
+            elif g[0] == "s":
+                self._s_axis(self.M.index(g[1]), g[2]); P = _conj_s(P, g[1], g[2])
+                self.right_s(g[1], dag=(not g[2]))
+            else:
+                self._cnot_axes(self.M.index(g[1]), self.M.index(g[2]))
+                P = _conj_cx(P, g[1], g[2]); self.right_cx(g[1], g[2])
+        sign = 1.0 if (P[2] & 3) == 0 else -1.0      # P now (0, 1<<r, pp' in {0,2}) = +-Z_r
+        return r, sign
+
+    # ================================================================= #
+    #  FUSED MEASUREMENT  (no 2^{r_mat} transient)                       #
+    # ----------------------------------------------------------------- #
+    #  measure_z dispatches here when the measurement is the diagonal-   #
+    #  magic case that the materialize-localize-drop path would handle   #
+    #  with a single +1 measured-axis transient.  The measured axis is   #
+    #  contracted analytically:                                          #
+    #    * Born p0 = (1 + <M'(t)>_in)/2 with M'(t)=U_core^dag M' U_core,  #
+    #      keeping only terms with no X on the newly-promoted axes (the   #
+    #      |0>^new factor kills X-on-new) -> evaluated on phi_in.         #
+    #    * survivor |phi_out> = K_b|phi_in> built directly on the r_out   #
+    #      register via the localiser parity mask (measured axis summed   #
+    #      out), then the SAME swap-pop axis bookkeeping + frame folds    #
+    #      (right_cx + |1>-branch X-fold) the drop path would apply.      #
+    #  Verified bit-identical to the oracle (M ordering, Xc/Zc, phi up    #
+    #  to global phase, p0) on coherent_d3_r3 -- /tmp/proto_fused_integ.  #
+    # ================================================================= #
+    def _fused_core_entries(self, q):
+        """The anticommuting core for the Z_q measurement WITHOUT advancing _meas_ctr or
+        touching pending -- mirrors _flush_core's selection (fast table, else live scan)."""
+        if self._fast_cores is None:
+            return self._dynamic_core(0, 1 << q)
+        core_uids = self._fast_cores.get(self._meas_ctr, ())
+        flush = []
+        for u in core_uids:
+            e = self.pending.get(u)
+            if e is None:                                  # structural miss -> safe live scan
+                return self._dynamic_core(0, 1 << q)
+            flush.append(e)
+        return flush
+
+    def _fused_setup(self, q):
+        """Read-only analysis of the Z_q measurement (uses the PRE-flush frame, which is the
+        SAME as the post-flush frame -- a core flush never mutates Xc/Zc).  Returns the fused
+        plan, or None when the diagonal-magic fast path does not apply (caller falls back)."""
+        # The measured axis q may be FRESH (newly promoted this core) or RESIDENT (already in M);
+        # _fused_survivor dispatches on m vs r_in.  Both run in <= max(r_in, r_out) workspace.
+        M_in = list(self.M)
+        core = self._fused_core_entries(q)
+        # virtual flush: replay the promote order (ascending qubit within each core entry).  The
+        # fused plan assumes the real flush leaves the Clifford frame UNCHANGED.  That holds UNLESS
+        # _flush_one localizes an off-diagonal rotation (mx != 0 and phi.size >= _loc_min_size),
+        # which folds W^dag into the frame mid-flush.  If any core rotation would trigger that, the
+        # pre-flush frame we read here is stale -> fall back to the oracle.
+        M_mat = list(M_in)
+        pulled = []
+        for (x, z, p, theta, uid) in core:
+            xp, zp, pp0 = self._pullback(x, z)
+            pp = (pp0 + p) & 3
+            pulled.append((xp, zp, pp, theta))
+            for qq in range(self.n):
+                if (xp >> qq) & 1 and qq not in M_mat:
+                    M_mat.append(qq)
+            if self._step2_localize and (1 << len(M_mat)) >= self._loc_min_size:
+                if any((xp >> qq) & 1 for qq in M_mat):    # off-diagonal rotation at localizing rank
+                    return None                            # flush would mutate the frame -> oracle
+        # Stabilizer check uses the POST-flush register (matches the oracle, which computes anti_s
+        # AFTER _flush_core): a qubit the measured Pauli anticommutes with may be promoted by the
+        # core flush, turning an apparent stabilizer measurement into a magic (off-diagonal) one.
+        Pm = (0, 1 << q, 0)
+        magset = set(M_mat)
+        if any(i not in magset and not pauli_commute(self.Zc[i], Pm) for i in range(self.n)):
+            return None                                    # genuine stabilizer branch -> oracle
+        xpq, zpq, ppq = self._pullback(0, 1 << q)
+
+        def masks(xp, zp):
+            mx = mz = 0
+            for l, qq in enumerate(M_mat):
+                if (xp >> qq) & 1:
+                    mx |= 1 << l
+                if (zp >> qq) & 1:
+                    mz |= 1 << l
+            return mx, mz
+
+        Mx, Mz = masks(xpq, zpq)
+        mmask = 0
+        for qq in M_mat:
+            mmask |= 1 << qq
+        if (xpq & ~mmask) != 0 or (Mx == 0 and Mz == 0):
+            return None                                    # X on a non-magic qubit / deterministic
+        # Build the localizer W EXACTLY as _localize_to_Z(prefer=q): H/S turn each X/Y support axis
+        # into Z, then CNOTs collapse the Z-string onto the pivot r.  We FOLD the H/S part (W_HS, as
+        # a Pauli sum) into the core -> U' = W_HS U_core, and conjugate M' to a pure-Z M''; the CNOTs
+        # are absorbed by the survivor parity mask.  So the off-diagonal case reduces to the diagonal
+        # machinery with (U', M''); the diagonal path is the no-X (empty W_HS) special case.
+        supp = sorted(qq for qq in M_mat if ((xpq | zpq) >> qq) & 1)
+        r = q if q in supp else supp[0]                    # pivot (dropped axis), as _localize_to_Z
+        m = M_mat.index(r)
+        hs = []                                            # H/S gates on the X/Y support axes
+        for s in supp:
+            xb = (xpq >> s) & 1; zb = (zpq >> s) & 1
+            if xb and zb:
+                hs += [("s", s, True), ("h", s)]           # Y -> S^dag, H -> Z
+            elif xb:
+                hs += [("h", s)]                           # X -> H -> Z
+        W_hs = {(0, 0): 1.0 + 0j}
+        xh, zh, ph = xpq, zpq, ppq                         # M'' = W_HS M' W_HS^dag (track exactly)
+        INV2 = 0.7071067811865476
+        for g in hs:
+            b = 1 << M_mat.index(g[1])
+            if g[0] == "h":
+                gate = {(b, 0): INV2, (0, b): INV2}        # H = (X + Z)/sqrt2
+                xh, zh, ph = _conj_h((xh, zh, ph), g[1])
+            else:
+                gate = {(0, 0): (1 - 1j) / 2, (0, b): (1 + 1j) / 2}   # S^dag = ((1-i)I + (1+i)Z)/2
+                xh, zh, ph = _conj_s((xh, zh, ph), g[1], g[2])
+            W_hs = _fmul(gate, W_hs)
+        Mx2, Mz2 = masks(xh, zh)
+        if Mx2 != 0:
+            return None                                    # HS failed to diagonalise M' -> oracle
+        W = list(hs) + [("cx", s, r) for s in supp if s != r]   # full localizer (HS then collapse)
+        # The symbolic core can blow up (#U ~ 2^{#off-axis rotations}); cap it so a pathological
+        # core (e.g. high-rank off-diagonal ry) FALLS BACK to the oracle instead of hanging.  This
+        # is a hang-guard, not a FLOP optimization -- correctness is identical either way.
+        cap = self._fused_max_terms
+        U = {(0, 0): 1.0 + 0j}
+        for (xp, zp, pp, theta) in pulled:
+            mx, mz = masks(xp, zp)
+            U = _fmul({(0, 0): np.cos(theta / 2.0),
+                       (mx, mz): (-1j * np.sin(theta / 2.0)) * (1j ** (pp & 3))}, U)
+            if len(U) > cap:
+                return None                                # core too large -> oracle (no hang)
+        U = _fmul(W_hs, U)                                 # fold the H/S localizer into the core
+        if len(U) > cap:
+            return None
+        return dict(M_in=M_in, M_mat=M_mat, q=q, pivot=r, m=m, core=core, U=U, Mx=0, Mz=Mz2,
+                    Mph=(1j ** (ph & 3)), ppq=ph, W=W, phi_in=self.phi.copy())
+
+    def _fused_born(self, info):
+        """P(outcome 0) = (1 + <M'(t)>_in)/2 on phi_in (2^{r_in}) -- never touches a new axis."""
+        M_in = info["M_in"]; M_mat = info["M_mat"]; U = info["U"]
+        rin = len(M_in); rmat = len(M_mat)
+        rin_mask = (1 << rin) - 1
+        new_mask = ((1 << rmat) - 1) & ~rin_mask
+        Mt = _fmul(_fdag(U), _fmul({(info["Mx"], info["Mz"]): info["Mph"]}, U))
+        pin = info["phi_in"]
+        nrm = float(np.linalg.norm(pin))
+        pin = pin / nrm if nrm > 1e-300 else pin
+        ev = 0j
+        for (x, z), cc in Mt.items():
+            if x & new_mask:                               # X on a |0>^new axis -> <0|X|0> = 0
+                continue
+            ev += cc * np.vdot(pin, _apply_xz(x & rin_mask, z & rin_mask, pin))
+        return max(0.0, min(1.0, (1.0 + ev.real) / 2.0))
+
+    def _fused_survivor(self, info, keepbit):
+        """K_b|phi_in> on the r_out register (2^{r_out}), layout-A = M_mat with bit m removed.
+        Dispatches on whether the measured axis m is FRESH (m >= r_in -- a newly-promoted |0>
+        axis) or RESIDENT (m < r_in -- an entangled old bit). Returns (UNNORMALISED survivor,
+        squared norm = branch probability)."""
+        rin = len(info["M_in"]); m = info["m"]            # m = dropped localizer-pivot bit
+        if m >= rin:
+            return self._fused_survivor_fresh(info, keepbit, m)
+        return self._fused_survivor_resident(info, keepbit, m)
+
+    def _fused_survivor_fresh(self, info, keepbit, m):
+        """Measured axis is a newly-promoted |0> axis: input = phi_in (x) |0>_m.  K_b places each
+        U_core term onto the r_out=r_in+|other-new| register, the m bit summed out by the
+        localiser parity mask (a zero-mask on the old Z-support controls)."""
+        M_in = info["M_in"]; M_mat = info["M_mat"]; U = info["U"]; phi_in = info["phi_in"]
+        rin = len(M_in); rmat = len(M_mat); rout = rmat - 1
+        rin_mask = (1 << rin) - 1
+        new_mask = ((1 << rmat) - 1) & ~rin_mask
+        other_new = new_mask & ~(1 << m)
+        onew_bits = [b for b in range(rmat) if (other_new >> b) & 1]
+        ctrls = [b for b in range(rmat) if (info["Mz"] >> b) & 1 and b != m]
+        Sr = [b for b in ctrls if b < rin]
+        So = [b for b in ctrls if b >= rin]
+        surv = np.zeros(1 << rout, dtype=np.complex128)
+        ridx = np.arange(1 << rin, dtype=np.int64)
+        for (x, z), cc in U.items():
+            vec = cc * _apply_xz(x & rin_mask, z & rin_mask, phi_in)
+            blk = 0
+            for j, b in enumerate(onew_bits):
+                if (x >> b) & 1:
+                    blk |= 1 << j
+            po = 0
+            for b in So:
+                po ^= (blk >> onew_bits.index(b)) & 1
+            tgt_par = (keepbit ^ ((x >> m) & 1) ^ po) & 1
+            if Sr:
+                par = np.zeros(1 << rin, dtype=np.int64)
+                for b in Sr:
+                    par ^= (ridx >> b) & 1
+                vec = np.where(par == tgt_par, vec, 0.0)
+            elif tgt_par != 0:
+                continue
+            surv[(blk << rin):((blk + 1) << rin)] += vec
+        return surv, float(np.vdot(surv, surv).real)
+
+    def _fused_survivor_resident(self, info, keepbit, m):
+        """Measured axis is an entangled old bit (m < r_in): input = phi_in (m already inside),
+        core promotes only WORK axes.  survivor = <keepbit|_m L U_core |phi_in>.  Output old part
+        = old register with bit m removed (r_in-1 bits); for each output index the m bit is GATHERED
+        (selected) at the value the localiser parity constraint forces -- m_pre = keepbit XOR
+        parity over the Z-support controls -- instead of zero-masked."""
+        M_in = info["M_in"]; M_mat = info["M_mat"]; U = info["U"]; phi_in = info["phi_in"]
+        rin = len(M_in); rmat = len(M_mat); rout = rmat - 1
+        rin_mask = (1 << rin) - 1
+        new_mask = ((1 << rmat) - 1) & ~rin_mask
+        ctrls = [b for b in range(rmat) if (info["Mz"] >> b) & 1 and b != m]
+        old_ctrls = [b for b in ctrls if b < rin]
+        work_ctrls = [b for b in ctrls if b >= rin]
+        onew_bits = sorted(b for b in range(rmat) if (new_mask >> b) & 1)   # work axes (all kept)
+        out_old_bits = rin - 1
+        low_mask = (1 << m) - 1
+        w = np.arange(1 << out_old_bits, dtype=np.int64)
+        w_low = w & low_mask
+        w_high = (w >> m) << (m + 1)                        # insert a 0 slot at bit m
+        par_old = np.zeros(1 << out_old_bits, dtype=np.int64)
+        for s in old_ctrls:                                # M_mat old-bit s -> output bit (s or s-1)
+            par_old ^= (w >> (s if s < m else s - 1)) & 1
+        surv = np.zeros(1 << rout, dtype=np.complex128)
+        for (x, z), cc in U.items():
+            vec = cc * _apply_xz(x & rin_mask, z & rin_mask, phi_in)        # 2^{r_in}, m inside
+            blk = 0
+            for j, b in enumerate(onew_bits):
+                if (x >> b) & 1:
+                    blk |= 1 << j
+            po = 0
+            for b in work_ctrls:
+                po ^= (blk >> onew_bits.index(b)) & 1
+            mpre = (keepbit ^ po ^ par_old) & 1            # localiser-forced m value per output idx
+            full = w_low | (mpre << m) | w_high
+            surv[(blk << out_old_bits):((blk + 1) << out_old_bits)] += vec[full]
+        return surv, float(np.vdot(surv, surv).real)
+
+    def _fused_commit(self, q, info):
+        """Sample the outcome (ONE rng.random, like the oracle), build the r_out survivor, and
+        apply the SAME M ordering + frame folds the drop path would -- with NO 2^{r_mat} alloc."""
+        M_in = info["M_in"]; M_mat = info["M_mat"]
+        rin = len(M_in); rmat = len(M_mat); rout = rmat - 1
+        piv = info["pivot"]; m = info["m"]                 # dropped localizer-pivot qubit / its bit
+        # consume the core like _flush_core/_do_flush would, but never materialize it
+        self._meas_ctr += 1
+        for ce in info["core"]:
+            del self.pending[ce[4]]
+        # Born + sample (single rng draw, same convention as the oracle: out=0 iff r<p0)
+        p0 = self._fused_born(info)
+        out = 0 if float(self.rng.random()) < p0 else 1
+        sign = 1.0 if (info["ppq"] & 3) == 0 else -1.0
+        plus_bit = 0 if sign > 0 else 1
+        keepbit = plus_bit if out == 0 else (1 - plus_bit)
+        # survivor on the r_out register (the ONLY exponential allocation this measurement)
+        surv, p_b = self._fused_survivor(info, keepbit)
+        if p_b > 1e-300:
+            surv *= (1.0 / p_b ** 0.5)                     # normalise to unit norm
+        M_A = [M_mat[i] for i in range(rmat) if i != m]
+        if m < rout:                                       # pivot not the MSB -> swap-pop permutation
+            M_out = M_A[:m] + [M_A[rout - 1]] + M_A[m:rout - 1]
+            y = np.arange(1 << rout, dtype=np.int64)
+            xidx = np.zeros(1 << rout, dtype=np.int64)
+            for i in range(rout):
+                pi = i if i < m else (rout - 1 if i == m else i - 1)
+                xidx |= ((y >> i) & 1) << pi
+            surv = surv[xidx]
+        else:                                              # pivot already the MSB -> layout-A == M_out
+            M_out = M_A
+        # write the survivor into the capacity buffer prefix (largest array = 2^{r_out})
+        self._ensure_inited()
+        self.budget.charge(1 << rout, 0, "fused:survivor")
+        self._grow_capacity(1 << rout)
+        self._storage[:1 << rout] = surv
+        self._sz = 1 << rout
+        self.M = M_out
+        self.phi = self._storage[:self._sz]
+        # frame folds: replay the FULL localizer W (the H/S that diagonalised M' AND the CNOTs that
+        # collapse onto the pivot) via the oracle's right_* primitives -- EXACTLY what
+        # _localize_to_Z folds -- then the drop's |1>-branch X_piv fold.  Folding through right_*
+        # keeps the incremental inverse-frame live (no rebuild) and Xc/Zc bit-identical.
+        for g in info["W"]:
+            if g[0] == "h":
+                self.right_h(g[1])
+            elif g[0] == "s":
+                self.right_s(g[1], dag=(not g[2]))
+            else:
+                self.right_cx(g[1], g[2])
+        if keepbit == 1:                                   # |1> product -> fold X_piv into frame
+            zr = self.Zc[piv]
+            self.Zc[piv] = (zr[0], zr[1], (zr[2] + 2) & 3)
+            self._frame_ver += 1
+            if self._inv_enabled:
+                self._inv_fold_x(piv)
+        # a measurement can disentangle a SECOND product axis (matches the oracle's residual sweep)
+        self._drop_residual_products()
+        # ---- hard invariants of the fused path ----
+        rout_final = len(self.M)
+        max_alloc_exp = max(rin, rout)                     # phi_in (r_in) and surv (r_out); never r_mat
+        removable = rmat > max(rin, rout)                  # a transient ABOVE the I/O bound existed
+        assert piv not in self.M, "fused: localizer-pivot axis materialized/retained"
+        assert max_alloc_exp <= max(rin, rout), "fused: dense array exceeded max(r_in,r_out)"
+        assert (not removable) or max_alloc_exp < rmat, "fused: failed to remove the r_mat transient"
+        log = getattr(self, "_fused_log", None)
+        if log is None:
+            log = self._fused_log = []
+        n_U = len(info["U"])                               # Pauli-sum length (the FLOP driver)
+        log.append(dict(meas=self._meas_log_ctr, r_in=rin, r_mat_reference=rmat,
+                        r_out=rout_final, largest_dense_array_exponent=max_alloc_exp,
+                        measurement_axis_materialized=False, kind=("fresh" if m >= rin else "resident"),
+                        removable=removable, n_U_terms=n_U, n_core_rot=len(info["core"]),
+                        survivor_ops=n_U * (1 << rout), p0=p0, out=out))
+        if rout_final > self.max_M:
+            self.max_M = rout_final
+        self.budget.note_resident(self.phi.size, "fused:post")
+        if self.log_cores:
+            self.core_log.append(dict(meas=self._meas_log_ctr, branch="magic-fused",
+                                      M_before=rin, M_after=rout_final, p0=p0,
+                                      peak_live_words=self.budget.peak))
+        self._meas_log_ctr += 1
+        return out
+
+    def measure_z(self, q):
+        # S2: flush the deferred segment of Clifford gates onto Xc/Zc before any tableau read.
+        if self._compiled_frame and self._tab_gates:
+            self._flush_tableau()
+        # COMPILED-CORE fast path (default OFF): one C++ call per measurement core.  Only on real
+        # shots (not structure discovery) and not in resource-only sizing.  Falls back to the oracle
+        # (returns None, no RNG consumed) for stabilizer / deterministic / unsupported cases.
+        if (self._compiled_core and not self.resource_only
+                and self._record_cores is None and self._flushed_uids is None):
+            from nearclifford_backend.clifft_axis.compiled_core import try_compiled_measure
+            out = try_compiled_measure(self, q)
+            if out is not None:
+                return out
+        # FUSED fast path: only on real shots (not the structure-discovery pass, which must
+        # record cores/flushed-uids via the oracle flush) and not in resource-only sizing.
+        if (self._fused_measure and not self.resource_only
+                and self._record_cores is None and self._flushed_uids is None):
+            info = self._fused_setup(q)
+            if info is not None:
+                return self._fused_commit(q, info)
+        self._flush_core(0, 1 << q)
+        Pm = (0, 1 << q, 0)
+        magset = set(self.M)
+        anti_s = [i for i in range(self.n)
+                  if i not in magset and not pauli_commute(self.Zc[i], Pm)]
+        M_before = len(self.M)
+        p0 = None
+        if anti_s:
+            out = self._ag_measure(Pm, anti_s)
+            branch = "stabilizer"
+        else:
+            xp, zp, pp = self._pullback(0, 1 << q)
+            r, sign = self._localize_to_Z(xp, zp, pp, prefer=q)
+            if r is None:                            # deterministic (no magic support)
+                p0 = max(0.0, min(1.0, (1.0 + sign) / 2.0))
+                out = 0 if float(self.rng.random()) < p0 else 1
+            else:
+                jr = self.M.index(r)
+                # PHASE-1 Born: BOTH branch sqnorms = exactly ONE full sweep (two strided
+                # half-views), and tot = s0+s1 is the state's TRUE current norm^2 recomputed
+                # each measurement (drift self-correcting, like the old _sqnorm_1d).  This
+                # REPLACES the old (half-sweep Born p0r) + (separate full _sqnorm_1d) = 1.5
+                # sweeps with one full sweep whose two halves serve BOTH the Born and the
+                # post-projection renormalization (reuse, no third pass).
+                s0 = self._branch_sqnorm(jr, 0)                  # ‖bit_r = 0‖^2  (strided view)
+                s1 = self._branch_sqnorm(jr, 1)                  # ‖bit_r = 1‖^2  (strided view)
+                tot = s0 + s1                                    # exact current norm^2
+                p0 = ((s0 if sign > 0 else s1) / tot) if tot > 1e-300 else 0.5
+                p0 = max(0.0, min(1.0, p0))                      # = (1 + <P'>)/2
+                out = 0 if float(self.rng.random()) < p0 else 1
+                plus_bit = 0 if sign > 0 else 1                  # +1 eigenvalue <-> this bit
+                keepbit = plus_bit if out == 0 else (1 - plus_bit)
+                v = self.phi.reshape(-1, 2, 1 << jr)
+                v[:, 1 - keepbit, :] = 0.0                       # project (strided view = 0)
+                nrm2 = s0 if keepbit == 0 else s1                # REUSE: surviving branch norm^2
+                if nrm2 > 1e-24:
+                    self.budget.charge(self.phi.size, 0, "normalize")   # 2^r real*complex divide
+                    self.phi /= nrm2 ** 0.5                      # in-place normalise (no sweep)
+                # PHASE-1 direct drop: drop the localized axis r (KNOWN product, keepbit known)
+                # with NO sqnorm, then a cheap support-gate sweep for the rare second product
+                # axis -- replacing _compress_magic's O(k)-sqnorm-per-rank rescan (purge sqnorm
+                # 0).  _purge_verify asserts the sweep == the original full scan.
+                self._drop_localized(r, keepbit)
+                if self._purge_verify:
+                    self._assert_no_residual_product()
+            branch = "magic"
+        self._reduce_full()
+        if len(self.M) > self.max_M:
+            self.max_M = len(self.M)
+        self.budget.note_resident(self.phi.size, "post-reduce")
+        if self.log_cores:
+            self.core_log.append(dict(meas=self._meas_log_ctr, branch=branch,
+                                      M_before=M_before, M_after=len(self.M), p0=p0,
+                                      peak_live_words=self.budget.peak))
+        self._meas_log_ctr += 1
+        return out

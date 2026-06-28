@@ -1,0 +1,12 @@
+{
+  "cpu_affinity": "core 2 (taskset)",
+  "threads": "OMP/OPENBLAS/MKL/NUMEXPR=1",
+  "complex": "complex128",
+  "release_flags": "-O3 -march=native -DNDEBUG",
+  "python": "Python 3.12.13",
+  "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+  "clifft": "0.4.2.dev2+g2655e48c6",
+  "timer": "perf_counter_ns outer public API",
+  "mdam_api": "backend.sample(compiled_core=True,fused OFF)",
+  "clifft_api": "clifft.sample"
+}

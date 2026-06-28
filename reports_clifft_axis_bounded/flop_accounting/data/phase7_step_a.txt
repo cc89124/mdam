@@ -1,0 +1,28 @@
+=== Step A (i): baseline equivalence (records/rank/p0 with vs without hooks) ===
+  coherent_ry_d3_r1  seeds=6  rec_mis=0 rank_mis=0 p0_mis=0  T=342 singlePauli=246/342 heur=312 needH=228 pureZ=114 meas=102 AG=0  PASS
+  coherent_ry_d3_r3  seeds=4  rec_mis=0 rank_mis=0 p0_mis=0  T=612 singlePauli=492/612 heur=396 needH=460 pureZ=152 meas=132 AG=0  PASS
+  cultivation_d3     seeds=8  rec_mis=0 rank_mis=0 p0_mis=0  T=232 singlePauli=184/232 heur=208 needH=184 pureZ=48 meas=40 AG=0  PASS
+  cultivation_d5     seeds=4  rec_mis=0 rank_mis=0 p0_mis=0  T=364 singlePauli=300/364 heur=312 needH=300 pureZ=64 meas=60 AG=0  PASS
+  coherent_rx_d3_r3  seeds=4  rec_mis=0 rank_mis=0 p0_mis=0  T=420 singlePauli=364/420 heur=272 needH=320 pureZ=100 meas=132 AG=12  PASS
+  coherent_d3_r3     seeds=6  rec_mis=0 rank_mis=0 p0_mis=0  T=390 singlePauli=336/390 heur=372 needH=288 pureZ=102 meas=96 AG=24  PASS
+  coherent_rx_d3_r1  seeds=4  rec_mis=0 rank_mis=0 p0_mis=0  T=164 singlePauli=140/164 heur=108 needH=124 pureZ=40 meas=68 AG=12  PASS
+  distillation       seeds=8  rec_mis=0 rank_mis=0 p0_mis=0  T=80 singlePauli=40/80 heur=80 needH=0 pureZ=80 meas=40 AG=3  PASS
+  coherent_d5_r5     seeds=2  rec_mis=0 rank_mis=0 p0_mis=0  T=806 singlePauli=706/806 heur=786 needH=610 pureZ=196 meas=144 AG=24  PASS
+  -> baseline equivalence ALL PASS (observation-only)
+
+=== Step A (ii-v): cultivation_d5 single seed detail ===
+  T rotations                          = 91
+  single-Pauli (single-axis-localizable) = 75/91  (Policy-3 PRECONDITION holds)
+  collapse-first heuristic coverage    = 78/91  (rest need a complete localization, still 1 born-H)
+  generator carries X-character (1 born-H) = 75   pure-Z (0 born-H) = 16
+  measurement boundaries   = 15   AG-measures (Clifford-injecting) = 0
+
+  cost notation (matching the existing meter coefficients):
+    array_h ALONE            = 4 * 2^r   (purge:h)
+    diagonal R_Z/T ALONE     = 3 * 2^r   (rot:diaghalf / array_rot)
+    H + diagonal rotation    = 7 * 2^r   (localizer per off-diagonal rotation)
+    off-diagonal butterfly   = 12 * 2^r  (rot:offdiag)
+
+  Policy-3 projection (all single-axis -> diagonal T/T^dag, born-H absorbed at promote):
+    runtime H-sweeps target  = 0   (the born-H is moved to EXPAND state; residue handled by T/T^dag)
+    F_bnd projected          ~ 193.9k = 0.91x clifft (diagonal-T 164.9k + Born 28.95k), residual-0 in report

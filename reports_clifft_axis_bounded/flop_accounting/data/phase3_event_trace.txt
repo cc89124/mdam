@@ -1,0 +1,92 @@
+
+============================================================================================
+  cultivation_d5
+============================================================================================
+
+  CLIFFT-unfused (k=10):  FLOP=212.82k  sum2^r=294.70k  traffic=265.12k
+  kernel                  calls    sum2^r   touched      FLOP  c=F/s2r
+  array_t                    45    33.28k    16.64k    99.83k     3.00
+  array_t_dag                46    24.81k    12.40k    74.43k     3.00
+  meas_interfere             15     4.14k     4.14k    33.09k     8.00
+  array_s                     2     1.09k       544     3.26k     3.00
+  array_cz                    9     4.42k     4.42k     2.21k     0.50
+  array_cnot                277   220.77k   220.77k         0     0.00
+  array_swap                 15     4.14k     4.14k         0     0.00
+  expand                     16     2.07k     2.07k         0     0.00
+
+  BOUNDED-P2 (k=10):  FLOP=727.70k  sum2^r=98.72k  traffic=98.72k
+  where                   calls    sum2^r   touched      FLOP        c
+  rot:offdiag-scalar         51    52.22k    52.22k   626.69k    12.00
+  rot:offdiag                40     4.81k     4.81k    57.72k    12.00
+  sqnorm                     45    10.34k    10.34k    20.68k     2.00
+  purge:h                     3     3.07k     3.07k    12.29k     4.00
+  normalize                  15     4.14k     4.14k     8.27k     2.00
+  purge:s                     1     1.02k     1.02k     2.05k     2.00
+  init                        1         1         1         0     0.00
+  promote                    16     4.14k     4.14k         0     0.00
+  purge:cnot                 27    14.84k    14.84k         0     0.00
+  drop                       15     2.07k     2.07k         0     0.00
+  post-reduce                15     2.07k     2.07k         0     0.00
+
+  --> FLOP ratio bnd/clf = 3.42   sum2^r ratio = 0.33   traffic ratio = 0.37
+
+============================================================================================
+  coherent_ry_d3_r1
+============================================================================================
+
+  CLIFFT-unfused (k=16):  FLOP=12.29M  sum2^r=4.96M  traffic=4.05M
+  kernel                  calls    sum2^r   touched      FLOP  c=F/s2r
+  array_h                    40     1.23M     1.23M     4.93M     4.00
+  array_rot                  57     1.37M   686.08k     4.12M     3.00
+  array_s                    25   448.54k   224.27k     1.35M     3.00
+  meas_interfere             17   139.26k   139.26k     1.11M     8.00
+  array_cz                   48     1.56M     1.56M   777.73k     0.50
+  array_cnot                  2    16.38k    16.38k         0     0.00
+  array_swap                 11   122.67k   122.67k         0     0.00
+  expand                     17    69.63k    69.63k         0     0.00
+
+  BOUNDED-P2 (k=16):  FLOP=12.85M  sum2^r=5.85M  traffic=5.85M
+  where                   calls    sum2^r   touched      FLOP        c
+  purge:h                    48     1.23M     1.23M     4.92M     4.00
+  rot:diaghalf               29   999.44k   999.44k     3.00M     3.00
+  rot:offdiag-scalar          2   131.07k   131.07k     1.57M    12.00
+  purge:s                    21   641.06k   641.06k     1.28M     2.00
+  rot:offdiag                24    79.92k    79.92k   959.02k    12.00
+  sqnorm                     50   327.69k   327.69k   655.39k     2.00
+  normalize                  17   131.08k   131.08k   262.16k     2.00
+  rot:diag                    2    32.90k    32.90k   197.38k     6.00
+  init                        1         1         1         0     0.00
+  promote                    17   131.08k   131.08k         0     0.00
+  purge:cnot                 62     2.01M     2.01M         0     0.00
+  drop                       17    65.54k    65.54k         0     0.00
+  post-reduce                17    65.54k    65.54k         0     0.00
+
+  --> FLOP ratio bnd/clf = 1.05   sum2^r ratio = 1.18   traffic ratio = 1.44
+
+============================================================================================
+  coherent_d5_r5
+============================================================================================
+
+  CLIFFT-unfused (k=24):  FLOP=17.99G  sum2^r=18.12G  traffic=15.30G
+  kernel                  calls    sum2^r   touched      FLOP  c=F/s2r
+  array_rot                 545     5.64G     2.82G    16.91G     3.00
+  meas_diagonal              72   134.29M   134.29M   537.17M     4.00
+  array_h                    48   134.18M   134.18M   536.74M     4.00
+  array_cnot                779    12.01G    12.01G         0     0.00
+  array_swap                 38   132.19M   132.19M         0     0.00
+  expand                     72    67.15M    67.15M         0     0.00
+
+  BOUNDED-P2 (k=13):  FLOP=25.10M  sum2^r=4.25M  traffic=4.25M
+  where                   calls    sum2^r   touched      FLOP        c
+  rot:offdiag               355     1.73M     1.73M    20.74M    12.00
+  rot:diag                   48   328.74k   328.74k     1.97M     6.00
+  sqnorm                    179   842.33k   842.33k     1.68M     2.00
+  normalize                  60   336.93k   336.93k   673.87k     2.00
+  purge:h                    12     8.19k     8.19k    32.76k     4.00
+  init                        1         1         1         0     0.00
+  post-reduce                72   168.48k   168.48k         0     0.00
+  promote                    60   336.93k   336.93k         0     0.00
+  purge:cnot                 48   328.74k   328.74k         0     0.00
+  drop                       60   168.47k   168.47k         0     0.00
+
+  --> FLOP ratio bnd/clf = 0.00   sum2^r ratio = 0.00   traffic ratio = 0.00

@@ -85,10 +85,11 @@ ttn_backend/
     test_rasl_symplectic.py
     test_ttn_transport.py
   docs/
-    TTN_BACKEND.md
+    TTN_BACKEND_OVERVIEW.md
     TTN_METHOD_DETAILED.md
+    STAGED_TRANSPORT_AND_RESIDENT_FLOOR.md
+    MULTICNOT_PARITY_REWRITE.md
     RASL_METHOD_AND_RESULTS.md
-    TTN_MEMORY_DIAGNOSIS.md
 ```
 
 ## Core Modules
@@ -350,9 +351,16 @@ script가 다시 생성한다.
 
 ## Detailed Method Notes
 
-현재 TTN backend의 전체 실행 방식, tensor convention, Class A/B/C dispatch,
-adjacent 2-bag transport sweep, actual/proxy memory metric 구분, 큰 회로 진단과
-static peak-bag compression 결과는 다음 문서에 자세히 정리했다.
+상위 개요(왜 만드는가 = Clifft active-state의 2^k 벽, 목적, 설계 알고리즘, 현재 성과,
+현재 한계 = resident entanglement floor / SVD·QR 연산 수와 원인)는 다음 한 문서에 정리했다.
+
+```text
+ttn_backend/docs/TTN_BACKEND_OVERVIEW.md
+```
+
+전체 실행 방식, tensor convention, Class A/B/C dispatch, adjacent 2-bag transport sweep,
+actual/proxy memory metric 구분, 큰 회로 진단과 static peak-bag compression 결과의
+deep-dive는 다음 문서에 있다.
 
 ```text
 ttn_backend/docs/TTN_METHOD_DETAILED.md

@@ -1,0 +1,6 @@
+benchmark,magic_cores,nonempty_cores,cores_with_tail,exec_rotations,tail_rotations,max_tail,mean_tail_per_hit,basis_agree,seed_invariant,case
+cultivation_d5,45,42,0,273,0,0,0.0,True,True,A/B (no executed suffix)
+coherent_ry_d3_r3,99,51,0,459,0,0,0.0,True,True,A/B (no executed suffix)
+coherent_d5_r5,180,144,144,1209,144,1,1.0,True,True,C (suffix executed)
+coherent_d3_r3,36,24,24,195,24,1,1.0,True,True,C (suffix executed)
+distillation,15,6,0,30,0,0,0.0,True,True,A/B (no executed suffix)

@@ -126,7 +126,7 @@ class BlockTensorStore:
             blk = self.get_block(i)
             moved = np.moveaxis(blk, axis, -1)
             sh = moved.shape
-            out = (moved.reshape(-1, sh[-1]) @ M.T).reshape(sh)
+            out = np.matmul(moved.reshape(-1, sh[-1]), M.T).reshape(sh)
             self.set_block(i, np.moveaxis(out, -1, axis))
 
     def axis1_squared_norm(self, axis):
@@ -153,7 +153,7 @@ class BlockTensorStore:
         for i in range(self.n_blocks):
             blk = self.get_block(i)
             mat = np.moveaxis(blk, a, -1).reshape(rest, blk.shape[a])
-            g = mat.conj().T @ mat
+            g = np.matmul(mat.conj().T, mat)
             G = g if G is None else _pad_add(G, g)
         return G
 

@@ -1,0 +1,8 @@
+circ,clifft_rank,mdam_work,clifft_sample_ms,mdam_core_ms,wall_md_over_cli,clifft_compile_ms,delta_rank,winner
+distillation,5,4,0.0176,0.2903,16.454,3.2006,1,Clifft
+cultivation_d3,4,4,0.0084,0.3976,47.520,0.9132,0,Clifft
+cultivation_d5,10,10,0.1170,1.8535,15.838,5.4207,0,Clifft
+coherent_d3_r3,8,5,0.0190,0.9193,48.442,0.7249,3,Clifft
+coherent_d5_r5,24,13,13973.3621,33.3914,0.002,2.6233,11,MDAM
+coherent_rx_d3_r1,14,11,0.1392,1.2686,9.110,0.2777,3,Clifft
+coherent_ry_d3_r3,16,16,4.9002,97.2204,19.840,0.4843,0,Clifft

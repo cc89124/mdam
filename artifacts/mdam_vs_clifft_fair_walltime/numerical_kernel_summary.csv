@@ -1,0 +1,8 @@
+circ,mdam_cpp_core_ms,clifft_full_ms,mdam_touch,clifft_touch,mdam_ns_per_touch,clifft_ns_per_touch
+distillation,0.11268,0.01141,2.032e+03,6.050e+02,55.454,18.855
+cultivation_d3,0.12847,0.00215,4.712e+03,1.085e+03,27.264,1.980
+cultivation_d5,0.33744,0.08110,6.200e+05,2.636e+05,0.544,0.308
+coherent_d3_r3,0.32919,0.01396,1.615e+04,2.368e+04,20.386,0.590
+coherent_d5_r5,9.01733,8616.95228,2.394e+07,1.523e+10,0.377,0.566
+coherent_rx_d3_r1,0.20671,0.13021,2.879e+05,3.991e+05,0.718,0.326
+coherent_ry_d3_r3,0.66219,5.41354,7.711e+07,1.248e+07,0.009,0.434

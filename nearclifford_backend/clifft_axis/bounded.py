@@ -21,8 +21,74 @@ import numpy as np
 
 from nearclifford_backend.simulator import pauli_commute
 from nearclifford_backend.block_magic import _support
-from nearclifford_backend.lazy import _conj_h, _conj_s, _conj_cx
+from nearclifford_backend.lazy import _conj_h, _conj_s, _conj_cx, _commute_xz
 from nearclifford_backend.clifft_axis.engine import CliftAxisNearClifford
+
+
+# ================================================================= #
+#  FUSED MEASUREMENT: symbolic Pauli-sum operator algebra over the   #
+#  (would-be) r_mat magic-bit layout.  Used ONLY to (a) contract the #
+#  measured axis into a Born scalar on phi_in and (b) build the      #
+#  survivor on the r_out register -- the 2^{r_mat} array is NEVER    #
+#  allocated.  Each operator is a dict {(x,z): complex coeff}, the   #
+#  Pauli stored as exactly X^x Z^z (any Y phase folded into coeff).  #
+# ================================================================= #
+def _fpopc(v):
+    return bin(int(v)).count("1")
+
+
+def _fmul(A, B):
+    """Operator product A*B (A applied AFTER B): (X^xa Z^za)(X^xb Z^zb) =
+    (-1)^<za,xb> X^(xa^xb) Z^(za^zb)."""
+    out = {}
+    for (xa, za), ca in A.items():
+        for (xb, zb), cb in B.items():
+            x = xa ^ xb
+            z = za ^ zb
+            ph = (-1.0) ** _fpopc(za & xb)
+            out[(x, z)] = out.get((x, z), 0j) + ca * cb * ph
+    return {k: v for k, v in out.items() if abs(v) > 1e-14}
+
+
+def _fdag(A):
+    """Hermitian conjugate of a Pauli sum: (c X^x Z^z)^dag = conj(c) (-1)^<x,z> X^x Z^z."""
+    return {(x, z): np.conj(c) * ((-1.0) ** _fpopc(x & z)) for (x, z), c in A.items()}
+
+
+def _apply_xz(x, z, v):
+    """(X^x Z^z) v for a length-2^k vector v (Z applied first: no X^x Z^z sign on |0>^new)."""
+    idx = np.arange(v.size, dtype=np.int64)
+    p = idx & z
+    for sh in (32, 16, 8, 4, 2, 1):
+        p ^= p >> sh
+    signs = 1.0 - 2.0 * (p & 1)
+    return (signs * v)[idx ^ x]
+
+
+class MeasurementExecutionPlan:
+    """MEASUREMENT-DRIVEN OPERATION DEFERRAL (default OFF).  Splits the ordered measurement core
+    into the immediate-execution PREFIX and the deferred maximal trailing measurement-commuting
+    SUFFIX (the tail).  full_entries == execute_entries + deferred_tail_entries (ordered).  Only
+    execute_entries are flushed + consumed at this measurement; deferred_tail_entries stay UNTOUCHED
+    in pending (UID, mask, phase, angle, order preserved) and run at a later measurement on demand."""
+    __slots__ = ("full_entries", "execute_entries", "deferred_tail_entries")
+
+    def __init__(self, full_entries, execute_entries, deferred_tail_entries):
+        self.full_entries = tuple(full_entries)
+        self.execute_entries = tuple(execute_entries)
+        self.deferred_tail_entries = tuple(deferred_tail_entries)
+
+    @property
+    def full_uids(self):
+        return tuple(e[4] for e in self.full_entries)
+
+    @property
+    def execute_uids(self):
+        return tuple(e[4] for e in self.execute_entries)
+
+    @property
+    def deferred_tail_uids(self):
+        return tuple(e[4] for e in self.deferred_tail_entries)
 
 
 def compile_bounded(stim_text, **kwargs):
@@ -55,6 +121,39 @@ class CliftAxisBoundedNearClifford(CliftAxisNearClifford):
     #                               makes the post-fold _pullback an O(1) lookup, so the old cache-recompute
     #                               thrash (the d5_r5 wall regression) is gone. True = undo (2 H, no frame
     #                               change) retained as fallback if the inverse-frame is ever disabled.
+    # FUSED MEASUREMENT (default ON): contract the measured axis into a branch map instead of
+    # materializing the 2^{r_mat}=2^{r_out+1} transient.  The diagonal-magic measurement is run
+    # as  Born p0 on phi_in (2^{r_in})  +  survivor on the r_out register (2^{r_out}), so the
+    # measured axis is NEVER a dense-array axis (peak dense rank = r_out, not r_out+1).  Falls
+    # back to the materialize-localize-drop path (now the verification ORACLE) for every case it
+    # does not cover (stabilizer / deterministic / off-diagonal / structure-discovery shots).
+    _fused_measure = True
+    # COMPILED CORE (default OFF): run the measurement-core numerical hot path in a SINGLE C++ call
+    # (direct general-Pauli branch-pair executor, no per-rotation localization).  When OFF the
+    # authoritative oracle path runs verbatim.  Toggled by the backend `compiled_core` feature flag.
+    _compiled_core = False
+    _compiled_executor = None
+    # S2 COMPILED FRAME (default OFF): defer the per-Clifford tableau conjugation
+    # (_apply_clifford_to_all) into a buffer and flush the whole measurement-segment in ONE
+    # C++ call (clifford_conj_seq), and mutate `pending` IN PLACE instead of rebuilding the
+    # dict every gate.  Valid because with the incremental inverse-frame the hot pullback uses
+    # Ax/Az (not Xc/Zc), so nothing reads Xc/Zc between measurements; _flush_tableau is called
+    # at the top of measure_z / statevector before any Xc/Zc read.  Bit-identical to the
+    # tuple-based path; RNG and the numerical core are untouched.  Toggled by the backend.
+    _compiled_frame = False
+    # MEASUREMENT TAIL DEFERRAL (default OFF): split the ordered measurement core into the immediate
+    # execution PREFIX and the maximal trailing measurement-commuting SUFFIX; execute + consume only
+    # the prefix, leave the tail UNTOUCHED in pending (it runs at a future measurement on demand).
+    # EXACT for Hermitian Pauli tails (proven: structured + 2000-config random sweep at machine
+    # precision; every real pending entry/tail verified Hermitian).  When OFF the authoritative paths
+    # run verbatim.  Forces dynamic core selection (the baseline _fast_cores schedule is stale once a
+    # tail is retained -- structure-cache regeneration is a separate, flag-keyed step).
+    _measurement_tail_deferral = False
+    _tail_defer_assert = False    # debug: assert physical-basis split == pulled-back-basis split
+    # hang-guard: if the symbolic core Pauli sum exceeds this many terms, fall back to the oracle
+    # (a high-rank off-diagonal core can grow ~2^{#off-axis rotations}; the oracle materializes it
+    # in bounded 2^{r_mat} memory faster than the symbolic contraction).  Correctness-neutral.
+    _fused_max_terms = 1 << 14
     _loc_min_size = 1 << 14       # localize only at rank >= 14 (phi.size >= 2^14). Below this the
     #                               localizer's strided sweeps + O(n) incremental inverse-frame update
     #                               per fold lose wall to the butterfly -- decisively so at large n / low
@@ -62,6 +161,103 @@ class CliftAxisBoundedNearClifford(CliftAxisNearClifford):
     #                               to butterfly). The RY rank-16 regime stays localized (ry_d3_r1 FLOP
     #                               win fully retained at 12.85M = 1.05x clifft-unfused). Measured-tuned
     #                               (phase2_gate_sweep.py); both fallbacks (undo / butterfly) preserved.
+
+    def __init__(self, n):
+        super().__init__(n)
+        self._tab_gates = []          # S2: deferred (gate, q1, q2) tableau conjugations
+
+    # ================================================================= #
+    #  S2: deferred + batched tableau conjugation (compiled frame kernel) #
+    # ----------------------------------------------------------------- #
+    #  h/s/cx defer the Xc/Zc conjugation (one C++ seq call per segment)  #
+    #  and mutate `pending` in place (no per-gate dict rebuild).  The     #
+    #  inverse-frame (Ax/Az) is still updated per gate so _pullback stays #
+    #  an O(weight) lookup; _flush_tableau is invoked before any Xc/Zc    #
+    #  read (measure_z / statevector).  Active only when _compiled_frame. #
+    # ================================================================= #
+    def h(self, q):
+        if not self._compiled_frame:
+            return super().h(q)
+        self._tab_gates.append((0, q, 0))             # G_H
+        self._frame_ver += 1
+        if self._inv_enabled:
+            self._inv_fwd_h(q)
+        for r in self.pending.values():
+            r[0], r[1], r[2] = _conj_h((r[0], r[1], r[2]), q)
+
+    def s(self, q, dag=False):
+        if not self._compiled_frame:
+            return super().s(q, dag)
+        self._tab_gates.append((2 if dag else 1, q, 0))   # G_SDAG / G_S
+        self._frame_ver += 1
+        if self._inv_enabled:
+            self._inv_fwd_s(q, dag)
+        for r in self.pending.values():
+            r[0], r[1], r[2] = _conj_s((r[0], r[1], r[2]), q, dag)
+
+    def cx(self, c, t):
+        if not self._compiled_frame:
+            return super().cx(c, t)
+        self._tab_gates.append((3, c, t))             # G_CX
+        self._frame_ver += 1
+        if self._inv_enabled:
+            self._inv_fwd_cx(c, t)
+        for r in self.pending.values():
+            r[0], r[1], r[2] = _conj_cx((r[0], r[1], r[2]), c, t)
+
+    def _flush_tableau(self):
+        """Apply the deferred segment of Clifford gates to Xc/Zc in ONE C++ call.  Xc/Zc stay
+        Python tuples (readers unchanged); pack -> clifford_conj_seq -> unpack happens only here
+        (once per measurement, not once per gate)."""
+        g = self._tab_gates
+        if not g:
+            return
+        from nearclifford_backend.clifft_axis import compiled_frame as CF
+        n = self.n
+        W = (n + 63) // 64 if n > 0 else 1          # uint64 words per Pauli mask (n may exceed 64)
+        M = 2 * n                                    # Xc rows 0..n-1, Zc rows n..2n-1
+        X = np.zeros(M * W, dtype=np.uint64)
+        Z = np.zeros(M * W, dtype=np.uint64)
+        Pp = np.empty(M, dtype=np.int32)
+        Xc = self.Xc; Zc = self.Zc
+        MASK = (1 << 64) - 1
+        if W == 1:                                   # fast path n<=64
+            for i in range(n):
+                xx, zz, pp = Xc[i]; X[i] = xx; Z[i] = zz; Pp[i] = pp
+                xx, zz, pp = Zc[i]; X[n + i] = xx; Z[n + i] = zz; Pp[n + i] = pp
+        else:
+            for i in range(n):
+                xx, zz, pp = Xc[i]; Pp[i] = pp
+                for w in range(W):
+                    X[i * W + w] = (xx >> (64 * w)) & MASK; Z[i * W + w] = (zz >> (64 * w)) & MASK
+                xx, zz, pp = Zc[i]; Pp[n + i] = pp
+                base = (n + i) * W
+                for w in range(W):
+                    X[base + w] = (xx >> (64 * w)) & MASK; Z[base + w] = (zz >> (64 * w)) & MASK
+        gt = np.fromiter((t[0] for t in g), dtype=np.int32, count=len(g))
+        q1 = np.fromiter((t[1] for t in g), dtype=np.int32, count=len(g))
+        q2 = np.fromiter((t[2] for t in g), dtype=np.int32, count=len(g))
+        CF.conj_seq(X, Z, Pp, W, gt, q1, q2)
+        if W == 1:
+            for i in range(n):
+                Xc[i] = (int(X[i]), int(Z[i]), int(Pp[i]))
+                Zc[i] = (int(X[n + i]), int(Z[n + i]), int(Pp[n + i]))
+        else:
+            for i in range(n):
+                xx = zz = 0
+                for w in range(W):
+                    xx |= int(X[i * W + w]) << (64 * w); zz |= int(Z[i * W + w]) << (64 * w)
+                Xc[i] = (xx, zz, int(Pp[i]))
+                xx = zz = 0; base = (n + i) * W
+                for w in range(W):
+                    xx |= int(X[base + w]) << (64 * w); zz |= int(Z[base + w]) << (64 * w)
+                Zc[i] = (xx, zz, int(Pp[n + i]))
+        self._tab_gates = []
+
+    def statevector(self):
+        if self._compiled_frame:
+            self._flush_tableau()
+        return super().statevector()
 
     def _flush_one(self, x, z, theta, phase=0):
         """Flush one pending rotation. STEP-2: if the pulled-back generator is single-axis with
@@ -201,7 +397,15 @@ class CliftAxisBoundedNearClifford(CliftAxisNearClifford):
         new_size = self._sz * 2
         self.budget.charge(new_size, 0, "promote")        # resident 2^(r+1) <= 2^k (enforced)
         self._grow_capacity(new_size)                     # realloc only on a new high-water
-        self._storage[self._sz:new_size] = 0.0            # new MSB qubit = |0>: high block zero
+        seed = getattr(self, "_dormant_seed", None)
+        if getattr(self, "_deferred_seed", False) and seed is not None and seed.get(q) == "PLUS":
+            # deferred |+> materialisation: new MSB qubit = (|0>+|1>)/sqrt2 -> high block = low
+            # block (copy), then scale BOTH halves by 1/sqrt2.  (a) -> (a/sqrt2, a/sqrt2).
+            self._storage[self._sz:new_size] = self._storage[:self._sz]
+            self._storage[:new_size] *= self._INV_SQRT2
+            seed.pop(q, None)
+        else:
+            self._storage[self._sz:new_size] = 0.0        # new MSB qubit = |0>: high block zero
         self._sz = new_size
         self.M.append(q)
         self.phi = self._storage[:self._sz]
@@ -419,7 +623,431 @@ class CliftAxisBoundedNearClifford(CliftAxisNearClifford):
         sign = 1.0 if (P[2] & 3) == 0 else -1.0      # P now (0, 1<<r, pp' in {0,2}) = +-Z_r
         return r, sign
 
+    # ================================================================= #
+    #  FUSED MEASUREMENT  (no 2^{r_mat} transient)                       #
+    # ----------------------------------------------------------------- #
+    #  measure_z dispatches here when the measurement is the diagonal-   #
+    #  magic case that the materialize-localize-drop path would handle   #
+    #  with a single +1 measured-axis transient.  The measured axis is   #
+    #  contracted analytically:                                          #
+    #    * Born p0 = (1 + <M'(t)>_in)/2 with M'(t)=U_core^dag M' U_core,  #
+    #      keeping only terms with no X on the newly-promoted axes (the   #
+    #      |0>^new factor kills X-on-new) -> evaluated on phi_in.         #
+    #    * survivor |phi_out> = K_b|phi_in> built directly on the r_out   #
+    #      register via the localiser parity mask (measured axis summed   #
+    #      out), then the SAME swap-pop axis bookkeeping + frame folds    #
+    #      (right_cx + |1>-branch X-fold) the drop path would apply.      #
+    #  Verified bit-identical to the oracle (M ordering, Xc/Zc, phi up    #
+    #  to global phase, p0) on coherent_d3_r3 -- /tmp/proto_fused_integ.  #
+    # ================================================================= #
+    def _fused_core_entries(self, q):
+        """The anticommuting core for the Z_q measurement WITHOUT advancing _meas_ctr or
+        touching pending -- mirrors _flush_core's selection (fast table, else live scan).  With tail
+        deferral the fast table stores the EXECUTE-PREFIX uids (recorded by the dynamic discovery
+        split), so the fast lookup already yields the prefix -- no need to force the live scan."""
+        if self._fast_cores is None:
+            return self._dynamic_core(0, 1 << q)
+        core_uids = self._fast_cores.get(self._meas_ctr, ())
+        flush = []
+        for u in core_uids:
+            e = self.pending.get(u)
+            if e is None:                                  # structural miss -> safe live scan
+                return self._dynamic_core(0, 1 << q)
+            flush.append(e)
+        return flush
+
+    def _split_measurement_commuting_suffix(self, qx, qz, full_core):
+        """Peel the maximal CONTIGUOUS trailing suffix of `full_core` whose generators commute with
+        the measured physical Pauli (qx,qz) -- i.e. branch-DIAGONAL rotations after the last
+        branch-mixing one.  Physical-basis test (pending masks are physical): _commute_xz(qx,qz,x,z).
+        Returns a MeasurementExecutionPlan.  Initial patch never defers the entire core (empty
+        prefix -> full execution), so a measurement always materialises >=1 mixing rotation."""
+        full_core = list(full_core)
+        if not full_core:
+            return MeasurementExecutionPlan((), (), ())
+        cut = len(full_core)
+        while cut > 0:
+            x, z = full_core[cut - 1][0], full_core[cut - 1][1]
+            if not _commute_xz(qx, qz, x, z):       # branch-mixing -> boundary
+                break
+            cut -= 1
+        if cut == len(full_core):                    # no trailing suffix -> no split (common: ends mixing)
+            full_core = tuple(full_core)
+            return MeasurementExecutionPlan(full_core, full_core, ())
+        execute = full_core[:cut]
+        tail = full_core[cut:]
+        if not execute:                              # no mixing rotation at all -> defer nothing
+            execute, tail = full_core, []
+        plan = MeasurementExecutionPlan(full_core, execute, tail)
+        if self._tail_defer_assert:                  # verification-only invariants (off the hot path)
+            assert plan.execute_entries + plan.deferred_tail_entries == plan.full_entries
+            assert len(set(plan.full_uids)) == len(plan.full_uids)
+            assert all(_commute_xz(qx, qz, e[0], e[1]) for e in plan.deferred_tail_entries)
+            if plan.deferred_tail_entries:
+                self._assert_split_basis_agree(qx, qz, plan)
+        return plan
+
+    def _measurement_execution_plan(self, qx, qz, full_core):
+        """Flag dispatch: OFF -> execute the whole core (tail empty, identical to baseline)."""
+        if not self._measurement_tail_deferral:
+            full_core = tuple(full_core)
+            return MeasurementExecutionPlan(full_core, full_core, ())
+        return self._split_measurement_commuting_suffix(qx, qz, full_core)
+
+    def _assert_split_basis_agree(self, qx, qz, plan):
+        """Debug cross-check: the physical-basis commute classification of each core entry equals the
+        pulled-back (executor-basis) symplectic commute with the pulled-back measured Pauli."""
+        xpq, zpq, _ = self._pullback(qx, qz)
+        def anti(ax, az, bx, bz):
+            return (int(ax & bz).bit_count() + int(az & bx).bit_count()) & 1
+        for e in plan.full_entries:
+            xp, zp, _ = self._pullback(e[0], e[1])
+            phys_comm = _commute_xz(qx, qz, e[0], e[1])
+            exec_comm = (anti(xp, zp, xpq, zpq) == 0)
+            assert phys_comm == exec_comm, (
+                f"tail-split basis disagreement uid={e[4]}: phys_comm={phys_comm} exec_comm={exec_comm}")
+
+    def _fused_setup(self, q):
+        """Read-only analysis of the Z_q measurement (uses the PRE-flush frame, which is the
+        SAME as the post-flush frame -- a core flush never mutates Xc/Zc).  Returns the fused
+        plan, or None when the diagonal-magic fast path does not apply (caller falls back)."""
+        # The measured axis q may be FRESH (newly promoted this core) or RESIDENT (already in M);
+        # _fused_survivor dispatches on m vs r_in.  Both run in <= max(r_in, r_out) workspace.
+        M_in = list(self.M)
+        # tail deferral: execute only the prefix (maximal trailing meas-commuting suffix stays pending)
+        plan = self._measurement_execution_plan(0, 1 << q, self._fused_core_entries(q))
+        core = list(plan.execute_entries)
+        # virtual flush: replay the promote order (ascending qubit within each core entry).  The
+        # fused plan assumes the real flush leaves the Clifford frame UNCHANGED.  That holds UNLESS
+        # _flush_one localizes an off-diagonal rotation (mx != 0 and phi.size >= _loc_min_size),
+        # which folds W^dag into the frame mid-flush.  If any core rotation would trigger that, the
+        # pre-flush frame we read here is stale -> fall back to the oracle.
+        M_mat = list(M_in)
+        pulled = []
+        for (x, z, p, theta, uid) in core:
+            xp, zp, pp0 = self._pullback(x, z)
+            pp = (pp0 + p) & 3
+            pulled.append((xp, zp, pp, theta))
+            for qq in range(self.n):
+                if (xp >> qq) & 1 and qq not in M_mat:
+                    M_mat.append(qq)
+            if self._step2_localize and (1 << len(M_mat)) >= self._loc_min_size:
+                if any((xp >> qq) & 1 for qq in M_mat):    # off-diagonal rotation at localizing rank
+                    return None                            # flush would mutate the frame -> oracle
+        # Stabilizer check uses the POST-flush register (matches the oracle, which computes anti_s
+        # AFTER _flush_core): a qubit the measured Pauli anticommutes with may be promoted by the
+        # core flush, turning an apparent stabilizer measurement into a magic (off-diagonal) one.
+        Pm = (0, 1 << q, 0)
+        magset = set(M_mat)
+        if any(i not in magset and not pauli_commute(self.Zc[i], Pm) for i in range(self.n)):
+            return None                                    # genuine stabilizer branch -> oracle
+        xpq, zpq, ppq = self._pullback(0, 1 << q)
+
+        def masks(xp, zp):
+            mx = mz = 0
+            for l, qq in enumerate(M_mat):
+                if (xp >> qq) & 1:
+                    mx |= 1 << l
+                if (zp >> qq) & 1:
+                    mz |= 1 << l
+            return mx, mz
+
+        Mx, Mz = masks(xpq, zpq)
+        mmask = 0
+        for qq in M_mat:
+            mmask |= 1 << qq
+        if (xpq & ~mmask) != 0 or (Mx == 0 and Mz == 0):
+            return None                                    # X on a non-magic qubit / deterministic
+        # Build the localizer W EXACTLY as _localize_to_Z(prefer=q): H/S turn each X/Y support axis
+        # into Z, then CNOTs collapse the Z-string onto the pivot r.  We FOLD the H/S part (W_HS, as
+        # a Pauli sum) into the core -> U' = W_HS U_core, and conjugate M' to a pure-Z M''; the CNOTs
+        # are absorbed by the survivor parity mask.  So the off-diagonal case reduces to the diagonal
+        # machinery with (U', M''); the diagonal path is the no-X (empty W_HS) special case.
+        supp = sorted(qq for qq in M_mat if ((xpq | zpq) >> qq) & 1)
+        r = q if q in supp else supp[0]                    # pivot (dropped axis), as _localize_to_Z
+        m = M_mat.index(r)
+        hs = []                                            # H/S gates on the X/Y support axes
+        for s in supp:
+            xb = (xpq >> s) & 1; zb = (zpq >> s) & 1
+            if xb and zb:
+                hs += [("s", s, True), ("h", s)]           # Y -> S^dag, H -> Z
+            elif xb:
+                hs += [("h", s)]                           # X -> H -> Z
+        W_hs = {(0, 0): 1.0 + 0j}
+        xh, zh, ph = xpq, zpq, ppq                         # M'' = W_HS M' W_HS^dag (track exactly)
+        INV2 = 0.7071067811865476
+        for g in hs:
+            b = 1 << M_mat.index(g[1])
+            if g[0] == "h":
+                gate = {(b, 0): INV2, (0, b): INV2}        # H = (X + Z)/sqrt2
+                xh, zh, ph = _conj_h((xh, zh, ph), g[1])
+            else:
+                gate = {(0, 0): (1 - 1j) / 2, (0, b): (1 + 1j) / 2}   # S^dag = ((1-i)I + (1+i)Z)/2
+                xh, zh, ph = _conj_s((xh, zh, ph), g[1], g[2])
+            W_hs = _fmul(gate, W_hs)
+        Mx2, Mz2 = masks(xh, zh)
+        if Mx2 != 0:
+            return None                                    # HS failed to diagonalise M' -> oracle
+        W = list(hs) + [("cx", s, r) for s in supp if s != r]   # full localizer (HS then collapse)
+        # The symbolic core can blow up (#U ~ 2^{#off-axis rotations}); cap it so a pathological
+        # core (e.g. high-rank off-diagonal ry) FALLS BACK to the oracle instead of hanging.  This
+        # is a hang-guard, not a FLOP optimization -- correctness is identical either way.
+        cap = self._fused_max_terms
+        U = {(0, 0): 1.0 + 0j}
+        for (xp, zp, pp, theta) in pulled:
+            mx, mz = masks(xp, zp)
+            U = _fmul({(0, 0): np.cos(theta / 2.0),
+                       (mx, mz): (-1j * np.sin(theta / 2.0)) * (1j ** (pp & 3))}, U)
+            if len(U) > cap:
+                return None                                # core too large -> oracle (no hang)
+        U = _fmul(W_hs, U)                                 # fold the H/S localizer into the core
+        if len(U) > cap:
+            return None
+        return dict(M_in=M_in, M_mat=M_mat, q=q, pivot=r, m=m, core=core, U=U, Mx=0, Mz=Mz2,
+                    Mph=(1j ** (ph & 3)), ppq=ph, W=W, phi_in=self.phi.copy())
+
+    def _fused_born(self, info):
+        """P(outcome 0) = (1 + <M'(t)>_in)/2 on phi_in (2^{r_in}) -- never touches a new axis."""
+        M_in = info["M_in"]; M_mat = info["M_mat"]; U = info["U"]
+        rin = len(M_in); rmat = len(M_mat)
+        rin_mask = (1 << rin) - 1
+        new_mask = ((1 << rmat) - 1) & ~rin_mask
+        Mt = _fmul(_fdag(U), _fmul({(info["Mx"], info["Mz"]): info["Mph"]}, U))
+        pin = info["phi_in"]
+        nrm = float(np.linalg.norm(pin))
+        pin = pin / nrm if nrm > 1e-300 else pin
+        ev = 0j
+        for (x, z), cc in Mt.items():
+            if x & new_mask:                               # X on a |0>^new axis -> <0|X|0> = 0
+                continue
+            ev += cc * np.vdot(pin, _apply_xz(x & rin_mask, z & rin_mask, pin))
+        return max(0.0, min(1.0, (1.0 + ev.real) / 2.0))
+
+    def _fused_survivor(self, info, keepbit):
+        """K_b|phi_in> on the r_out register (2^{r_out}), layout-A = M_mat with bit m removed.
+        Dispatches on whether the measured axis m is FRESH (m >= r_in -- a newly-promoted |0>
+        axis) or RESIDENT (m < r_in -- an entangled old bit). Returns (UNNORMALISED survivor,
+        squared norm = branch probability)."""
+        rin = len(info["M_in"]); m = info["m"]            # m = dropped localizer-pivot bit
+        if m >= rin:
+            return self._fused_survivor_fresh(info, keepbit, m)
+        return self._fused_survivor_resident(info, keepbit, m)
+
+    def _fused_survivor_fresh(self, info, keepbit, m):
+        """Measured axis is a newly-promoted |0> axis: input = phi_in (x) |0>_m.  K_b places each
+        U_core term onto the r_out=r_in+|other-new| register, the m bit summed out by the
+        localiser parity mask (a zero-mask on the old Z-support controls)."""
+        M_in = info["M_in"]; M_mat = info["M_mat"]; U = info["U"]; phi_in = info["phi_in"]
+        rin = len(M_in); rmat = len(M_mat); rout = rmat - 1
+        rin_mask = (1 << rin) - 1
+        new_mask = ((1 << rmat) - 1) & ~rin_mask
+        other_new = new_mask & ~(1 << m)
+        onew_bits = [b for b in range(rmat) if (other_new >> b) & 1]
+        ctrls = [b for b in range(rmat) if (info["Mz"] >> b) & 1 and b != m]
+        Sr = [b for b in ctrls if b < rin]
+        So = [b for b in ctrls if b >= rin]
+        surv = np.zeros(1 << rout, dtype=np.complex128)
+        ridx = np.arange(1 << rin, dtype=np.int64)
+        for (x, z), cc in U.items():
+            vec = cc * _apply_xz(x & rin_mask, z & rin_mask, phi_in)
+            blk = 0
+            for j, b in enumerate(onew_bits):
+                if (x >> b) & 1:
+                    blk |= 1 << j
+            po = 0
+            for b in So:
+                po ^= (blk >> onew_bits.index(b)) & 1
+            tgt_par = (keepbit ^ ((x >> m) & 1) ^ po) & 1
+            if Sr:
+                par = np.zeros(1 << rin, dtype=np.int64)
+                for b in Sr:
+                    par ^= (ridx >> b) & 1
+                vec = np.where(par == tgt_par, vec, 0.0)
+            elif tgt_par != 0:
+                continue
+            surv[(blk << rin):((blk + 1) << rin)] += vec
+        return surv, float(np.vdot(surv, surv).real)
+
+    def _fused_survivor_resident(self, info, keepbit, m):
+        """Measured axis is an entangled old bit (m < r_in): input = phi_in (m already inside),
+        core promotes only WORK axes.  survivor = <keepbit|_m L U_core |phi_in>.  Output old part
+        = old register with bit m removed (r_in-1 bits); for each output index the m bit is GATHERED
+        (selected) at the value the localiser parity constraint forces -- m_pre = keepbit XOR
+        parity over the Z-support controls -- instead of zero-masked."""
+        M_in = info["M_in"]; M_mat = info["M_mat"]; U = info["U"]; phi_in = info["phi_in"]
+        rin = len(M_in); rmat = len(M_mat); rout = rmat - 1
+        rin_mask = (1 << rin) - 1
+        new_mask = ((1 << rmat) - 1) & ~rin_mask
+        ctrls = [b for b in range(rmat) if (info["Mz"] >> b) & 1 and b != m]
+        old_ctrls = [b for b in ctrls if b < rin]
+        work_ctrls = [b for b in ctrls if b >= rin]
+        onew_bits = sorted(b for b in range(rmat) if (new_mask >> b) & 1)   # work axes (all kept)
+        out_old_bits = rin - 1
+        low_mask = (1 << m) - 1
+        w = np.arange(1 << out_old_bits, dtype=np.int64)
+        w_low = w & low_mask
+        w_high = (w >> m) << (m + 1)                        # insert a 0 slot at bit m
+        par_old = np.zeros(1 << out_old_bits, dtype=np.int64)
+        for s in old_ctrls:                                # M_mat old-bit s -> output bit (s or s-1)
+            par_old ^= (w >> (s if s < m else s - 1)) & 1
+        surv = np.zeros(1 << rout, dtype=np.complex128)
+        for (x, z), cc in U.items():
+            vec = cc * _apply_xz(x & rin_mask, z & rin_mask, phi_in)        # 2^{r_in}, m inside
+            blk = 0
+            for j, b in enumerate(onew_bits):
+                if (x >> b) & 1:
+                    blk |= 1 << j
+            po = 0
+            for b in work_ctrls:
+                po ^= (blk >> onew_bits.index(b)) & 1
+            mpre = (keepbit ^ po ^ par_old) & 1            # localiser-forced m value per output idx
+            full = w_low | (mpre << m) | w_high
+            surv[(blk << out_old_bits):((blk + 1) << out_old_bits)] += vec[full]
+        return surv, float(np.vdot(surv, surv).real)
+
+    def _fused_commit(self, q, info):
+        """Sample the outcome (ONE rng.random, like the oracle), build the r_out survivor, and
+        apply the SAME M ordering + frame folds the drop path would -- with NO 2^{r_mat} alloc."""
+        M_in = info["M_in"]; M_mat = info["M_mat"]
+        rin = len(M_in); rmat = len(M_mat); rout = rmat - 1
+        piv = info["pivot"]; m = info["m"]                 # dropped localizer-pivot qubit / its bit
+        # consume the core like _flush_core/_do_flush would, but never materialize it
+        self._meas_ctr += 1
+        for ce in info["core"]:
+            del self.pending[ce[4]]
+        # Born + sample (single rng draw, same convention as the oracle: out=0 iff r<p0)
+        p0 = self._fused_born(info)
+        out = 0 if float(self.rng.random()) < p0 else 1
+        sign = 1.0 if (info["ppq"] & 3) == 0 else -1.0
+        plus_bit = 0 if sign > 0 else 1
+        keepbit = plus_bit if out == 0 else (1 - plus_bit)
+        # survivor on the r_out register (the ONLY exponential allocation this measurement)
+        surv, p_b = self._fused_survivor(info, keepbit)
+        if p_b > 1e-300:
+            surv *= (1.0 / p_b ** 0.5)                     # normalise to unit norm
+        M_A = [M_mat[i] for i in range(rmat) if i != m]
+        if m < rout:                                       # pivot not the MSB -> swap-pop permutation
+            M_out = M_A[:m] + [M_A[rout - 1]] + M_A[m:rout - 1]
+            y = np.arange(1 << rout, dtype=np.int64)
+            xidx = np.zeros(1 << rout, dtype=np.int64)
+            for i in range(rout):
+                pi = i if i < m else (rout - 1 if i == m else i - 1)
+                xidx |= ((y >> i) & 1) << pi
+            surv = surv[xidx]
+        else:                                              # pivot already the MSB -> layout-A == M_out
+            M_out = M_A
+        # write the survivor into the capacity buffer prefix (largest array = 2^{r_out})
+        self._ensure_inited()
+        self.budget.charge(1 << rout, 0, "fused:survivor")
+        self._grow_capacity(1 << rout)
+        self._storage[:1 << rout] = surv
+        self._sz = 1 << rout
+        self.M = M_out
+        self.phi = self._storage[:self._sz]
+        # frame folds: replay the FULL localizer W (the H/S that diagonalised M' AND the CNOTs that
+        # collapse onto the pivot) via the oracle's right_* primitives -- EXACTLY what
+        # _localize_to_Z folds -- then the drop's |1>-branch X_piv fold.  Folding through right_*
+        # keeps the incremental inverse-frame live (no rebuild) and Xc/Zc bit-identical.
+        for g in info["W"]:
+            if g[0] == "h":
+                self.right_h(g[1])
+            elif g[0] == "s":
+                self.right_s(g[1], dag=(not g[2]))
+            else:
+                self.right_cx(g[1], g[2])
+        if keepbit == 1:                                   # |1> product -> fold X_piv into frame
+            zr = self.Zc[piv]
+            self.Zc[piv] = (zr[0], zr[1], (zr[2] + 2) & 3)
+            self._frame_ver += 1
+            if self._inv_enabled:
+                self._inv_fold_x(piv)
+        # a measurement can disentangle a SECOND product axis (matches the oracle's residual sweep)
+        self._drop_residual_products()
+        # ---- hard invariants of the fused path ----
+        rout_final = len(self.M)
+        max_alloc_exp = max(rin, rout)                     # phi_in (r_in) and surv (r_out); never r_mat
+        removable = rmat > max(rin, rout)                  # a transient ABOVE the I/O bound existed
+        assert piv not in self.M, "fused: localizer-pivot axis materialized/retained"
+        assert max_alloc_exp <= max(rin, rout), "fused: dense array exceeded max(r_in,r_out)"
+        assert (not removable) or max_alloc_exp < rmat, "fused: failed to remove the r_mat transient"
+        log = getattr(self, "_fused_log", None)
+        if log is None:
+            log = self._fused_log = []
+        n_U = len(info["U"])                               # Pauli-sum length (the FLOP driver)
+        log.append(dict(meas=self._meas_log_ctr, r_in=rin, r_mat_reference=rmat,
+                        r_out=rout_final, largest_dense_array_exponent=max_alloc_exp,
+                        measurement_axis_materialized=False, kind=("fresh" if m >= rin else "resident"),
+                        removable=removable, n_U_terms=n_U, n_core_rot=len(info["core"]),
+                        survivor_ops=n_U * (1 << rout), p0=p0, out=out))
+        if rout_final > self.max_M:
+            self.max_M = rout_final
+        self.budget.note_resident(self.phi.size, "fused:post")
+        if self.log_cores:
+            self.core_log.append(dict(meas=self._meas_log_ctr, branch="magic-fused",
+                                      M_before=rin, M_after=rout_final, p0=p0,
+                                      peak_live_words=self.budget.peak))
+        self._meas_log_ctr += 1
+        return out
+
+    def _flush_core(self, qx, qz):
+        """ORACLE measurement flush.  With tail deferral OFF -> the authoritative lazy flush verbatim.
+        With it ON: the structure pre-pass (dynamic) peels the maximal trailing measurement-commuting
+        suffix and records the EXECUTE-PREFIX uids; real shots gather that prefix from the FAST table
+        (no live scan) and flush ONLY it -- the deferred tail stays UNTOUCHED in pending (or, with
+        drop_dead, never materialises: it is record-irrelevant so the existing dead-drop prunes it).
+        Fast/dynamic both flush the same execute-prefix; a structural miss falls back to dynamic+split."""
+        if not self._measurement_tail_deferral:
+            return super()._flush_core(qx, qz)
+        meas_idx = self._meas_ctr
+        self._meas_ctr += 1
+        if self._fast_cores is not None and self._record_cores is None:
+            # FAST PATH: the recorded schedule stores EXECUTE-PREFIX uids -> gather + flush them
+            core_uids = self._fast_cores.get(meas_idx, ())
+            flush = []
+            miss = False
+            for u in core_uids:
+                e = self.pending.get(u)
+                if e is None:                          # structural miss -> safe dynamic+split
+                    miss = True; break
+                flush.append(e)
+            if self._debug_compare:                    # §11.4 cross-check: fast prefix == dynamic prefix
+                dyn = self._split_measurement_commuting_suffix(qx, qz, self._dynamic_core(qx, qz))
+                if not miss and [r[4] for r in flush] != list(dyn.execute_uids):
+                    self._fast_mismatch_count += 1; flush = list(dyn.execute_entries); miss = False
+                elif miss:
+                    flush = list(dyn.execute_entries)
+            if miss:
+                flush = list(self._split_measurement_commuting_suffix(
+                    qx, qz, self._dynamic_core(qx, qz)).execute_entries)
+            self._do_flush(qx, qz, flush)
+            return
+        # DYNAMIC PATH (discovery or no schedule): split + record the execute prefix as the schedule
+        full = self._dynamic_core(qx, qz)
+        plan = self._split_measurement_commuting_suffix(qx, qz, full)
+        if self._record_cores is not None:
+            self._record_cores[meas_idx] = list(plan.execute_uids)
+        self._do_flush(qx, qz, list(plan.execute_entries))
+
     def measure_z(self, q):
+        # S2: flush the deferred segment of Clifford gates onto Xc/Zc before any tableau read.
+        if self._compiled_frame and self._tab_gates:
+            self._flush_tableau()
+        # COMPILED-CORE fast path (default OFF): one C++ call per measurement core.  Only on real
+        # shots (not structure discovery) and not in resource-only sizing.  Falls back to the oracle
+        # (returns None, no RNG consumed) for stabilizer / deterministic / unsupported cases.
+        if (self._compiled_core and not self.resource_only
+                and self._record_cores is None and self._flushed_uids is None):
+            from nearclifford_backend.clifft_axis.compiled_core import try_compiled_measure
+            out = try_compiled_measure(self, q)
+            if out is not None:
+                return out
+        # FUSED fast path: only on real shots (not the structure-discovery pass, which must
+        # record cores/flushed-uids via the oracle flush) and not in resource-only sizing.
+        if (self._fused_measure and not self.resource_only
+                and self._record_cores is None and self._flushed_uids is None):
+            info = self._fused_setup(q)
+            if info is not None:
+                return self._fused_commit(q, info)
         self._flush_core(0, 1 << q)
         Pm = (0, 1 << q, 0)
         magset = set(self.M)

@@ -1077,7 +1077,7 @@ def _apply_1q_method(self, ident, U):
     bag = self.bags[home_id]
     pos = bag.ident_axis_pos(ident)
     T = np.moveaxis(bag.tensor, pos, -1)
-    T = T @ U.T
+    T = np.matmul(T, U.T)
     bag.tensor = np.moveaxis(T, -1, pos)
     self._record_metrics()
 
@@ -1246,7 +1246,7 @@ def _apply_2q_local_method(self, bag_id, ident_a, ident_b, U4):
     pb = bag.ident_axis_pos(ident_b)
     T = np.moveaxis(bag.tensor, [pa, pb], [-2, -1])
     sh = T.shape
-    out = T.reshape(-1, 4) @ U4.T
+    out = np.matmul(T.reshape(-1, 4), U4.T)
     T = out.reshape(sh)
     bag.tensor = np.moveaxis(T, [-2, -1], [pa, pb])
     self._record_metrics()
@@ -1348,7 +1348,7 @@ def _apply_2q_on_labeled_tensor(tensor, labels, ident_a, ident_b, U4):
     ta = labels.index(('own', int(ident_b)))
     T = np.moveaxis(tensor, [ca, ta], [-2, -1])
     sh = T.shape
-    out = T.reshape(-1, 4) @ U4.T
+    out = np.matmul(T.reshape(-1, 4), U4.T)
     T = out.reshape(sh)
     return np.moveaxis(T, [-2, -1], [ca, ta])
 
@@ -1623,7 +1623,7 @@ def _apply_2q_class_B_2bag_method(self, ident_u, ident_v, U4):
     pv = (L_n_own + L_outer_n) + bag_r.ident_axis_pos(ident_v)
     amp = np.moveaxis(theta, [pu, pv], [-2, -1])
     sh = amp.shape
-    out = amp.reshape(-1, 4) @ U4.T
+    out = np.matmul(amp.reshape(-1, 4), U4.T)
     amp = out.reshape(sh)
     theta_new = np.moveaxis(amp, [-2, -1], [pu, pv])
 
@@ -1819,7 +1819,7 @@ def _staged_factor_blocks(src_m, dst_m, left_dim, right_without_dim,
         for r0, r1 in _rows():
             Mb = row_block_fn(r0, r1)
             max_block_bytes = max(max_block_bytes, int(Mb.nbytes))
-            G += Mb.conj().T @ Mb
+            G += np.matmul(Mb.conj().T, Mb)
         V, s, keep, cond = _staged_rank_from_gram(G, rtol, atol, svd_rtol, cond_max)
         Vk = V[:, keep]
         sk = s[keep]
@@ -1827,12 +1827,12 @@ def _staged_factor_blocks(src_m, dst_m, left_dim, right_without_dim,
         Vk_over_s = Vk / sk[None, :]
         Q = np.empty((left_dim, chi), dtype=np.complex128)
         for r0, r1 in _rows():
-            Q[r0:r1] = row_block_fn(r0, r1) @ Vk_over_s
+            Q[r0:r1] = np.matmul(row_block_fn(r0, r1), Vk_over_s)
         if force_reorth or cond > 1e3:
             reorth = True
             G2 = np.zeros((chi, chi), dtype=np.complex128)
             for r0, r1 in _rows():
-                G2 += Q[r0:r1].conj().T @ Q[r0:r1]
+                G2 += np.matmul(Q[r0:r1].conj().T, Q[r0:r1])
             G2 = (G2 + G2.conj().T) * 0.5
             lam2, V2 = np.linalg.eigh(G2)
             s2 = np.sqrt(np.clip(lam2.real, 0.0, None))
@@ -1840,10 +1840,10 @@ def _staged_factor_blocks(src_m, dst_m, left_dim, right_without_dim,
                                s2, 1.0)
             W2 = V2 / s2_safe[None, :]
             for r0, r1 in _rows():
-                Q[r0:r1] = Q[r0:r1] @ W2
+                Q[r0:r1] = np.matmul(Q[r0:r1], W2)
         R = np.zeros((chi, n), dtype=np.complex128)
         for r0, r1 in _rows():
-            R += Q[r0:r1].conj().T @ row_block_fn(r0, r1)
+            R += np.matmul(Q[r0:r1].conj().T, row_block_fn(r0, r1))
         gram_bytes = int(G.nbytes + V.nbytes + Vk_over_s.nbytes)
     else:
         # ---- wide: Gram on the left (M M^H) via source-column streaming ----
@@ -1859,14 +1859,14 @@ def _staged_factor_blocks(src_m, dst_m, left_dim, right_without_dim,
                 j0 = 0
                 while j0 < rwd:
                     j1 = min(j0 + block_cols, rwd)
-                    Tb = src_m[:, x, :] @ dst_m[:, j0:j1]   # (left_dim, j1-j0)
+                    Tb = np.matmul(src_m[:, x, :], dst_m[:, j0:j1])   # (left_dim, j1-j0)
                     yield x, j0, j1, Tb
                     j0 = j1
 
         G = np.zeros((left_dim, left_dim), dtype=np.complex128)
         for x, j0, j1, Tb in _col_blocks():
             max_block_bytes = max(max_block_bytes, int(Tb.nbytes))
-            G += Tb @ Tb.conj().T
+            G += np.matmul(Tb, Tb.conj().T)
         U, s, keep, cond = _staged_rank_from_gram(G, rtol, atol, svd_rtol, cond_max)
         Q = U[:, keep]                       # (left_dim, chi) orthonormal directly
         chi = int(Q.shape[1])
@@ -1874,7 +1874,7 @@ def _staged_factor_blocks(src_m, dst_m, left_dim, right_without_dim,
         # R_source[:, x, j] = Q^H @ M_source[:, x, j]
         R_source = np.empty((chi, 2, rwd), dtype=np.complex128)
         for x, j0, j1, Tb in _col_blocks():
-            R_source[:, x, j0:j1] = QH @ Tb
+            R_source[:, x, j0:j1] = np.matmul(QH, Tb)
         # reorder source axes -> right_source_shape -> M right-label order
         R_src = R_source.reshape((chi,) + right_source_shape)
         R = np.transpose(R_src, [0] + [perm[k] for k in range(1, len(perm))]).reshape(chi, n)

@@ -11,3 +11,4 @@ This repository houses each category of simulation in its own subflorder, with i
 | `qec_bench/` | QEC and paper-style benchmarks | Contains `clifford_bench`, `cultivation_bench`, `distillation_bench`, `coherent_noise_bench`, plus shared `bench_common.py` and `tsim_compile_check.py` |
 | `qv_bench/` | Quantum Volume benchmark | Separate environment for Qiskit, Qulacs, qsim, and Qrack dependencies |
 | `magic_state_cultivation/` | S-proxy vs T-gate magic state cultivation fidelity comparison | Reproduces and extends Gidney et al. (arXiv:2409.17595); requires a 512-qubit Clifft source build |
+| `ttn_backend/` | Experimental Python TTN backend, RASL analysis, memory-risk metrics, and validation scripts | See `ttn_backend/README.md`; run tools with `python -m ttn_backend.scripts.<name>` |

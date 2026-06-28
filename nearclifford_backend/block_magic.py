@@ -22,6 +22,7 @@ import numpy as np
 
 _TOL = 1e-9
 _INV_SQRT2 = 0.7071067811865476
+_EMPTY_PEEL = frozenset()    # targeted-peel: "probe nothing" (no recorded peel here)
 
 
 # --- single-/two-qubit Clifford gates applied to a dense block vector (bit j = LSB
@@ -100,6 +101,21 @@ class MagicRegister:
         # complex-arith convention: mult=6, add=2, |z|^2-accumulate(norm)=4, vdot=8
         self.flop_mm = 0.0         # state-evolution work (rotation apply, kron, measure)
         self.flop_norm = 0.0       # factoring work (the norm/vdot scans in factor())
+        # --- targeted-peel (structure-once analogue for factoring) ---------------
+        # Each factor() call is indexed by _factor_ctr (shot-invariant call order). A
+        # discovery pre-pass records {call_idx -> set of qubit ids that actually peel}
+        # into _record_peels; at runtime _fast_peels supplies that set as `only=`, so
+        # factor probes ONLY the qubits known to peel (O(s*2^b)) instead of the whole
+        # block / whole support (O(b*2^b)). State-exact by construction: factor(only=S)
+        # never changes amplitudes, only which product factors are split out -- a missed
+        # peel enlarges a block but cannot corrupt the state. _peel_debug runs a full
+        # re-scan afterward and counts (self-heals) any miss.
+        self._factor_ctr = 0
+        self._peeled = []          # qubit ids split off during the current factor()
+        self._record_peels = None  # dict to FILL (pre-pass); None = don't record
+        self._fast_peels = None     # dict to USE (runtime targeting); None = full scan
+        self._peel_debug = False
+        self._peel_mismatch = 0
 
     # ---- queries ----
     def qubits(self):
@@ -196,7 +212,30 @@ class MagicRegister:
         A measurement is a non-unitary projection and CAN disentangle qubits outside
         its support, so the measurement path passes `only=None` (full scan). This
         turns the per-op cost from O(sum_b |Q_b|*2^|Q_b|) (rescan every block every
-        op -- the dominant `flop_norm`) into O(|S|*2^|touched block|)."""
+        op -- the dominant `flop_norm`) into O(|S|*2^|touched block|).
+
+        Targeted-peel layer: each call is indexed; if `_fast_peels` holds a recorded
+        peel set for this call it REPLACES `only` (a subset of the caller's `only`, so
+        still correctness-safe), shrinking the probe set to just the known peelers (or
+        skipping the scan entirely when none peel). `_record_peels` captures the actual
+        peels for the discovery pre-pass."""
+        idx = self._factor_ctr
+        self._factor_ctr += 1
+        if self._fast_peels is not None:
+            only = self._fast_peels.get(idx, _EMPTY_PEEL)
+        self._peeled = []
+        self._factor_sweep(only)
+        if self._record_peels is not None and self._peeled:
+            self._record_peels[idx] = set(self._peeled)
+        if self._peel_debug and self._fast_peels is not None:
+            # safety net: a full re-scan; if it peels MORE the targeted set missed one
+            # (a suboptimal block, never a wrong state) -- count it and self-heal.
+            self._peeled = []
+            self._factor_sweep(None)
+            if self._peeled:
+                self._peel_mismatch += 1
+
+    def _factor_sweep(self, only):
         i = 0
         while i < len(self.blocks):
             changed = self._factor_block(i, only)
@@ -246,6 +285,7 @@ class MagicRegister:
         qubit is |0> and leaves the register; else it becomes its own block."""
         qubits, _ = self.blocks[i]
         q = qubits[j]
+        self._peeled.append(q)             # targeted-peel: record what this call peels
         rest_qubits = qubits[:j] + qubits[j + 1:]
         self.blocks[i] = [rest_qubits, rest]
         if qubit_state is None:
@@ -532,9 +572,9 @@ class BlockLazyNearClifford(LazyNearClifford):
 
     # ---- dense reconstruction (verification only) ----
     def statevector(self):
-        for (x, z, p, theta) in self.pending:
+        for (x, z, p, theta, uid) in self.pending.values():
             self._flush_one(x, z, theta)
-        self.pending = []
+        self.pending = {}
         n = self.n
         qubits, mvec = self.mag.amplitude_table()
         psi = np.zeros(1 << n, dtype=complex)

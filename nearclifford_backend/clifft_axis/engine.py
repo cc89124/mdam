@@ -60,6 +60,11 @@ class CliftAxisNearClifford(VirtualAxisNearClifford):
     # PHASE-2 STEP-1: strided single-axis-Z half-array rotation fast path. ON by default;
     # the verifier flips it OFF to reconstruct the pre-Step-1 parity kernel for bit-exact A/B.
     _step1_diaghalf = True
+    # STAGE B (default OFF): run the in-place dense Pauli linear combination in C++ for the
+    # full-formula branches (off-diagonal butterfly + non-diaghalf diagonal) -- the Python
+    # scalar/vectorized hot path (the ry/rx bottleneck).  Bit-identical; the diaghalf global-
+    # phase fast path stays in Python.  Toggled by the backend `compiled_numerical` flag.
+    _compiled_numerical = False
 
     def __init__(self, n):
         super().__init__(n)
@@ -179,6 +184,17 @@ class CliftAxisNearClifford(VirtualAxisNearClifford):
         N = phi.size
         ph = (1j ** pp)
         bph = beta * ph
+        # STAGE B: route the FULL-FORMULA branches (off-diagonal, and non-diaghalf diagonal) to
+        # the C++ kernel.  Keep the diaghalf global-phase fast path AND the mz==0 global scalar in
+        # Python so the state stays bit-identical to the authoritative path.
+        if self._compiled_numerical and (mx != 0 or mz != 0):
+            is_diaghalf = (self._step1_diaghalf and where.startswith("rot") and mx == 0
+                           and (mz & (mz - 1)) == 0 and abs(abs(alpha + bph) - 1.0) < 1e-9)
+            if not is_diaghalf:
+                from nearclifford_backend.clifft_axis import compiled_numerical as CN
+                self.budget.charge(N, 0, where + ":cpp")     # in-place: no transient
+                CN.lincomb(phi, int(mx), int(mz), complex(alpha), complex(bph))
+                return
         slack = self.budget.cap - N
         CH = self._lincomb_chunk(slack)
         if mx == 0:

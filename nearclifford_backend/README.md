@@ -448,7 +448,8 @@ would be **Condition A** (a rotation whose physical generator commutes with ever
 subsequent measured Pauli → never flushed → free) — exact but trivial. The
 defensible source is **Condition B** (rotations *are* flushed/observable, but each
 measurement's anticommutation-connected core stays small). This implementation
-performs **no** pending fusion/cancellation, so A and B are the *only* two sources.
+performs **no** pending fusion/cancellation of *flushed* rotations, so A and B are the
+*only* two sources of the working-set gain.
 We measured the split directly (instrument `apply_rotation` = total, `_flush_core`
 = flushed core, leftover `pending` at shot end = never-flushed), block backend,
 per shot:
@@ -485,6 +486,48 @@ working-set ladder (eager near-Clifford |M| → `clifft` `peak_rank` → our `ma
 `d3_r3` 16→8→5, `distillation` 5→5→3, `cultivation_d3` 6→4→4, `d5_r5` (eager
 overflows)→24→13. The `clifft`→ours step is pure factoring (B); the eager→`clifft`
 step is what `clifft` already recovers on its own.
+
+**Dead-rotation pruning (Condition A → removed, not just free).** A never-flushed (A)
+rotation commutes with every measured Pauli for the whole circuit, so it never touches
+the dense register **and never affects a record bit** — yet it used to *linger in
+`pending`* as dead weight, the memory floor that does not decrease at circuit end.
+`NearCliffordBackend(drop_dead=True)` (**default ON**) removes it. A one-off structure
+pass (cached per program; two independent seeds, which must agree or pruning is
+disabled) records which rotation uids ever enter a core; the complement is dropped from
+`pending` on every shot. This is **record-bit-identical** (verified seed-for-seed in
+`scripts/verify_drop_dead.py`), because the active-gate stream is outcome-independent —
+records only steer the deferred Pauli *frame*, never the tableau/rotations — so the flush
+structure is a fixed property of the program. The pruned fraction equals the **never %**
+column above exactly (100 / 100 / 16.5 / 8.6 / 0 / 0 %). Effect: the end-of-circuit
+floor collapses to the tableau (`coherent_d3_r1` total PEAK `512 B → 48 B`,
+`coherent_d5_r1` → `336 B`), and the per-step core scans / pending conjugations shrink
+(wall-clock up to ~1.5× on the fully-pruned `*_r1`). It does **not** change `max_block`
+or the dense FLOP counts (dead rotations never become magic), so the ACTIVE-STATE and
+FLOPS figures are invariant; only the total-memory footprint drops. The 0%-never
+circuits (distillation, cultivation) are untouched — their metadata is genuine working
+state, which is why they remain the honest near-parity all-magic cases.
+
+**Structure-once measurement fast path (`structure_once=True`, default ON).** The same
+cached structure pass records not just the dead uids but a `{meas_idx -> core uids}` table:
+the anticommuting core flushed at each measurement is *also* outcome-independent (the
+commute test depends only on the Pauli **supports**, which records never touch). So at
+runtime `pending` is a `uid -> entry` map, and each measurement **looks up** its core and
+gathers it by uid instead of re-running `_core_indices` / `_commute_xz` over all pending.
+The per-measurement commute-judgment work is removed from the runtime entirely
+(`coherent_d3_r3` `_commute_xz` calls `1774 -> 0`, `distillation` `55 -> 0`, every
+`dynamic_core_scan -> 0`, replaced by O(1) lookups). It is **record-bit-identical** to the
+live-scan path (`scripts/verify_structure_once.py`; a `structure_once_debug` mode cross-
+checks every measurement's precomputed core against a live scan and falls back on any
+mismatch — 0 mismatches on all benchmark circuits). The validity gate is **multi-seed core
+agreement**: structure-once is enabled iff the per-measurement cores are identical across
+independent discovery seeds, which proves outcome-independence per circuit. Only a
+conditional *active-state* op could break it; this backend has none (all feedback — even
+cultivation_d5's 135 rec-conditioned Paulis — is routed to the Pauli **frame**, so it cannot
+change the cores), hence every circuit passes, cultivation_d5 included. (Set
+`structure_once_exclude_feedback=True` to additionally exclude any circuit with conditional
+Paulis, the conservative policy.) It does **not** change `max_block`, the dense FLOPs, or the
+memory footprint — only how the core is *located*. Single-shot only so far; the larger win is
+multi-shot batching (amortise the dense flush across shots), deliberately not done yet.
 
 ---
 

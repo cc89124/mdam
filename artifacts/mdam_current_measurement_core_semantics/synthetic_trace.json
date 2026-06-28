@@ -1,0 +1,41 @@
+{
+ "note": "engine-level controlled pending (identity frame so physical==pulled-back), READ-ONLY",
+ "cases": [
+  {
+   "pattern": "X_q, Z_q, MZ",
+   "core_seq": "X,I(=Z-on-q)",
+   "tail_uids": [
+    1
+   ],
+   "tail_len": 1
+  },
+  {
+   "pattern": "X_q, Z_q, Z_q, MZ",
+   "core_seq": "X,I,I",
+   "tail_uids": [
+    1,
+    2
+   ],
+   "tail_len": 2,
+   "note": "trailing diagonal suffix length 2 is structurally possible"
+  },
+  {
+   "pattern": "X_q, (Z_q*Z_1), (X_1) , MZ",
+   "core_seq": "X,I,I",
+   "tail_uids": [
+    1,
+    2
+   ],
+   "tail_len": 2,
+   "note": "a rotation identity-on-q but coupled also enters the trailing suffix"
+  },
+  {
+   "pattern": "Y_q, Z_q, MZ",
+   "core_seq": "X(=Y mixing),I",
+   "tail_uids": [
+    1
+   ],
+   "tail_len": 1
+  }
+ ]
+}

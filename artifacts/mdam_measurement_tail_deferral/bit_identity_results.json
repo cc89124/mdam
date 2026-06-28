@@ -1,0 +1,469 @@
+{
+ "results": [
+  {
+   "bench": "coherent_d3_r3",
+   "seed": 7,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d3_r3",
+   "seed": 8,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d3_r3",
+   "seed": 9,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d3_r3",
+   "seed": 42,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d3_r3",
+   "seed": 123,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "cultivation_d5",
+   "seed": 7,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "cultivation_d5",
+   "seed": 8,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "cultivation_d5",
+   "seed": 9,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "cultivation_d5",
+   "seed": 42,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "cultivation_d5",
+   "seed": 123,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_ry_d3_r3",
+   "seed": 7,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_ry_d3_r3",
+   "seed": 8,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_ry_d3_r3",
+   "seed": 9,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_ry_d3_r3",
+   "seed": 42,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_ry_d3_r3",
+   "seed": 123,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "distillation",
+   "seed": 7,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "distillation",
+   "seed": 8,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "distillation",
+   "seed": 9,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "distillation",
+   "seed": 42,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "distillation",
+   "seed": 123,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "cultivation_d3",
+   "seed": 7,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "cultivation_d3",
+   "seed": 8,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "cultivation_d3",
+   "seed": 9,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "cultivation_d3",
+   "seed": 42,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "cultivation_d3",
+   "seed": 123,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d3_r1",
+   "seed": 7,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d3_r1",
+   "seed": 8,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d3_r1",
+   "seed": 9,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d3_r1",
+   "seed": 42,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d3_r1",
+   "seed": 123,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d5_r1",
+   "seed": 7,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d5_r1",
+   "seed": 8,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d5_r1",
+   "seed": 9,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d5_r1",
+   "seed": 42,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d5_r1",
+   "seed": 123,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_rx_d3_r3",
+   "seed": 7,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_rx_d3_r3",
+   "seed": 8,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_rx_d3_r3",
+   "seed": 9,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_rx_d3_r3",
+   "seed": 42,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_rx_d3_r3",
+   "seed": 123,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d5_r5",
+   "seed": 7,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  },
+  {
+   "bench": "coherent_d5_r5",
+   "seed": 42,
+   "cross_off_ok": true,
+   "per_path": {
+    "oracle": true,
+    "fused": true,
+    "compiled": true
+   },
+   "ok": true
+  }
+ ],
+ "n_pass": 42,
+ "n_total": 42,
+ "failures": []
+}
