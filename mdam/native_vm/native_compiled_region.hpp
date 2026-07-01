@@ -20,6 +20,10 @@ namespace mdam {
 
 // ---- GF(2) symbolic expression over the dynbit basis:  value = cst ^ parity(mask & dynbits) ----
 static constexpr int JDYN_WORDS = 40;            // up to 2560 dynbits (cultivation_d3 uses 2466)
+// Multiword packed signatures: theta_sig (bit r = rotation r's xb) and rec_sig (bit r = record r) span
+// SIG_MAX_WORDS uint64 each, so nrot/record_cap > 64 are supported (coherent_d5_r1: nrot=129, rc=98).
+static constexpr int SIG_MAX_WORDS = 16;         // up to 1024 rotations / record bits
+#define JSIGBIT(sig, i) (((sig)[(i)>>6] >> ((i)&63)) & 1ULL)
 struct SymBit {
     uint64_t m[JDYN_WORDS]; uint8_t cst;
     SymBit(){ clear(); }
@@ -56,25 +60,28 @@ struct CompiledMdamProgram {
     // keeps a packed signature theta_sig (bit r = xb at rotation r) + rec_sig (bit r = record r) and,
     // when dynbit e fires, XORs the precomputed columns: theta_sig ^= ev_theta[e]; rec_sig ^= ev_rec[e].
     // Cost is O(fired events), not O(queries × ndyn).  (nrot, record_cap ≤ 64 here → uint64 sigs.)
-    uint64_t theta_init=0, rec_init=0;      // constant parts (query .cst)
-    std::vector<uint64_t> ev_theta, ev_rec; // per dynbit e: rotations / record bits it flips
-    bool fast_ok=false;                     // nrot<=64 && record_cap<=64 (else fast path unsupported)
+    int theta_words=1, rec_words=1;         // ceil(nrot/64), ceil(record_cap/64)
+    std::vector<uint64_t> theta_init, rec_init;   // constant parts (query .cst), theta_words/rec_words long
+    std::vector<uint64_t> ev_theta, ev_rec; // per dynbit e: rotations / record bits it flips (flat e*words+w)
+    bool fast_ok=false;                     // theta_words,rec_words <= SIG_MAX_WORDS (else fast path unsupported)
 };
 
 // transpose the compiled queries into per-dynbit contribution columns (built once, after compile).
 inline void build_event_tables(CompiledMdamProgram& cp){
     int nrot=cp.nrot, rc=cp.record_cap, ndyn=cp.dyn.ndyn;
-    cp.fast_ok = (nrot<=64 && rc<=64);
-    cp.theta_init=0; for(int r=0;r<nrot;r++) if(cp.theta_q[r].cst) cp.theta_init|=1ULL<<r;
-    cp.rec_init=0;   for(int r=0;r<rc;r++)   if(cp.final_rec_q[r].cst) cp.rec_init|=1ULL<<r;
-    cp.ev_theta.assign(ndyn,0); cp.ev_rec.assign(ndyn,0);
+    int tw=(nrot+63)>>6, rw=(rc+63)>>6; if(tw<1) tw=1; if(rw<1) rw=1;
+    cp.theta_words=tw; cp.rec_words=rw;
+    cp.fast_ok = (tw<=SIG_MAX_WORDS && rw<=SIG_MAX_WORDS);
+    cp.theta_init.assign(tw,0); for(int r=0;r<nrot;r++) if(cp.theta_q[r].cst) cp.theta_init[r>>6]|=1ULL<<(r&63);
+    cp.rec_init.assign(rw,0);   for(int r=0;r<rc;r++)   if(cp.final_rec_q[r].cst) cp.rec_init[r>>6]|=1ULL<<(r&63);
+    cp.ev_theta.assign((size_t)ndyn*tw,0); cp.ev_rec.assign((size_t)ndyn*rw,0);
     if(!cp.fast_ok) return;
     for(int r=0;r<nrot;r++){ const ParityQuery& q=cp.theta_q[r];
         for(int w=0;w<JDYN_WORDS;w++){ uint64_t m=q.m[w]; while(m){ int b=__builtin_ctzll(m); m&=m-1;
-            int e=(w<<6)+b; if(e<ndyn) cp.ev_theta[e]|=1ULL<<r; } } }
+            int e=(w<<6)+b; if(e<ndyn) cp.ev_theta[(size_t)e*tw+(r>>6)]|=1ULL<<(r&63); } } }
     for(int r=0;r<rc;r++){ const ParityQuery& q=cp.final_rec_q[r];
         for(int w=0;w<JDYN_WORDS;w++){ uint64_t m=q.m[w]; while(m){ int b=__builtin_ctzll(m); m&=m-1;
-            int e=(w<<6)+b; if(e<ndyn) cp.ev_rec[e]|=1ULL<<r; } } }
+            int e=(w<<6)+b; if(e<ndyn) cp.ev_rec[(size_t)e*rw+(r>>6)]|=1ULL<<(r&63); } } }
 }
 
 // ============================ symbolic compiler ============================
@@ -87,11 +94,18 @@ inline CompiledMdamProgram compile_jprogram(const MdamProgram& p) {
     for(int s=0;s<NS;s++){ cp.dyn.noise_base[s]=base; base+=(int)p.noise_sites[s].channels.size(); }
     cp.dyn.n_noise=base;
     int ndorm=0,nread=0,nmag=0;
-    for(uint8_t k:p.kind){ if(k==MO_MEAS_DORM_RANDOM)ndorm++; else if(k==MO_READOUT_NOISE)nread++; else if(k==MO_SWAP_MEAS_INTERFERE)nmag++; }
+    for(uint8_t k:p.kind){ if(k==MO_MEAS_DORM_RANDOM)ndorm++; else if(k==MO_READOUT_NOISE)nread++;
+        else if(k==MO_SWAP_MEAS_INTERFERE||k==MO_MEAS_ACTIVE_DIAGONAL||k==MO_MEAS_ACTIVE_INTERFERE)nmag++; }
     cp.dyn.dormant_base=base; base+=ndorm;
     cp.dyn.readout_base=base; base+=nread;
     cp.dyn.outcome_base=base; base+=nmag;
     cp.dyn.ndyn=base; cp.nmagic=nmag;
+
+    // SymBit packs the dynbit basis into a FIXED uint64_t m[JDYN_WORDS].  If a program has more dynbits
+    // than that holds (e.g. cultivation_d5: ndyn=16056 needs 251 words), the abstract-interp xor_dyn()
+    // below would write past m[] and corrupt the heap.  Refuse to compile (fast_ok=false) and bail BEFORE
+    // any OOB write; callers gate on fast_ok and fall back to the authoritative path.
+    if (base > JDYN_WORDS*64) { cp.fast_ok=false; cp.nrot=0; return cp; }
 
     int NQ=p.num_qubits, RC=p.record_cap;
     std::vector<SymBit> fx(NQ), fz(NQ), frec(RC);   // all start at const 0
@@ -128,14 +142,28 @@ inline CompiledMdamProgram compile_jprogram(const MdamProgram& p) {
                 while(mask){ int ctrl=__builtin_ctzll(mask); mask&=mask-1; if(ctrl==tgt) continue; fx[tgt].xor_in(fx[ctrl]); fz[ctrl].xor_in(fz[tgt]); } } break;
             case MO_MULTI_CZ: { uint64_t mask=p.mmask[i0];
                 while(mask){ int tgt=__builtin_ctzll(mask); mask&=mask-1; if(tgt==a1) continue; fz[a1].xor_in(fx[tgt]); fz[tgt].xor_in(fx[a1]); } } break;
-            case MO_ARRAY_T: case MO_ARRAY_T_DAG: { cp.theta_q.resize(rot_i+1); cp.theta_q[rot_i].from(fx[a1]); rot_i++; } break;
+            case MO_ARRAY_T: case MO_ARRAY_T_DAG:
+            case MO_ARRAY_ROT: { cp.theta_q.resize(rot_i+1); cp.theta_q[rot_i].from(fx[a1]); rot_i++; } break;
             case MO_ARRAY_S: fz[a1].xor_in(fx[a1]); break;
-            case MO_EXPAND_T: case MO_EXPAND_T_DAG: { cp.theta_q.resize(rot_i+1); cp.theta_q[rot_i].from(fx[a1]); rot_i++; } break;
+            case MO_EXPAND_T: case MO_EXPAND_T_DAG:
+            case MO_EXPAND_ROT: { cp.theta_q.resize(rot_i+1); cp.theta_q[rot_i].from(fx[a1]); rot_i++; } break;
+            case MO_ARRAY_SWAP: std::swap(fx[a1],fx[a2]); std::swap(fz[a1],fz[a2]); break;  // pure relabel
             case MO_SWAP_MEAS_INTERFERE: { std::swap(fx[a1],fx[a2]); std::swap(fz[a1],fz[a2]);
                 int b=cp.dyn.outcome_base+(mag_i++);
                 SymBit mabs; mabs.set_dyn(b); mabs.xor_in(fz[a2]);   // m_abs = outcome ^ frame.zb(a2)
                 frec[i0]=mabs; frec[i0].cst^=(uint8_t)(i1&1);
                 fx[a2]=mabs; fz[a2].set_const(0); } break;
+            case MO_MEAS_ACTIVE_DIAGONAL: {                          // m_abs = outcome ^ frame.xb(a1)
+                int b=cp.dyn.outcome_base+(mag_i++);
+                SymBit mabs; mabs.set_dyn(b); mabs.xor_in(fx[a1]);
+                frec[i0]=mabs; frec[i0].cst^=(uint8_t)(i1&1);
+                fx[a1]=mabs; fz[a1].set_const(0); } break;
+            case MO_MEAS_ACTIVE_INTERFERE: {                         // m_abs = outcome ^ frame.zb(a1)
+                int b=cp.dyn.outcome_base+(mag_i++);
+                SymBit mabs; mabs.set_dyn(b); mabs.xor_in(fz[a1]);
+                frec[i0]=mabs; frec[i0].cst^=(uint8_t)(i1&1);
+                fx[a1]=mabs; fz[a1].set_const(0); } break;
+            case MO_ARRAY_H: std::swap(fx[a1],fz[a1]); break;   // active Hadamard: frame H is symbolic (fx<->fz); engine H is not symbolic (handled in run_jfast_2e/shadow)
             default: break;
         }
     }
@@ -155,10 +183,7 @@ inline void run_jshadow(MdamShot& s, const MdamProgram& p, const CompiledMdamPro
     std::vector<uint64_t> dyn((size_t)JDYN_WORDS, 0);
     s.sampler.log_on=true; s.sampler.fire_log.clear(); size_t fire_cur=0;
     // map a fired (site,xw,zw) -> dynbit
-    auto set_noise=[&](int site,uint64_t xw,uint64_t zw){ const NoiseSite& stt=p.noise_sites[site];
-        for(size_t c=0;c<stt.channels.size();c++){ const NoiseChannel& ch=stt.channels[c];
-            uint64_t cx=ch.x_words.empty()?0:ch.x_words[0], cz=ch.z_words.empty()?0:ch.z_words[0];
-            if(cx==xw&&cz==zw){ int bdyn=cp.dyn.noise_base[site]+(int)c; dyn[bdyn>>6]|=1ULL<<(bdyn&63); return; } } };
+    auto set_noise=[&](int site,uint64_t ci,uint64_t){ int bdyn=cp.dyn.noise_base[site]+(int)ci; dyn[bdyn>>6]|=1ULL<<(bdyn&63); };   // fire_log stores the channel index (multiword-safe)
     auto drain_fires=[&](){ for(;fire_cur<s.sampler.fire_log.size();++fire_cur){ auto&f=s.sampler.fire_log[fire_cur]; set_noise((int)f[0],f[1],f[2]); } };
     int dorm_i=0, read_i=0, mag_i=0, rot_i=0;
     size_t N=p.kind.size();
@@ -207,6 +232,25 @@ inline void run_jshadow(MdamShot& s, const MdamProgram& p, const CompiledMdamPro
                 s.slot2id[a2]=-1; int m_abs=b ^ s.frame.zb(a2);
                 s.record.set((uint32_t)i0, m_abs^i1); s.frame.set_xz(a2,(uint8_t)m_abs,0);
             } break;
+            // ---- distillation / coherent dialect: mirror MdamShot::run authoritative cases ----
+            case MO_ARRAY_ROT: { int conc=s.frame.xb(a1); int comp=eval_parity(cp.theta_q[rot_i],dyn.data());
+                st.theta_checks++; if(conc!=comp){ st.theta_mismatch++; if(st.first_bad_rot<0)st.first_bad_rot=rot_i; } rot_i++;
+                s.rot(p,a1,dv); } break;
+            case MO_EXPAND_ROT: { s.newq(a1); s.engine.h(s.slot2id[a1]); int conc=s.frame.xb(a1); int comp=eval_parity(cp.theta_q[rot_i],dyn.data());
+                st.theta_checks++; if(conc!=comp){ st.theta_mismatch++; if(st.first_bad_rot<0)st.first_bad_rot=rot_i; } rot_i++;
+                s.rot(p,a1,dv); } break;
+            case MO_ARRAY_SWAP: { int i_1=s.slot2id[a1], i_2=s.slot2id[a2]; s.slot2id[a1]=-1; s.slot2id[a2]=-1;
+                if(i_1>=0) s.slot2id[a2]=i_1; if(i_2>=0) s.slot2id[a1]=i_2; s.frame.swap(a1,a2); } break;
+            case MO_MEAS_ACTIVE_DIAGONAL: { int q=s.slot2id[a1]; int bdyn=cp.dyn.outcome_base+(mag_i++); if(q<0) break;
+                int b=s.measure_z(q); if(b) dyn[bdyn>>6]|=1ULL<<(bdyn&63);
+                s.slot2id[a1]=-1; int m_abs=b ^ s.frame.xb(a1);
+                s.record.set((uint32_t)i0, m_abs^i1); s.frame.set_xz(a1,(uint8_t)m_abs,0); } break;
+            case MO_MEAS_ACTIVE_INTERFERE: { int q=s.slot2id[a1]; int bdyn=cp.dyn.outcome_base+(mag_i++); if(q<0) break;
+                s.engine.h(q); int b=s.measure_z(q); if(b) dyn[bdyn>>6]|=1ULL<<(bdyn&63);
+                s.slot2id[a1]=-1; int m_abs=b ^ s.frame.zb(a1);
+                s.record.set((uint32_t)i0, m_abs^i1); s.frame.set_xz(a1,(uint8_t)m_abs,0); } break;
+            case MO_EXPAND: { s.newq(a1); s.engine.h(s.slot2id[a1]); } break;
+            case MO_ARRAY_H: { int q=s.slot2id[a1]; if(q>=0) s.engine.h(q); s.frame.h(a1); } break;
             default: break;
         }
     }
@@ -216,6 +260,110 @@ inline void run_jshadow(MdamShot& s, const MdamProgram& p, const CompiledMdamPro
         int conc=s.record.get((uint32_t)r); int comp=eval_parity(cp.final_rec_q[r],dyn.data());
         st.rec_checks++; if(conc!=comp){ st.rec_mismatch++; if(st.first_bad_rec<0)st.first_bad_rec=r; }
     }
+}
+
+// DEBUG: run authoritative NativeFrame and the symbolic SymBit frame in PARALLEL for one shot,
+// comparing eval_parity(fx/fz[slot],dyn) vs s.frame.xb/zb(slot) after EVERY opcode.  Reports the FIRST
+// opcode where they diverge (out[0]=opno, out[1]=slot, out[2]=kind, out[3]=is_z, out[4]=found).  This
+// isolates which symbolic frame update in compile_jprogram disagrees with the live NativeFrame.
+inline void frame_first_divergence(MdamShot& s, const MdamProgram& p, const CompiledMdamProgram& cp, long* out){
+    out[0]=out[1]=out[2]=out[3]=out[4]=-1; out[4]=0;
+    std::vector<uint64_t> dyn((size_t)JDYN_WORDS,0);
+    int NQ=p.num_qubits, RC=p.record_cap;
+    std::vector<SymBit> fx(NQ), fz(NQ), frec(RC);
+    s.sampler.log_on=true; s.sampler.fire_log.clear(); size_t fire_cur=0;
+    auto set_noise=[&](int site,uint64_t ci,uint64_t){ int bdyn=cp.dyn.noise_base[site]+(int)ci; dyn[bdyn>>6]|=1ULL<<(bdyn&63); };   // fire_log stores the channel index (multiword-safe)
+    auto drain_fires=[&](){ for(;fire_cur<s.sampler.fire_log.size();++fire_cur){ auto&f=s.sampler.fire_log[fire_cur]; set_noise((int)f[0],f[1],f[2]); } };
+    auto sym_noise=[&](int site){ const NoiseSite& st=p.noise_sites[site]; int b=cp.dyn.noise_base[site];
+        for(size_t c=0;c<st.channels.size();c++){ const NoiseChannel& ch=st.channels[c];
+            for(size_t wi=0;wi<ch.x_words.size();wi++){ uint64_t w=ch.x_words[wi]; while(w){ int bit=__builtin_ctzll(w); w&=w-1; int q=(int)(wi*64+bit); if(q<NQ) fx[q].xor_dyn(b+(int)c); } }
+            for(size_t wi=0;wi<ch.z_words.size();wi++){ uint64_t w=ch.z_words[wi]; while(w){ int bit=__builtin_ctzll(w); w&=w-1; int q=(int)(wi*64+bit); if(q<NQ) fz[q].xor_dyn(b+(int)c); } } } };
+    int dorm_i=0, read_i=0, mag_i=0, rot_i=0, dorm_i2=0, read_i2=0, mag_i2=0;
+    size_t N=p.kind.size();
+    for(size_t i=0;i<N && !s.err;i++){
+        int a1=p.a1[i], a2=p.a2[i], i0=p.i0[i], i1=p.i1[i]; double dv=p.dval[i];
+        MdamOp k=(MdamOp)p.kind[i];
+        // ---- authoritative (mirror run_jshadow) ----
+        switch(k){
+            case MO_FRAME_H: s.frame.h(a1); break;
+            case MO_FRAME_CNOT: s.frame.cnot(a1,a2); break;
+            case MO_FRAME_CZ: s.frame.cz(a1,a2); break;
+            case MO_FRAME_SWAP: s.frame.swap(a1,a2); break;
+            case MO_FRAME_S: s.frame.s_gate(a1); break;
+            case MO_APPLY_PAULI: { int rc=s.record.get((uint32_t)i0); if(rc==1) s.apply_mask(p.cp_masks[i1]); } break;
+            case MO_NOISE: s.sampler.apply_site(i0, p.noise_sites[i0], s.frame); drain_fires(); break;
+            case MO_NOISE_BLOCK: for(int si=i0;si<i0+i1;si++) s.sampler.apply_site(si, p.noise_sites[si], s.frame); drain_fires(); break;
+            case MO_READOUT_NOISE: { int b=cp.dyn.readout_base+(read_i++); if(s.udraw()<dv){ s.record.flip((uint32_t)i0); dyn[b>>6]|=1ULL<<(b&63);} } break;
+            case MO_MEAS_DORM_STATIC: s.record.set((uint32_t)i0, s.frame.xb(a1)^i1); break;
+            case MO_MEAS_DORM_RANDOM: { int m=(int)s.idraw2(); int b=cp.dyn.dormant_base+(dorm_i++); if(m) dyn[b>>6]|=1ULL<<(b&63);
+                s.record.set((uint32_t)i0,m^i1); s.frame.set_xz(a1,(uint8_t)m,0); } break;
+            case MO_ARRAY_CNOT: { int u=s.slot2id[a1],v=s.slot2id[a2]; if(u>=0&&v>=0) s.engine.cx(u,v); s.frame.cnot(a1,a2); } break;
+            case MO_ARRAY_CZ: { int u=s.slot2id[a1],v=s.slot2id[a2]; if(u>=0&&v>=0) s.engine.cz(u,v); s.frame.cz(a1,a2); } break;
+            case MO_MULTI_CNOT: { int tgt=a1,t=s.slot2id[tgt]; uint64_t mask=p.mmask[i0];
+                while(mask){ int ctrl=__builtin_ctzll(mask); mask&=mask-1; if(ctrl==tgt) continue; int c=s.slot2id[ctrl]; if(t>=0&&c>=0) s.engine.cx(c,t); s.frame.cnot(ctrl,tgt); } } break;
+            case MO_MULTI_CZ: { uint64_t mask=p.mmask[i0];
+                while(mask){ int tgt=__builtin_ctzll(mask); mask&=mask-1; if(tgt==a1) continue; int u=s.slot2id[a1],v=s.slot2id[tgt]; if(u>=0&&v>=0) s.engine.cz(u,v); s.frame.cz(a1,tgt); } } break;
+            case MO_ARRAY_T: rot_i++; s.rot(p,a1,NV_T_ANGLE); break;
+            case MO_ARRAY_T_DAG: rot_i++; s.rot(p,a1,-NV_T_ANGLE); break;
+            case MO_ARRAY_S: { int q=s.slot2id[a1]; if(q>=0) s.engine.s(q,false); s.frame.s_gate(a1); } break;
+            case MO_EXPAND_T: { s.newq(a1); s.engine.h(s.slot2id[a1]); rot_i++; s.rot(p,a1,NV_T_ANGLE); } break;
+            case MO_EXPAND_T_DAG: { s.newq(a1); s.engine.h(s.slot2id[a1]); rot_i++; s.rot(p,a1,-NV_T_ANGLE); } break;
+            case MO_ARRAY_ROT: rot_i++; s.rot(p,a1,dv); break;
+            case MO_EXPAND_ROT: { s.newq(a1); s.engine.h(s.slot2id[a1]); rot_i++; s.rot(p,a1,dv); } break;
+            case MO_ARRAY_SWAP: { int i_1=s.slot2id[a1],i_2=s.slot2id[a2]; s.slot2id[a1]=-1; s.slot2id[a2]=-1; if(i_1>=0) s.slot2id[a2]=i_1; if(i_2>=0) s.slot2id[a1]=i_2; s.frame.swap(a1,a2); } break;
+            case MO_SWAP_MEAS_INTERFERE: { int i_1=s.slot2id[a1],i_2=s.slot2id[a2]; s.slot2id[a1]=-1; s.slot2id[a2]=-1;
+                if(i_1>=0) s.slot2id[a2]=i_1; if(i_2>=0) s.slot2id[a1]=i_2; s.frame.swap(a1,a2);
+                int q=s.slot2id[a2]; int bdyn=cp.dyn.outcome_base+(mag_i++); if(q<0) break;
+                s.engine.h(q); int b=s.measure_z(q); if(b) dyn[bdyn>>6]|=1ULL<<(bdyn&63);
+                s.slot2id[a2]=-1; int m_abs=b ^ s.frame.zb(a2); s.record.set((uint32_t)i0,m_abs^i1); s.frame.set_xz(a2,(uint8_t)m_abs,0); } break;
+            case MO_MEAS_ACTIVE_DIAGONAL: { int q=s.slot2id[a1]; int bdyn=cp.dyn.outcome_base+(mag_i++); if(q<0) break;
+                int b=s.measure_z(q); if(b) dyn[bdyn>>6]|=1ULL<<(bdyn&63);
+                s.slot2id[a1]=-1; int m_abs=b ^ s.frame.xb(a1); s.record.set((uint32_t)i0,m_abs^i1); s.frame.set_xz(a1,(uint8_t)m_abs,0); } break;
+            case MO_MEAS_ACTIVE_INTERFERE: { int q=s.slot2id[a1]; int bdyn=cp.dyn.outcome_base+(mag_i++); if(q<0) break;
+                s.engine.h(q); int b=s.measure_z(q); if(b) dyn[bdyn>>6]|=1ULL<<(bdyn&63);
+                s.slot2id[a1]=-1; int m_abs=b ^ s.frame.zb(a1); s.record.set((uint32_t)i0,m_abs^i1); s.frame.set_xz(a1,(uint8_t)m_abs,0); } break;
+            case MO_EXPAND: { s.newq(a1); s.engine.h(s.slot2id[a1]); } break;
+            case MO_ARRAY_H: { int q=s.slot2id[a1]; if(q>=0) s.engine.h(q); s.frame.h(a1); } break;
+            default: break;
+        }
+        // ---- symbolic (mirror compile_jprogram) ----
+        switch(k){
+            case MO_FRAME_H: std::swap(fx[a1],fz[a1]); break;
+            case MO_FRAME_CNOT: fx[a2].xor_in(fx[a1]); fz[a1].xor_in(fz[a2]); break;
+            case MO_FRAME_CZ: fz[a1].xor_in(fx[a2]); fz[a2].xor_in(fx[a1]); break;
+            case MO_FRAME_SWAP: std::swap(fx[a1],fx[a2]); std::swap(fz[a1],fz[a2]); break;
+            case MO_FRAME_S: fz[a1].xor_in(fx[a1]); break;
+            case MO_APPLY_PAULI: { const NoiseSite& cm=p.cp_masks[i1]; if(cm.channels.empty()) break; const NoiseChannel& ch=cm.channels[0];
+                for(size_t wi=0;wi<ch.x_words.size();wi++){ uint64_t w=ch.x_words[wi]; while(w){ int bit=__builtin_ctzll(w); w&=w-1; int q=(int)(wi*64+bit); if(q<NQ) fx[q].xor_in(frec[i0]); } }
+                for(size_t wi=0;wi<ch.z_words.size();wi++){ uint64_t w=ch.z_words[wi]; while(w){ int bit=__builtin_ctzll(w); w&=w-1; int q=(int)(wi*64+bit); if(q<NQ) fz[q].xor_in(frec[i0]); } } } break;
+            case MO_NOISE: sym_noise(i0); break;
+            case MO_NOISE_BLOCK: for(int si=i0;si<i0+i1;si++) sym_noise(si); break;
+            case MO_READOUT_NOISE: { int b=cp.dyn.readout_base+(read_i2++); frec[i0].xor_dyn(b); } break;
+            case MO_MEAS_DORM_STATIC: { frec[i0]=fx[a1]; frec[i0].cst^=(uint8_t)(i1&1); } break;
+            case MO_MEAS_DORM_RANDOM: { int b=cp.dyn.dormant_base+(dorm_i2++); frec[i0].set_dyn(b); frec[i0].cst^=(uint8_t)(i1&1); fx[a1].set_dyn(b); fz[a1].set_const(0); } break;
+            case MO_ARRAY_CNOT: fx[a2].xor_in(fx[a1]); fz[a1].xor_in(fz[a2]); break;
+            case MO_ARRAY_CZ: fz[a1].xor_in(fx[a2]); fz[a2].xor_in(fx[a1]); break;
+            case MO_MULTI_CNOT: { int tgt=a1; uint64_t mask=p.mmask[i0]; while(mask){ int ctrl=__builtin_ctzll(mask); mask&=mask-1; if(ctrl==tgt) continue; fx[tgt].xor_in(fx[ctrl]); fz[ctrl].xor_in(fz[tgt]); } } break;
+            case MO_MULTI_CZ: { uint64_t mask=p.mmask[i0]; while(mask){ int tgt=__builtin_ctzll(mask); mask&=mask-1; if(tgt==a1) continue; fz[a1].xor_in(fx[tgt]); fz[tgt].xor_in(fx[a1]); } } break;
+            case MO_ARRAY_S: fz[a1].xor_in(fx[a1]); break;
+            case MO_ARRAY_SWAP: std::swap(fx[a1],fx[a2]); std::swap(fz[a1],fz[a2]); break;
+            case MO_SWAP_MEAS_INTERFERE: { std::swap(fx[a1],fx[a2]); std::swap(fz[a1],fz[a2]); int b=cp.dyn.outcome_base+(mag_i2++);
+                SymBit mabs; mabs.set_dyn(b); mabs.xor_in(fz[a2]); frec[i0]=mabs; frec[i0].cst^=(uint8_t)(i1&1); fx[a2]=mabs; fz[a2].set_const(0); } break;
+            case MO_MEAS_ACTIVE_DIAGONAL: { int b=cp.dyn.outcome_base+(mag_i2++); SymBit mabs; mabs.set_dyn(b); mabs.xor_in(fx[a1]);
+                frec[i0]=mabs; frec[i0].cst^=(uint8_t)(i1&1); fx[a1]=mabs; fz[a1].set_const(0); } break;
+            case MO_MEAS_ACTIVE_INTERFERE: { int b=cp.dyn.outcome_base+(mag_i2++); SymBit mabs; mabs.set_dyn(b); mabs.xor_in(fz[a1]);
+                frec[i0]=mabs; frec[i0].cst^=(uint8_t)(i1&1); fx[a1]=mabs; fz[a1].set_const(0); } break;
+            case MO_ARRAY_H: std::swap(fx[a1],fz[a1]); break;
+            default: break;   // MO_ARRAY_T/T_DAG/ROT, EXPAND_*, MO_EXPAND: no symbolic frame effect
+        }
+        // ---- compare every slot ----
+        ParityQuery pq;
+        for(int q=0;q<NQ;q++){
+            pq.from(fx[q]); if((eval_parity(pq,dyn.data())&1) != (s.frame.xb(q)&1)){ out[0]=(long)i; out[1]=q; out[2]=(long)k; out[3]=0; out[4]=1; return; }
+            pq.from(fz[q]); if((eval_parity(pq,dyn.data())&1) != (s.frame.zb(q)&1)){ out[0]=(long)i; out[1]=q; out[2]=(long)k; out[3]=1; out[4]=1; return; }
+        }
+    }
+    s.sampler.log_on=false;
 }
 
 // ====================================================================================
@@ -235,13 +383,11 @@ inline int& jfast_dbg(){ static int d=0; return d; }   // 0=full; 1=skip fire-ha
 
 inline int run_jfast(MdamShot& s, const MdamProgram& p, const CompiledMdamProgram& cp, JFastStats& st){
     if(!cp.fast_ok){ s.err="run_jfast: nrot/record_cap > 64 (fast sig unsupported)"; return 1; }
-    uint64_t theta_sig=cp.theta_init, rec_sig=cp.rec_init;
+    s.engine.lazy_inverse=false;
+    int j_tw=cp.theta_words, j_rw=cp.rec_words; uint64_t theta_sig[SIG_MAX_WORDS], rec_sig[SIG_MAX_WORDS]; for(int j_w=0;j_w<j_tw;j_w++) theta_sig[j_w]=cp.theta_init[j_w]; for(int j_w=0;j_w<j_rw;j_w++) rec_sig[j_w]=cp.rec_init[j_w];
     s.sampler.log_on=true; s.sampler.noapply=true; s.sampler.fire_log.clear(); size_t fire_cur=0;
-    auto fire_dynbit=[&](int site,uint64_t xw,uint64_t zw)->int{ const NoiseSite& stt=p.noise_sites[site];
-        for(size_t c=0;c<stt.channels.size();c++){ const NoiseChannel& ch=stt.channels[c];
-            uint64_t cx=ch.x_words.empty()?0:ch.x_words[0], cz=ch.z_words.empty()?0:ch.z_words[0];
-            if(cx==xw&&cz==zw) return cp.dyn.noise_base[site]+(int)c; } return -1; };
-    auto fire=[&](int e){ if(e<0) return; theta_sig^=cp.ev_theta[e]; rec_sig^=cp.ev_rec[e]; st.fires++; st.accum_xor+=2; };
+    auto fire_dynbit=[&](int site,uint64_t ci,uint64_t)->int{ return cp.dyn.noise_base[site]+(int)ci; };   // fire_log stores the channel index (multiword-safe)
+    auto fire=[&](int e){ if(e<0) return; for(int j_w=0;j_w<j_tw;j_w++) theta_sig[j_w]^=cp.ev_theta[(size_t)e*j_tw+j_w]; for(int j_w=0;j_w<j_rw;j_w++) rec_sig[j_w]^=cp.ev_rec[(size_t)e*j_rw+j_w]; st.fires++; st.accum_xor+=2; };
     int dbg=jfast_dbg();
     auto drain=[&](){ if(dbg) { s.sampler.fire_log.clear(); fire_cur=0; return; }
         for(;fire_cur<s.sampler.fire_log.size();++fire_cur){ auto&f=s.sampler.fire_log[fire_cur];
@@ -268,14 +414,25 @@ inline int run_jfast(MdamShot& s, const MdamProgram& p, const CompiledMdamProgra
                 while(mask){ int tgt=__builtin_ctzll(mask); mask&=mask-1; if(tgt==a1) continue;
                     int u=s.slot2id[a1],v=s.slot2id[tgt]; if(u>=0&&v>=0) s.engine.cz(u,v); } } break;
             case MO_ARRAY_S: { int q=s.slot2id[a1]; if(q>=0) s.engine.s(q,false); } break;
-            case MO_ARRAY_T: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)((theta_sig>>rot_i)&1);
+            case MO_ARRAY_T: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)(JSIGBIT(theta_sig,rot_i));
                 s.engine.apply_rotation(q, xb?-NV_T_ANGLE:NV_T_ANGLE); } rot_i++; st.rotations++; } break;
-            case MO_ARRAY_T_DAG: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)((theta_sig>>rot_i)&1);
+            case MO_ARRAY_T_DAG: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)(JSIGBIT(theta_sig,rot_i));
                 s.engine.apply_rotation(q, xb?NV_T_ANGLE:-NV_T_ANGLE); } rot_i++; st.rotations++; } break;
             case MO_EXPAND_T: { s.newq(a1); int q=s.slot2id[a1]; s.engine.h(q);
-                int xb=(int)((theta_sig>>rot_i)&1); s.engine.apply_rotation(q, xb?-NV_T_ANGLE:NV_T_ANGLE); rot_i++; st.rotations++; } break;
+                int xb=(int)(JSIGBIT(theta_sig,rot_i)); s.engine.apply_rotation(q, xb?-NV_T_ANGLE:NV_T_ANGLE); rot_i++; st.rotations++; } break;
             case MO_EXPAND_T_DAG: { s.newq(a1); int q=s.slot2id[a1]; s.engine.h(q);
-                int xb=(int)((theta_sig>>rot_i)&1); s.engine.apply_rotation(q, xb?NV_T_ANGLE:-NV_T_ANGLE); rot_i++; st.rotations++; } break;
+                int xb=(int)(JSIGBIT(theta_sig,rot_i)); s.engine.apply_rotation(q, xb?NV_T_ANGLE:-NV_T_ANGLE); rot_i++; st.rotations++; } break;
+            // ---- Gate L: coherent opcodes (arbitrary-theta dv; xb from compiled theta_sig) ----
+            case MO_ARRAY_ROT: { int q=s.slot2id[a1]; int xb=(int)(JSIGBIT(theta_sig,rot_i));
+                if(q>=0){ if(s.rot_log_on) s.rot_log.push_back({(double)a1,(double)xb,dv,xb?-dv:dv});
+                    s.engine.apply_rotation(q, xb?-dv:dv); } rot_i++; st.rotations++; } break;
+            case MO_EXPAND_ROT: { s.newq(a1); int q=s.slot2id[a1]; s.engine.h(q);
+                int xb=(int)(JSIGBIT(theta_sig,rot_i));
+                if(s.rot_log_on) s.rot_log.push_back({(double)a1,(double)xb,dv,xb?-dv:dv});
+                s.engine.apply_rotation(q, xb?-dv:dv); rot_i++; st.rotations++; } break;
+            case MO_ARRAY_SWAP: {   // frame compiled away -> slot relabel only
+                int i_1=s.slot2id[a1], i_2=s.slot2id[a2]; s.slot2id[a1]=-1; s.slot2id[a2]=-1;
+                if(i_1>=0) s.slot2id[a2]=i_1; if(i_2>=0) s.slot2id[a1]=i_2; } break;
             case MO_SWAP_MEAS_INTERFERE: {
                 int i_1=s.slot2id[a1], i_2=s.slot2id[a2]; s.slot2id[a1]=-1; s.slot2id[a2]=-1;
                 if(i_1>=0) s.slot2id[a2]=i_1; if(i_2>=0) s.slot2id[a1]=i_2;
@@ -284,11 +441,19 @@ inline int run_jfast(MdamShot& s, const MdamProgram& p, const CompiledMdamProgra
                 int e=cp.dyn.outcome_base+(mag_i++); if(b) fire(e);
                 s.slot2id[a2]=-1;   // m_abs / record write deferred to end (rec_sig already has it)
             } break;
+            case MO_MEAS_ACTIVE_DIAGONAL: {   // no swap, no H; m_abs symbolic in rec_sig
+                int q=s.slot2id[a1]; if(q<0){ mag_i++; break; }
+                int b=s.measure_z(q); int e=cp.dyn.outcome_base+(mag_i++); if(b) fire(e);
+                s.slot2id[a1]=-1; } break;
+            case MO_MEAS_ACTIVE_INTERFERE: {  // H then measure
+                int q=s.slot2id[a1]; if(q<0){ mag_i++; break; }
+                s.engine.h(q); int b=s.measure_z(q); int e=cp.dyn.outcome_base+(mag_i++); if(b) fire(e);
+                s.slot2id[a1]=-1; } break;
             default: break;
         }
     }
     s.sampler.log_on=false; s.sampler.noapply=false;
-    int nm=p.num_measurements; for(int r=0;r<nm;r++) s.record.bits[r]=(uint8_t)((rec_sig>>r)&1);
+    int nm=p.num_measurements; for(int r=0;r<nm;r++) s.record.bits[r]=(uint8_t)(JSIGBIT(rec_sig,r));
     return s.err?1:0;
 }
 
@@ -371,6 +536,7 @@ struct JPhaseStats {
 // forward map, then the commit (rfd + the logged foldx q's via post-mask 2·z_q), comparing to the
 // live inverse phases at the boundary AND after the commit.  Live path runs authoritatively (shadow).
 inline void jphase_run(MdamShot& s, const MdamProgram& p, JPhaseCompiled& cp, JPhaseStats& st, bool compile){
+    s.engine.lazy_inverse=false;   // compile/shadow pass rides the live inverse frame (sf) + reads .ax/.az
     int n=s.engine.n, W=s.engine.W, twoN=2*n;
     SymInvFrame sf; if(compile) sf.init(n,W);
     std::vector<uint8_t> ppin(twoN,0), pred, live, pp_b; bool cur_match=true; std::vector<int> foldxlog;
@@ -433,6 +599,11 @@ inline void jphase_run(MdamShot& s, const MdamProgram& p, JPhaseCompiled& cp, JP
             case MO_ARRAY_S: { int q=s.slot2id[a1]; if(q>=0){ s.engine.s(q,false); if(compile) sf.fwd_s(q,false);} s.frame.s_gate(a1); } break;
             case MO_EXPAND_T: { s.newq(a1); int q2=s.slot2id[a1]; s.engine.h(q2); if(compile) sf.fwd_h(q2); s.rot(p,a1,NV_T_ANGLE); } break;
             case MO_EXPAND_T_DAG: { s.newq(a1); int q2=s.slot2id[a1]; s.engine.h(q2); if(compile) sf.fwd_h(q2); s.rot(p,a1,-NV_T_ANGLE); } break;
+            // ---- Gate L: coherent rotations (diagonal magic on dense; inverse frame untouched) + slot relabel ----
+            case MO_ARRAY_ROT: s.rot(p,a1,dv); break;
+            case MO_EXPAND_ROT: { s.newq(a1); int q2=s.slot2id[a1]; s.engine.h(q2); if(compile) sf.fwd_h(q2); s.rot(p,a1,dv); } break;
+            case MO_ARRAY_SWAP: { int i_1=s.slot2id[a1], i_2=s.slot2id[a2]; s.slot2id[a1]=-1; s.slot2id[a2]=-1;
+                if(i_1>=0) s.slot2id[a2]=i_1; if(i_2>=0) s.slot2id[a1]=i_2; s.frame.swap(a1,a2); } break;
             case MO_SWAP_MEAS_INTERFERE: {
                 int i_1=s.slot2id[a1], i_2=s.slot2id[a2]; s.slot2id[a1]=-1; s.slot2id[a2]=-1;
                 if(i_1>=0) s.slot2id[a2]=i_1; if(i_2>=0) s.slot2id[a1]=i_2;
@@ -491,6 +662,63 @@ inline void jphase_run(MdamShot& s, const MdamProgram& p, JPhaseCompiled& cp, JP
                 s.record.set((uint32_t)i0, m_abs^i1);
                 s.frame.set_xz(a2,(uint8_t)m_abs,0);
             } break;
+            case MO_MEAS_ACTIVE_DIAGONAL:                            // Gate L: coherent active measure boundary (no swap; slot a1)
+            case MO_MEAS_ACTIVE_INTERFERE: {                         // DIAGONAL: no boundary H, xb; INTERFERE: boundary H, zb
+                bool interfere = ((MdamOp)p.kind[i]==MO_MEAS_ACTIVE_INTERFERE);
+                int q=s.slot2id[a1]; if(q<0) break;
+                if(interfere){ s.engine.h(q); if(compile) sf.fwd_h(q); }   // boundary h: last op of region mag (interfere only)
+                bool fmatch = (mag<(int)cp.maps.size() && cp.maps[mag].valid && cur_match);
+                if(compile){ emit_map(mag); read_phases(pp_b); }   // boundary forward map + boundary phases
+                else if(mag<(int)cp.maps.size() && cp.maps[mag].valid){
+                    st.regions_total++; apply_map(mag); pp_b=pred;  // pp_b = compiled (chained) boundary
+                    if(fmatch){ st.regions_match++; st.phase_checks++; read_phases(live);
+                        bool bad=false; for(int o=0;o<twoN;o++) if(pred[o]!=live[o]){ bad=true;
+                            if(st.first_bad_slot<0){ st.first_bad_region=mag; st.first_bad_slot=o; } }
+                        if(bad) st.phase_mismatch++; }
+                    else st.regions_variant++;
+                }
+                std::vector<int> Mkey = s.engine.M;                // boundary M-vector = commit-variant key
+                long ag0 = s.engine.ag_fired;                       // detect stabilizer-branch rebuild
+                foldxlog.clear(); s.engine.foldx_log=&foldxlog;   // capture commit foldx (dense byproduct)
+                int b=s.measure_z(q);
+                s.engine.foldx_log=nullptr;
+                bool rebuilt = (s.engine.ag_fired > ag0);           // ag_measure rebuilt the inverse phases
+                if(mag<(int)cp.maps.size()){ JRegionMap& m=cp.maps[mag];
+                    std::vector<uint8_t> pc; read_phases(pc);       // post-commit live phases
+                    if(compile){ capture_masks(m.post_ax,m.post_az);
+                        if(!rebuilt){ std::vector<uint8_t> tmp=pp_b; apply_foldx(tmp,m,foldxlog);
+                            JCommitVariant cv; cv.M_key=Mkey; cv.rfd.assign(twoN,0);
+                            for(int o=0;o<twoN;o++) cv.rfd[o]=(uint8_t)((pc[o]-tmp[o])&3);
+                            m.commits.push_back(cv); } }
+                    else if(rebuilt){ st.commit_rebuild++; ppin=pc; }  // stabilizer rebuild: re-sync (separate case)
+                    else {
+                        bool cmatch=masks_eq(m.post_ax,m.post_az); if(!cmatch) st.commit_maskbad++;
+                        int vi=-1; for(size_t k=0;k<m.commits.size();k++) if(m.commits[k].M_key==Mkey){ vi=(int)k; break; }
+                        if(vi<0){                                   // new M-variant: capture rfd from live, count
+                            std::vector<uint8_t> tmp=pp_b; apply_foldx(tmp,m,foldxlog);
+                            JCommitVariant cv; cv.M_key=Mkey; cv.rfd.assign(twoN,0);
+                            for(int o=0;o<twoN;o++) cv.rfd[o]=(uint8_t)((pc[o]-tmp[o])&3);
+                            m.commits.push_back(cv); st.commit_new_variant++; ppin=pc;   // chain exact
+                        } else {                                    // known variant: predict + compare + chain
+                            std::vector<uint8_t> pa=pp_b;
+                            for(int o=0;o<twoN;o++) pa[o]=(uint8_t)((pa[o]+m.commits[vi].rfd[o])&3);
+                            apply_foldx(pa,m,foldxlog);
+                            st.commit_checks++; bool bad=false;
+                            for(int o=0;o<twoN;o++) if(pa[o]!=pc[o]){ bad=true;
+                                if(st.first_bad_commit_region<0) st.first_bad_commit_region=mag; }
+                            if(bad) st.commit_mismatch++;
+                            ppin=pa;                                // CHAIN: carry compiled phase_pack forward
+                        }
+                    }
+                }
+                mag++;
+                if(compile) start_region_compile(mag);
+                else cur_match=mask_match_ref(mag);                // next region forward gate (NO re-sync)
+                s.slot2id[a1]=-1;
+                int m_abs=b ^ (interfere ? s.frame.zb(a1) : s.frame.xb(a1));
+                s.record.set((uint32_t)i0, m_abs^i1);
+                s.frame.set_xz(a1,(uint8_t)m_abs,0);
+            } break;
             default: break;
         }
     }
@@ -515,15 +743,13 @@ struct JFast2CStats { long opcode_dispatch=0, reconstructs=0, pullback_calls=0, 
 inline int run_jfast_2c(MdamShot& s, const MdamProgram& p, const CompiledMdamProgram& cp,
                         const JPhaseCompiled& jp, JFast2CStats& st){
     if(!cp.fast_ok){ s.err="run_jfast_2c: fast sig unsupported"; return 1; }
+    s.engine.lazy_inverse=false;   // fast path maintains/reconstructs the inverse frame explicitly
     int n=s.engine.n, twoN=2*n;
-    uint64_t theta_sig=cp.theta_init, rec_sig=cp.rec_init;
+    int j_tw=cp.theta_words, j_rw=cp.rec_words; uint64_t theta_sig[SIG_MAX_WORDS], rec_sig[SIG_MAX_WORDS]; for(int j_w=0;j_w<j_tw;j_w++) theta_sig[j_w]=cp.theta_init[j_w]; for(int j_w=0;j_w<j_rw;j_w++) rec_sig[j_w]=cp.rec_init[j_w];
     s.sampler.log_on=true; s.sampler.noapply=true; s.sampler.fire_log.clear(); size_t fire_cur=0;
     std::vector<uint8_t> pp(twoN,0), bnd(twoN,0);
-    auto fire_dynbit=[&](int site,uint64_t xw,uint64_t zw)->int{ const NoiseSite& stt=p.noise_sites[site];
-        for(size_t c=0;c<stt.channels.size();c++){ const NoiseChannel& ch=stt.channels[c];
-            uint64_t cx=ch.x_words.empty()?0:ch.x_words[0], cz=ch.z_words.empty()?0:ch.z_words[0];
-            if(cx==xw&&cz==zw) return cp.dyn.noise_base[site]+(int)c; } return -1; };
-    auto fire=[&](int e){ if(e<0) return; theta_sig^=cp.ev_theta[e]; rec_sig^=cp.ev_rec[e]; };
+    auto fire_dynbit=[&](int site,uint64_t ci,uint64_t)->int{ return cp.dyn.noise_base[site]+(int)ci; };   // fire_log stores the channel index (multiword-safe)
+    auto fire=[&](int e){ if(e<0) return; for(int j_w=0;j_w<j_tw;j_w++) theta_sig[j_w]^=cp.ev_theta[(size_t)e*j_tw+j_w]; for(int j_w=0;j_w<j_rw;j_w++) rec_sig[j_w]^=cp.ev_rec[(size_t)e*j_rw+j_w]; };
     auto drain=[&](){ for(;fire_cur<s.sampler.fire_log.size();++fire_cur){ auto&f=s.sampler.fire_log[fire_cur];
         fire(fire_dynbit((int)f[0],f[1],f[2])); } };
     auto fwd_map=[&](int mag){ const JRegionMap& m=jp.maps[mag];   // bnd = A·pp + b
@@ -548,14 +774,14 @@ inline int run_jfast_2c(MdamShot& s, const MdamProgram& p, const CompiledMdamPro
                 while(mask){ int tgt=__builtin_ctzll(mask); mask&=mask-1; if(tgt==a1) continue;
                     int u=s.slot2id[a1],v=s.slot2id[tgt]; if(u>=0&&v>=0) s.engine.cz_noinv(u,v); } } break;
             case MO_ARRAY_S: { int q=s.slot2id[a1]; if(q>=0) s.engine.s_noinv(q,false); } break;
-            case MO_ARRAY_T: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)((theta_sig>>rot_i)&1);
+            case MO_ARRAY_T: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)(JSIGBIT(theta_sig,rot_i));
                 s.engine.apply_rotation(q, xb?-NV_T_ANGLE:NV_T_ANGLE); } rot_i++; } break;
-            case MO_ARRAY_T_DAG: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)((theta_sig>>rot_i)&1);
+            case MO_ARRAY_T_DAG: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)(JSIGBIT(theta_sig,rot_i));
                 s.engine.apply_rotation(q, xb?NV_T_ANGLE:-NV_T_ANGLE); } rot_i++; } break;
             case MO_EXPAND_T: { s.newq(a1); int q=s.slot2id[a1]; s.engine.h_noinv(q);
-                int xb=(int)((theta_sig>>rot_i)&1); s.engine.apply_rotation(q, xb?-NV_T_ANGLE:NV_T_ANGLE); rot_i++; } break;
+                int xb=(int)(JSIGBIT(theta_sig,rot_i)); s.engine.apply_rotation(q, xb?-NV_T_ANGLE:NV_T_ANGLE); rot_i++; } break;
             case MO_EXPAND_T_DAG: { s.newq(a1); int q=s.slot2id[a1]; s.engine.h_noinv(q);
-                int xb=(int)((theta_sig>>rot_i)&1); s.engine.apply_rotation(q, xb?NV_T_ANGLE:-NV_T_ANGLE); rot_i++; } break;
+                int xb=(int)(JSIGBIT(theta_sig,rot_i)); s.engine.apply_rotation(q, xb?NV_T_ANGLE:-NV_T_ANGLE); rot_i++; } break;
             case MO_SWAP_MEAS_INTERFERE: {
                 int i_1=s.slot2id[a1], i_2=s.slot2id[a2]; s.slot2id[a1]=-1; s.slot2id[a2]=-1;
                 if(i_1>=0) s.slot2id[a2]=i_1; if(i_2>=0) s.slot2id[a1]=i_2;
@@ -578,7 +804,7 @@ inline int run_jfast_2c(MdamShot& s, const MdamProgram& p, const CompiledMdamPro
     }
     s.sampler.log_on=false; s.sampler.noapply=false;
     st.imem_miss = s.imem_misses;
-    int nm=p.num_measurements; for(int r=0;r<nm;r++) s.record.bits[r]=(uint8_t)((rec_sig>>r)&1);
+    int nm=p.num_measurements; for(int r=0;r<nm;r++) s.record.bits[r]=(uint8_t)(JSIGBIT(rec_sig,r));
     return s.err?1:0;
 }
 
@@ -605,16 +831,14 @@ inline uint64_t* j2d_cyc(){ static uint64_t c[4]={0,0,0,0}; return c; }
 inline int run_jfast_2d(MdamShot& s, const MdamProgram& p, const CompiledMdamProgram& cp,
                         JPhaseCompiled& jp, JFast2DStats& st){
     if(!cp.fast_ok){ s.err="run_jfast_2d: fast sig unsupported"; return 1; }
+    s.engine.lazy_inverse=false;   // fast path maintains/reconstructs the inverse frame explicitly
     int n=s.engine.n, twoN=2*n;
-    uint64_t theta_sig=cp.theta_init, rec_sig=cp.rec_init;
+    int j_tw=cp.theta_words, j_rw=cp.rec_words; uint64_t theta_sig[SIG_MAX_WORDS], rec_sig[SIG_MAX_WORDS]; for(int j_w=0;j_w<j_tw;j_w++) theta_sig[j_w]=cp.theta_init[j_w]; for(int j_w=0;j_w<j_rw;j_w++) rec_sig[j_w]=cp.rec_init[j_w];
     s.sampler.log_on=true; s.sampler.noapply=true; s.sampler.fire_log.clear(); size_t fire_cur=0;
     std::vector<uint8_t> pp(twoN,0), bnd(twoN,0); std::vector<int> foldxlog;
     int dbg=j2d_dbg(), tm=j2d_time(); uint64_t* C=j2d_cyc(); uint64_t _tsh=tm?__rdtsc():0;
-    auto fire_dynbit=[&](int site,uint64_t xw,uint64_t zw)->int{ const NoiseSite& stt=p.noise_sites[site];
-        for(size_t c=0;c<stt.channels.size();c++){ const NoiseChannel& ch=stt.channels[c];
-            uint64_t cx=ch.x_words.empty()?0:ch.x_words[0], cz=ch.z_words.empty()?0:ch.z_words[0];
-            if(cx==xw&&cz==zw) return cp.dyn.noise_base[site]+(int)c; } return -1; };
-    auto fire=[&](int e){ if(e<0) return; theta_sig^=cp.ev_theta[e]; rec_sig^=cp.ev_rec[e]; };
+    auto fire_dynbit=[&](int site,uint64_t ci,uint64_t)->int{ return cp.dyn.noise_base[site]+(int)ci; };   // fire_log stores the channel index (multiword-safe)
+    auto fire=[&](int e){ if(e<0) return; for(int j_w=0;j_w<j_tw;j_w++) theta_sig[j_w]^=cp.ev_theta[(size_t)e*j_tw+j_w]; for(int j_w=0;j_w<j_rw;j_w++) rec_sig[j_w]^=cp.ev_rec[(size_t)e*j_rw+j_w]; };
     auto drain=[&](){ for(;fire_cur<s.sampler.fire_log.size();++fire_cur){ auto&f=s.sampler.fire_log[fire_cur];
         fire(fire_dynbit((int)f[0],f[1],f[2])); } };
     auto fwd_map=[&](int mag){ const JRegionMap& m=jp.maps[mag];
@@ -653,14 +877,14 @@ inline int run_jfast_2d(MdamShot& s, const MdamProgram& p, const CompiledMdamPro
                 while(mask){ int tgt=__builtin_ctzll(mask); mask&=mask-1; if(tgt==a1) continue;
                     int u=s.slot2id[a1],v=s.slot2id[tgt]; if(u>=0&&v>=0&&!(dbg&J2D_SKIP_ENGINE)) s.engine.cz_noinv(u,v); } } break;
             case MO_ARRAY_S: { int q=s.slot2id[a1]; if(q>=0&&!(dbg&J2D_SKIP_ENGINE)) s.engine.s_noinv(q,false); } break;
-            case MO_ARRAY_T: { int q=s.slot2id[a1]; if(q>=0&&!(dbg&J2D_SKIP_ROT)){ int xb=(int)((theta_sig>>rot_i)&1);
+            case MO_ARRAY_T: { int q=s.slot2id[a1]; if(q>=0&&!(dbg&J2D_SKIP_ROT)){ int xb=(int)(JSIGBIT(theta_sig,rot_i));
                 s.engine.apply_rotation(q, xb?-NV_T_ANGLE:NV_T_ANGLE); } rot_i++; } break;
-            case MO_ARRAY_T_DAG: { int q=s.slot2id[a1]; if(q>=0&&!(dbg&J2D_SKIP_ROT)){ int xb=(int)((theta_sig>>rot_i)&1);
+            case MO_ARRAY_T_DAG: { int q=s.slot2id[a1]; if(q>=0&&!(dbg&J2D_SKIP_ROT)){ int xb=(int)(JSIGBIT(theta_sig,rot_i));
                 s.engine.apply_rotation(q, xb?NV_T_ANGLE:-NV_T_ANGLE); } rot_i++; } break;
             case MO_EXPAND_T: { s.newq(a1); int q=s.slot2id[a1]; if(!(dbg&J2D_SKIP_ENGINE)) s.engine.h_noinv(q);
-                int xb=(int)((theta_sig>>rot_i)&1); if(!(dbg&J2D_SKIP_ROT)) s.engine.apply_rotation(q, xb?-NV_T_ANGLE:NV_T_ANGLE); rot_i++; } break;
+                int xb=(int)(JSIGBIT(theta_sig,rot_i)); if(!(dbg&J2D_SKIP_ROT)) s.engine.apply_rotation(q, xb?-NV_T_ANGLE:NV_T_ANGLE); rot_i++; } break;
             case MO_EXPAND_T_DAG: { s.newq(a1); int q=s.slot2id[a1]; if(!(dbg&J2D_SKIP_ENGINE)) s.engine.h_noinv(q);
-                int xb=(int)((theta_sig>>rot_i)&1); if(!(dbg&J2D_SKIP_ROT)) s.engine.apply_rotation(q, xb?NV_T_ANGLE:-NV_T_ANGLE); rot_i++; } break;
+                int xb=(int)(JSIGBIT(theta_sig,rot_i)); if(!(dbg&J2D_SKIP_ROT)) s.engine.apply_rotation(q, xb?NV_T_ANGLE:-NV_T_ANGLE); rot_i++; } break;
             case MO_SWAP_MEAS_INTERFERE: {
                 int i_1=s.slot2id[a1], i_2=s.slot2id[a2]; s.slot2id[a1]=-1; s.slot2id[a2]=-1;
                 if(i_1>=0) s.slot2id[a2]=i_1; if(i_2>=0) s.slot2id[a1]=i_2;
@@ -707,7 +931,7 @@ inline int run_jfast_2d(MdamShot& s, const MdamProgram& p, const CompiledMdamPro
     }
     s.sampler.log_on=false; s.sampler.noapply=false;
     st.imem_miss = s.imem_misses;
-    int nm=p.num_measurements; if(!(dbg&J2D_SKIP_RECORD)) for(int r=0;r<nm;r++) s.record.bits[r]=(uint8_t)((rec_sig>>r)&1);
+    int nm=p.num_measurements; if(!(dbg&J2D_SKIP_RECORD)) for(int r=0;r<nm;r++) s.record.bits[r]=(uint8_t)(JSIGBIT(rec_sig,r));
     if(tm) C[0]+=__rdtsc()-_tsh;
     return s.err?1:0;
 }
@@ -772,12 +996,13 @@ inline uint64_t* j2e_cyc(){ static uint64_t c[16]={0}; return c; }
 inline int run_jfast_2e(MdamShot& s, const MdamProgram& p, const CompiledMdamProgram& cp,
                         JPhaseCompiled& jp, JFast2EStats& st, int cmode){
     if(!cp.fast_ok){ s.err="run_jfast_2e: fast sig unsupported"; return 1; }
+    s.engine.lazy_inverse=false;   // fast path reconstructs the inverse frame at boundaries (reads .ax/.az directly)
     bool shadow=(cmode==1), dense_only=(cmode==2||cmode==3||cmode==4||cmode==5), use_bplan=(cmode==3||cmode==4||cmode==5);
     bool kshadow=(cmode==4);   // Gate K Step-2: maintain+verify the boundary-edge cache (NO live skip)
     bool kfast=(cmode==5);     // Gate K Step-4A: FAST — full edge HIT skips boundary_load/imem/dense/commit
     int n=s.engine.n, twoN=2*n;
     if(kshadow||kfast){ s.cur_sid=s.intern_state(s.engine.dense.resident.data(), s.engine.dense.r); s.dense_sid=s.cur_sid; }   // Step-4B-1: id of the initial resident state; Step-4B-4: engine.dense holds it (live)
-    uint64_t theta_sig=cp.theta_init, rec_sig=cp.rec_init;
+    int j_tw=cp.theta_words, j_rw=cp.rec_words; uint64_t theta_sig[SIG_MAX_WORDS], rec_sig[SIG_MAX_WORDS]; for(int j_w=0;j_w<j_tw;j_w++) theta_sig[j_w]=cp.theta_init[j_w]; for(int j_w=0;j_w<j_rw;j_w++) rec_sig[j_w]=cp.rec_init[j_w];
     s.sampler.log_on=true; s.sampler.noapply=true; s.sampler.fire_log.clear(); size_t fire_cur=0;
     std::vector<uint8_t> pp(twoN,0), bnd(twoN,0); std::vector<int> foldxlog;
     std::vector<uint8_t> fb_prev; if(shadow) fb_prev.assign(4*n,0);   // post-commit phase of prev boundary
@@ -785,11 +1010,8 @@ inline int run_jfast_2e(MdamShot& s, const MdamProgram& p, const CompiledMdamPro
     int dbg=j2e_dbg(), tm=j2e_time(); uint64_t* C=j2e_cyc(); uint64_t _tsh=tm?__rdtsc():0;
     int nmode=j2e_noise_mode();   // 0 full / 1 draw-only / 2 off (timing-only)
     int nskip=j2e_noise_skip();   // 1 = skip-to-next-fire (visit only blocks containing next_idx), 0 = per-site loop
-    auto fire_dynbit=[&](int site,uint64_t xw,uint64_t zw)->int{ const NoiseSite& stt=p.noise_sites[site];
-        for(size_t c=0;c<stt.channels.size();c++){ const NoiseChannel& ch=stt.channels[c];
-            uint64_t cx=ch.x_words.empty()?0:ch.x_words[0], cz=ch.z_words.empty()?0:ch.z_words[0];
-            if(cx==xw&&cz==zw) return cp.dyn.noise_base[site]+(int)c; } return -1; };
-    auto fire=[&](int e){ if(e<0) return; theta_sig^=cp.ev_theta[e]; rec_sig^=cp.ev_rec[e]; };
+    auto fire_dynbit=[&](int site,uint64_t ci,uint64_t)->int{ return cp.dyn.noise_base[site]+(int)ci; };   // fire_log stores the channel index (multiword-safe)
+    auto fire=[&](int e){ if(e<0) return; for(int j_w=0;j_w<j_tw;j_w++) theta_sig[j_w]^=cp.ev_theta[(size_t)e*j_tw+j_w]; for(int j_w=0;j_w<j_rw;j_w++) rec_sig[j_w]^=cp.ev_rec[(size_t)e*j_rw+j_w]; };
     auto drain=[&](){ for(;fire_cur<s.sampler.fire_log.size();++fire_cur){ auto&f=s.sampler.fire_log[fire_cur];
         fire(fire_dynbit((int)f[0],f[1],f[2])); } };
     auto fwd_map=[&](int mag){ const JRegionMap& m=jp.maps[mag];
@@ -913,16 +1135,24 @@ inline int run_jfast_2e(MdamShot& s, const MdamProgram& p, const CompiledMdamPro
                 while(mask){ int tgt=__builtin_ctzll(mask); mask&=mask-1; if(tgt==a1) continue;
                     int u=s.slot2id[a1],v=s.slot2id[tgt]; if(u>=0&&v>=0&&shadow){ s.engine.cz_noinv(u,v); st.tableau_conj++; } } } break;
             case MO_ARRAY_S: { int q=s.slot2id[a1]; if(q>=0&&shadow){ s.engine.s_noinv(q,false); st.tableau_conj++; } } break;
-            case MO_ARRAY_T: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)((theta_sig>>rot_i)&1); double th=xb?-NV_T_ANGLE:NV_T_ANGLE;
+            case MO_ARRAY_T: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)(JSIGBIT(theta_sig,rot_i)); double th=xb?-NV_T_ANGLE:NV_T_ANGLE;
                 if(!(dbg&J2E_SKIP_CAP)) cap(rot_i,th); if(shadow){ s.engine.apply_rotation(q,th); st.pending_create_rot++; } } rot_i++; } break;
-            case MO_ARRAY_T_DAG: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)((theta_sig>>rot_i)&1); double th=xb?NV_T_ANGLE:-NV_T_ANGLE;
+            case MO_ARRAY_T_DAG: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)(JSIGBIT(theta_sig,rot_i)); double th=xb?NV_T_ANGLE:-NV_T_ANGLE;
                 if(!(dbg&J2E_SKIP_CAP)) cap(rot_i,th); if(shadow){ s.engine.apply_rotation(q,th); st.pending_create_rot++; } } rot_i++; } break;
             case MO_EXPAND_T: { s.newq(a1); int q=s.slot2id[a1]; if(shadow){ s.engine.h_noinv(q); st.tableau_conj++; }
-                int xb=(int)((theta_sig>>rot_i)&1); double th=xb?-NV_T_ANGLE:NV_T_ANGLE;
+                int xb=(int)(JSIGBIT(theta_sig,rot_i)); double th=xb?-NV_T_ANGLE:NV_T_ANGLE;
                 if(!(dbg&J2E_SKIP_CAP)) cap(rot_i,th); if(shadow){ s.engine.apply_rotation(q,th); st.pending_create_rot++; } rot_i++; } break;
             case MO_EXPAND_T_DAG: { s.newq(a1); int q=s.slot2id[a1]; if(shadow){ s.engine.h_noinv(q); st.tableau_conj++; }
-                int xb=(int)((theta_sig>>rot_i)&1); double th=xb?NV_T_ANGLE:-NV_T_ANGLE;
+                int xb=(int)(JSIGBIT(theta_sig,rot_i)); double th=xb?NV_T_ANGLE:-NV_T_ANGLE;
                 if(!(dbg&J2E_SKIP_CAP)) cap(rot_i,th); if(shadow){ s.engine.apply_rotation(q,th); st.pending_create_rot++; } rot_i++; } break;
+            // ---- Gate L: coherent rotations (arbitrary-theta dv; xb from compiled theta_sig) + slot relabel ----
+            case MO_ARRAY_ROT: { int q=s.slot2id[a1]; if(q>=0){ int xb=(int)(JSIGBIT(theta_sig,rot_i)); double th=xb?-dv:dv;
+                if(!(dbg&J2E_SKIP_CAP)) cap(rot_i,th); if(shadow){ s.engine.apply_rotation(q,th); st.pending_create_rot++; } } rot_i++; } break;
+            case MO_EXPAND_ROT: { s.newq(a1); int q=s.slot2id[a1]; if(shadow){ s.engine.h_noinv(q); st.tableau_conj++; }
+                int xb=(int)(JSIGBIT(theta_sig,rot_i)); double th=xb?-dv:dv;
+                if(!(dbg&J2E_SKIP_CAP)) cap(rot_i,th); if(shadow){ s.engine.apply_rotation(q,th); st.pending_create_rot++; } rot_i++; } break;
+            case MO_ARRAY_SWAP: { int i_1=s.slot2id[a1], i_2=s.slot2id[a2]; s.slot2id[a1]=-1; s.slot2id[a2]=-1;
+                if(i_1>=0) s.slot2id[a2]=i_1; if(i_2>=0) s.slot2id[a1]=i_2; } break;   // frame compiled away -> slot relabel only
             case MO_SWAP_MEAS_INTERFERE: {
                 int i_1=s.slot2id[a1], i_2=s.slot2id[a2]; s.slot2id[a1]=-1; s.slot2id[a2]=-1;
                 if(i_1>=0) s.slot2id[a2]=i_1; if(i_2>=0) s.slot2id[a1]=i_2;
@@ -1041,12 +1271,116 @@ inline int run_jfast_2e(MdamShot& s, const MdamProgram& p, const CompiledMdamPro
                 int e=cp.dyn.outcome_base+mag; if(b) fire(e);
                 s.slot2id[a2]=-1;
             } break;
+            case MO_MEAS_ACTIVE_DIAGONAL:                            // Gate L: coherent active measure boundary (no swap; slot a1)
+            case MO_MEAS_ACTIVE_INTERFERE: {                         // DIAGONAL: no boundary H; INTERFERE: boundary H. rec parity baked in rec_sig.
+                bool interfere = ((MdamOp)p.kind[i]==MO_MEAS_ACTIVE_INTERFERE);
+                int q=s.slot2id[a1]; if(q<0){ mag_i++; break; }
+                int mag=mag_i; mag_i++;
+                if(kfast){
+                    kM_in=s.engine.M;
+                    cthetas.clear(); for(uint32_t uid : s.core_cache[mag]) cthetas.push_back(uid<s.fb_theta.size()?s.fb_theta[uid]:0.0);
+                    uint64_t key=kkey(s.cur_sid, kM_in, pp, &cthetas);        // Step-4B-2: key on the carried pre-fwd_map pp
+                    MdamShot::KEdge* he=nullptr;
+                    if(mag<(int)s.kcache.size()){ auto it=s.kcache[mag].find(key); if(it!=s.kcache[mag].end()) he=&it->second; }
+                    bool handled=false;
+                    if(he && !he->antis){
+                        bool okraw=(he->sid_in==s.cur_sid && he->M_in==kM_in && he->pp_in==pp && he->th_in==cthetas);
+                        if(okraw){
+                            double rv=s.udraw();
+                            int bb=(rv<he->p0)?0:1;
+                            if(he->has[bb]){                                 // FULL HIT on the drawn branch
+                                s.k_full_hit++;
+                                s.engine.M=he->Mout[bb]; pp=he->ppout[bb]; s.cur_sid=he->next_sid[bb];
+                                for(int i=0;i<n;i++){ s.engine.tableau.Xc[i].phase=he->tphase[bb][2*i]; s.engine.tableau.Zc[i].phase=he->tphase[bb][2*i+1]; }
+                                s.magic_point++; s.magic_seen++; if(he->oracle) s.magic_oracle++; else s.magic_compiled++;
+                                int e=cp.dyn.outcome_base+mag; if(bb) fire(e);
+                                s.slot2id[a1]=-1; break;                     // boundary_load/imem/dense/commit all SKIPPED
+                            }
+                            s.kfast_inj_rv=rv; s.kfast_use_inj=true; s.k_partial++; handled=true;
+                        }
+                    }
+                    if(!handled){ s.k_miss5++; if(he && he->antis) s.k_antis_live++; }
+                    if(s.dense_sid!=s.cur_sid){ s.materialize_dense(s.cur_sid); s.dense_sid=s.cur_sid; s.k_materialize++; }
+                }
+                uint64_t _tb=tm?__rdtsc():0;
+                if(shadow){ if(interfere){ s.engine.h_noinv(q); st.tableau_conj++; } s.fb_shadow_boundary(mag, fb_prev); }   // INTERFERE-only boundary H + verify
+                else if(!(dbg&J2E_SKIP_BNDLOAD)){ s.fb_load_boundary(mag); st.boundary_loads++;             // load snapshot (incl. boundary h for INTERFERE; none for DIAGONAL)
+                       if(mag<(int)s.fb_snap.size()) st.boundary_pending += (long)s.fb_snap[mag].puid.size(); }
+                if(tm) C[2]+=__rdtsc()-_tb;
+                if(!(dbg&J2E_SKIP_FWDMAP)){ fwd_map(mag); if(kfast) s.k_fwdmap++; }
+                uint64_t _tm=tm?__rdtsc():0;
+                const JRegionMap& m=jp.maps[mag];
+                StaticPlan* pcp=nullptr; MdamShot::ImemEntry* ie=nullptr; int cvi=-1; bool compiled_fast=false;
+                if(use_bplan){
+                    uint64_t mpack=imem_mpack(s.engine.M);
+                    MdamShot::BoundaryVariant* bv=bplan_resolve(mag, mpack, s.engine.M); st.bplan_resolve++;
+                    if(bv->compiled){
+                        cvi=bv->commit_idx; pcp=&s.plan_cache[mag][bv->plan_idx];
+                        uint64_t ikey=(uint64_t)mag | (ip_of(bnd)<<4) | (mpack<<(4+4*n)); st.imem_keybuild++;
+                        ie=imem_find(ikey); st.imem_probe++; compiled_fast=(ie!=nullptr);
+                    }
+                } else {
+                    std::vector<int> Mkey = s.engine.M;
+                    cvi = commit_find(mag, Mkey);
+                    if(plan_compiled(mag, Mkey) && cvi>=0 && s.imem.count(imem_key(mag,bnd,Mkey))){
+                        compiled_fast=true; pcp=plan_find(mag,Mkey); ie=imem_find(imem_key(mag,bnd,Mkey)); }
+                }
+                foldxlog.clear(); s.engine.foldx_log=&foldxlog;
+                if(kshadow||kfast){ k_sid_in=s.cur_sid; kM_in=s.engine.M; k_pp_in=pp; }
+                double kp0=-2.0;
+                int b;
+                if(compiled_fast && dense_only){
+                    st.compiled_fast++;
+                    cthetas.clear(); for(uint32_t uid : s.core_cache[mag]) cthetas.push_back(uid<s.fb_theta.size()?s.fb_theta[uid]:0.0);
+                    double rv=s.udraw();
+                    s.engine.inverse_off=true;
+                    b=magic_compiled_fast(s.engine,*pcp,ie->rpp,ie->sign,cthetas,rv,s.magic_scratch, (kshadow||kfast)?&kp0:nullptr);
+                    s.engine.inverse_off=false; st.dense_only_calls++;
+                    s.magic_point++; s.magic_seen++; s.magic_compiled++;
+                    for(int o=0;o<twoN;o++) pp[o]=(uint8_t)((bnd[o]+jp.maps[mag].commits[cvi].rfd[o])&3);
+                    apply_foldx(pp, m, foldxlog); st.phasepack_updates++;
+                    if(kshadow||kfast) kverify(mag,false,&ie->rpp,ie->sign,&cthetas,b,kp0);
+                } else if(compiled_fast){
+                    s.engine.set_inverse_phases(bnd.data());
+                    s.engine.inverse_off=true; b=s.measure_z(q); s.engine.inverse_off=false; st.generic_measure_calls++;
+                    for(int o=0;o<twoN;o++) pp[o]=(uint8_t)((bnd[o]+jp.maps[mag].commits[cvi].rfd[o])&3);
+                    apply_foldx(pp, m, foldxlog); st.compiled_fast++;
+                } else {
+                    Mpre.assign(s.engine.M.begin(), s.engine.M.end());
+                    ORC_T(0, s.engine.reconstruct_inverse(m.bnd_ax, m.bnd_az, bnd.data())); st.reconstructs++;
+                    long pb0=s.engine.pullback_calls; int mo0=s.magic_oracle;
+                    ORC_T(7, b=s.measure_z(q)); st.generic_measure_calls++;
+                    st.pullback_calls += (s.engine.pullback_calls-pb0);
+                    bool is_oracle=(s.magic_oracle>mo0); if(is_oracle) st.oracle_count++; else st.cold_fallback++;
+                    ORC_T(6, s.engine.read_phase_pack(pp.data()));
+                    if(!is_oracle && cvi<0){
+                        std::vector<uint8_t> tmp=bnd; apply_foldx(tmp, m, foldxlog);
+                        JCommitVariant ncv; ncv.M_key=Mpre; ncv.rfd.assign(twoN,0);
+                        for(int o=0;o<twoN;o++) ncv.rfd[o]=(uint8_t)((pp[o]-tmp[o])&3);
+                        if(jp.maps[mag].post_ax.empty()){ jp.maps[mag].post_ax.resize(n); jp.maps[mag].post_az.resize(n);
+                            for(int ii=0;ii<n;ii++){ jp.maps[mag].post_ax[ii]=s.engine.inverse_frame.ax[ii]; jp.maps[mag].post_ax[ii].phase=0;
+                                                     jp.maps[mag].post_az[ii]=s.engine.inverse_frame.az[ii]; jp.maps[mag].post_az[ii].phase=0; } }
+                        jp.maps[mag].commits.push_back(ncv);
+                    }
+                    if((kshadow||kfast) && is_oracle){
+                        if(s.core_cache[mag].empty()) for(auto* e : s.magic_scratch.core) s.core_cache[mag].push_back(e->uid);
+                        koracle_th.clear(); for(auto* e : s.magic_scratch.core) koracle_th.push_back(e->theta);
+                        kverify(mag,true,nullptr,0.0,&koracle_th,b,s.magic_last_p0); }
+                }
+                s.engine.foldx_log=nullptr;
+                if(tm) C[1]+=__rdtsc()-_tm;
+                if(shadow) s.fb_capture_phase(fb_prev);
+                if(kfast){ s.cur_sid=s.intern_state(s.engine.dense.resident.data(), s.engine.dense.r); s.dense_sid=s.cur_sid; }
+                int e=cp.dyn.outcome_base+mag; if(b) fire(e);
+                s.slot2id[a1]=-1;
+            } break;
+            case MO_ARRAY_H: break;   // active Hadamard: frame H compiled symbolically (compile_jprogram fx<->fz); no engine op (mirrors ARRAY_CNOT/S, which touch the engine in shadow only)
             default: break;
         }
     }
     s.sampler.log_on=false; s.sampler.noapply=false;
     st.imem_miss = s.imem_misses; st.fb_mismatch = s.fb_mismatch;
-    int nm=p.num_measurements; if(!(dbg&J2E_SKIP_RECORD)) for(int r=0;r<nm;r++) s.record.bits[r]=(uint8_t)((rec_sig>>r)&1);
+    int nm=p.num_measurements; if(!(dbg&J2E_SKIP_RECORD)) for(int r=0;r<nm;r++) s.record.bits[r]=(uint8_t)(JSIGBIT(rec_sig,r));
     if(tm){ C[0]+=__rdtsc()-_tsh; C[9]+=s.sampler.draws; C[10]+=(uint64_t)s.sampler.fire_log.size(); }   // per-shot noise RNG draws + fires (gap-sampling: draws ~ fires+1)
     return s.err?1:0;
 }

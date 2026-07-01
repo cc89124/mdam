@@ -1,8 +1,0 @@
-circuit,total_rotations,ever_flushed_rotations,never_flushed_rotations,never_ratio,max_pending_rot_before,max_nc_core_rot,max_nc_core_qubits,max_clifft_active_rank,max_nc_state_log2_transient,max_nc_state_log2_resident,max_state_gap_log2,avg_state_gap_log2,sum_2_nc_core_qubits
-coherent_d5_r5,546,499,47,0.0861,165,16,13,24,13,12,21,6.444,328768
-coherent_d3_r3,97,81,16,0.1649,52,14,5,8,5,4,5,2.188,224
-distillation,10,10,0,0.0,10,6,3,5,3,2,2,1.0,14
-cultivation_d3,29,29,0,0.0,14,14,4,4,4,3,0,0.0,58
-cultivation_d5,91,91,0,0.0,38,38,10,10,10,10,1,0.0,4049
-coherent_d3_r1,25,0,25,1.0,25,0,0,5,0,0,5,3.75,8
-coherent_d5_r1,82,0,82,1.0,82,0,0,13,0,0,13,9.75,24

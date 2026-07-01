@@ -1,9 +1,0 @@
-flushes=91  measurements=15  AG-measures(Clifford-frame updates)=0
-distinct (qubit,incarnation) cells with generators = 32
-  q5 incarnation#1: types=['X', 'Z'] (44 gens)  <-- MIXED -> needs >=1 runtime H
-  q14 incarnation#1: types=['X', 'Z'] (39 gens)  <-- MIXED -> needs >=1 runtime H
-
-incarnations per conflict qubit: q5=[0, 1] q14=[0, 1]
-(qubit,incarnation) cells with MIXED single-qubit Pauli = 2
-=> minimum runtime H under per-incarnation born-basis (consistency lower bound) = 2
-   if 0: each axis incarnation is single-basis -> H absorbed at promote -> 0 runtime H (matches clifft)

@@ -1,0 +1,5 @@
+== distillation: fblock modes 1/2/3 vs authoritative, 8 seeds x 4000 shots: mismatch=0  OK
+   carry ns/shot (interleaved 15 reps): OFF=28606  ON=16594  Clifft=17946  hit=95.2%
+     fblock saves 12012 ns (42.0%) | ON/Clifft=0.92x (MDAM faster by 1352 ns)
+
+ALL FBLOCK CHECKS PASS

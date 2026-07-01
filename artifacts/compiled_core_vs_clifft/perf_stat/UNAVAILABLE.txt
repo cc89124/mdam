@@ -1,1 +1,0 @@
-perf stat unavailable: kernel.perf_event_paranoid=4 (needs CAP_PERFMON/CAP_SYS_ADMIN). §20 hardware counters skipped; wall analysis relies on RELEASE-build timers + PROFILE-build FLOP counters instead.

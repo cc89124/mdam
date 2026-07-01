@@ -7,26 +7,23 @@ bit-exact to the authoritative Python runtime. The native path is **default OFF*
 (`run_shot` / `sample_batch`) is the reference oracle and is never modified by the native code.
 
 Result on cultivation_d3: **~1.08–1.10× Clifft, bit-exact, robust across shot counts** (Gate K FAST path).
-Full result write-up: [`../../artifacts/mdam_native_batch_vm/RESULTS.md`](../../artifacts/mdam_native_batch_vm/RESULTS.md).
+Full result write-up: [`../../results/RESULTS.md`](../../results/RESULTS.md).
 Development journey (Gates A–K detail) is archived at `/home/jung/mdam-vm-archive/`.
 
 ## Dependencies (what this connects to)
-- **Build** (C++ only, self-contained under `mdam/`): `native_mdam_vm.cpp` + the dense-core kernel
-  `../clifft_axis/cpp/mdm_core_executor.cpp`. That `.cpp` is a **vendored copy** of the canonical
-  `nearclifford_backend/clifft_axis/cpp/mdm_core_executor.cpp` (the live clifft_axis engine still builds
-  its own `mdm_core_release.so` from the canonical file). The kernel includes only stdlib headers.
-- **Verify / runtime oracle** (Python, live, unchanged): the verify scripts import the authoritative
-  near-Clifford backend `nearclifford_backend.backend` (`_opname`, `count_idents`) and
-  `ttn_backend.frame_layer` to `translate()` a circuit into the native program. These packages live at the
-  repo root and are **NOT** part of `mdam/` — `mdam/native_vm` is the C++ *implementation* that ports and
-  verifies against them. (Scripts resolve them via `sys.path` = repo root; `mdam/native_vm` sits exactly two
-  levels under the root, so all `__file__`-relative paths are unchanged by the move from the old layout.)
+- **Build** (C++ only): `native_mdam_vm.cpp` + the dense-core kernel
+  `../backend/clifft_axis/cpp/mdm_core_executor.cpp` (`mdm_execute_core`, stdlib-only, self-contained).
+- **Verify / runtime oracle** (in-tree Python): the verify scripts import `mdam.backend.backend`
+  (`_opname`, `count_idents`, `NearCliffordBackend`) and `mdam.frame.frame_layer` to `translate()` a circuit
+  into the native program. These are the Python layers the native VM ports and verifies against; they live
+  under `mdam/backend` and `mdam/frame`. (Scripts resolve `mdam` via `sys.path` = repo root; `mdam/native_vm`
+  sits two levels under the root.)
 
 ## Build
 
 ```bash
 ./build.sh        # g++ -O3 -march=native -std=c++17 -DNDEBUG -shared -fPIC
-                  # native_mdam_vm.cpp + ../clifft_axis/cpp/mdm_core_executor.cpp -> native_mdam_vm.so
+                  # native_mdam_vm.cpp + ../backend/clifft_axis/cpp/mdm_core_executor.cpp -> native_mdam_vm.so
 ```
 Reference toolchain (g++ 11.4) produces a byte-identical 387 944-byte `native_mdam_vm.so`.
 
@@ -50,7 +47,7 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 ## Implementation files (the `native_mdam_vm.so` build)
 
 Single TU `native_mdam_vm.cpp` (the C API: `nvm_*` create/run/batch/compile + cmode dispatch) +
-the verified dense kernel `../clifft_axis/cpp/mdm_core_executor.cpp` (`mdm_execute_core`).
+the verified dense kernel `../backend/clifft_axis/cpp/mdm_core_executor.cpp` (`mdm_execute_core`).
 Header layers, bottom-up:
 
 | header | role |

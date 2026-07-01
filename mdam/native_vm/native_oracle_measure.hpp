@@ -21,7 +21,7 @@ inline void oracle_flush_core(NativeDenseEngineState& st, int q, MagicScratch& s
     dynamic_core_scr(st.pending, q, st.W, scr);
     for (auto* e : scr.core) {
         // _flush_one(x,z,theta,phase): pullback -> pp+phase -> _masks(promote) -> lincomb(c,-i s)
-        PackedPauli pb = st.pullback(e->p);
+        pb_kind()=2; PackedPauli pb = st.pullback(e->p);   // flush_pullback
         int pp = (pb.phase + e->p.phase) & 3;
         // _masks(promote=True): promote X-support qubits, then mx/mz over M layout
         for (int qq = 0; qq < st.n; qq++) if (pb.getx(qq)) { bool inM=false; for(int m:st.M) if(m==qq) inM=true; if(!inM) st.promote(qq); }
@@ -66,7 +66,7 @@ inline OracleResult oracle_measure_magic(NativeDenseEngineState& st, int q, Nati
     for (int i = 0; i < st.n; i++) { bool inM=false; for(int m:st.M) if(m==i) inM=true;
         if (!inM && !st.tableau.Zc_commutes_with_Zq(i, q)) return {-1,0.0,false,"stabilizer branch (unsupported for cultivation_d3)"}; }
     PackedPauli Pm_log(st.W); Pm_log.z[PackedPauli::word(q)] = PackedPauli::bit(q);
-    PackedPauli pm = st.pullback(Pm_log);
+    pb_kind()=1; PackedPauli pm = st.pullback(Pm_log);   // oracle Pm_pullback
     double sign;
     int r = oracle_localize(st, pm, q, sign, scr);
     double p0; int outcome;
@@ -77,6 +77,7 @@ inline OracleResult oracle_measure_magic(NativeDenseEngineState& st, int q, Nati
         return {outcome, p0, true, nullptr};
     }
     int jr = -1; for (size_t i=0;i<st.M.size();i++) if (st.M[i]==r) jr=(int)i;
+    dense_flop_collapse() += (uint64_t)12 << st.dense.r;   // collapse (Born+project+norm), == Clifft meas convention
     double s0 = st.branch_sqnorm(jr, 0), s1 = st.branch_sqnorm(jr, 1), tot = s0 + s1;
     p0 = (tot > 1e-300) ? ((sign > 0 ? s0 : s1) / tot) : 0.5;
     p0 = std::max(0.0, std::min(1.0, p0));

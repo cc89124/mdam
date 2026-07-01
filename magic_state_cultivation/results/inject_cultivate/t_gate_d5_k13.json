@@ -1,9 +1,0 @@
-{
-  "circuit": "t_gate",
-  "dcolor": 5,
-  "k": 13,
-  "total_shots": 1000000000,
-  "passed_shots": 43562,
-  "logical_errors": 0,
-  "seconds": 2645.5
-}

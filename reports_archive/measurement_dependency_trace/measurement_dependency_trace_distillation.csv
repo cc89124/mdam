@@ -1,6 +1,0 @@
-circuit,shot_id,meas_idx,step_id,record_id,meas_qubit,pending_rot_before,nc_core_rot,not_needed_this_meas,nc_core_qubits,nc_state_log2_transient,nc_state_log2_resident,clifft_active_rank_at_meas,state_gap_log2,core_rot_ids,core_qubit_ids
-distillation,0,0,332,8,0,10,6,4,3,3,2,5,2,0 1 4 5 6 9,0 1 4
-distillation,0,1,653,25,4,4,2,2,1,2,2,4,2,3 8,3
-distillation,0,2,1003,42,3,2,2,0,1,2,2,3,1,2 7,2
-distillation,0,3,1409,59,1,0,0,0,0,2,1,2,0,,
-distillation,0,4,1856,76,2,0,0,0,0,1,0,1,0,,

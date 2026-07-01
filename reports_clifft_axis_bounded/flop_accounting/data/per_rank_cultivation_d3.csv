@@ -1,6 +1,0 @@
-rank,n_events,flop_bounded,flop_clifft_modeled,win_ratio_cl_bn
-0,1,0,0,
-1,6,32,256,8.00
-2,12,152,608,4.00
-3,36,688,1376,2.00
-4,50,5120,4832,0.94

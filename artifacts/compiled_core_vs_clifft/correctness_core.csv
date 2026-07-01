@@ -1,4 +1,0 @@
-test,n_cases,FAIL,max_p0_err,max_survivor_err,reference
-synthetic_hermitian,1438,0,3.33e-16,1.69e-15,brute-force Kronecker
-real_cores,1146,0,2.33e-15,3.10e-14,python dense oracle
-real_cores_oracle_link,573,0,2.00e-15,-,authoritative oracle p0

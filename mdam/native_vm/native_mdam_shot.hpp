@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <cmath>
 #include <chrono>
 #include <unordered_map>
@@ -38,7 +39,17 @@ enum MdamOp : uint8_t {
     MO_MEAS_DORM_STATIC, MO_MEAS_DORM_RANDOM,
     MO_ARRAY_CNOT, MO_ARRAY_CZ, MO_MULTI_CNOT, MO_MULTI_CZ,
     MO_ARRAY_T, MO_ARRAY_T_DAG, MO_ARRAY_S, MO_EXPAND_T, MO_EXPAND_T_DAG,
-    MO_SWAP_MEAS_INTERFERE, MO_END
+    MO_SWAP_MEAS_INTERFERE,
+    // Gate L1: coherent-circuit opcodes (arbitrary-theta diagonal rotation + active-register meas/swap).
+    // dval[i] carries the rotation angle theta = arg(weight_re + i*weight_im) for ROT/EXPAND_ROT.
+    MO_ARRAY_ROT, MO_EXPAND_ROT, MO_ARRAY_SWAP, MO_MEAS_ACTIVE_DIAGONAL, MO_MEAS_ACTIVE_INTERFERE,
+    // Gate L Tier-3 (de-fused bytecode_passes=None dialect): birth |+> + active Hadamard (no U2/U4).
+    MO_EXPAND, MO_ARRAY_H,
+    // Gate L Tier-3 DIRECT (fused dialect): frame-keyed fused 1q/2q unitaries.  These PRESERVE the
+    // measurement-core localization (maxM) — de-fusing them de-localizes (d5_r5 12->31).  i0 = cp_idx
+    // (node index); the per-in-state decomposition (ZXZ angles / 2q op-list) is precomputed in Python.
+    MO_ARRAY_U2, MO_ARRAY_U4,
+    MO_END
 };
 
 // immutable compiled program (POD), built once in Python
@@ -51,6 +62,18 @@ struct MdamProgram {
     int32_t num_qubits=0, num_measurements=0, engine_n=0, max_work=0;
     int32_t record_cap=0;        // record buffer capacity: covers ALL classical indices incl. feedback
                                  // conditions (which can EXCEED num_measurements; Python's record is a dict)
+    // Gate L Tier-3 DIRECT: precomputed frame-keyed fused-unitary decompositions (compile-time static;
+    // the matrices are constants, only the frame-selected in_state is runtime).  Indexed by cp_idx (i0).
+    // U2: per node, 4 in_states (= 2*zb|xb) -> ZXZ angles (b,c,d) + out frame.  apply Rz(d)Rx(c)Rz(b).
+    int32_t n_u2=0;
+    std::vector<double>  u2_bcd;    // [(cp_idx*4 + in_state)*3 + {0:b,1:c,2:d}]
+    std::vector<uint8_t> u2_out;    // [cp_idx*4 + in_state] -> out frame (bit0=x, bit1=z)
+    // U4: per node, 16 in_states (= 8*zb_hi|4*xb_hi|2*zb_lo|xb_lo) -> op-list + out frame (4 bits: lo x/z, hi x/z).
+    // each op = 5 doubles (type, which, px, pz, theta); type 0=cx(lo->hi) 1=cz 2=rot1(on which: 0=lo 1=hi).
+    int32_t n_u4=0;
+    std::vector<int32_t> u4_start, u4_cnt;   // [cp_idx*16 + in_state] -> first op index / op count
+    std::vector<double>  u4_ops;             // flattened, 5 doubles/op
+    std::vector<uint8_t> u4_out;             // [cp_idx*16 + in_state] -> out frame
 };
 
 // Gate F-B: per-measurement-boundary structural region snapshot.  The audit proves the tableau /
@@ -158,6 +181,306 @@ struct MdamShot {
     inline void materialize_dense(int sid){      // write state_amp[sid] back into the live dense engine
         const std::vector<cd>& a=state_amp[sid]; int rk=(int)__builtin_ctzll(a.size());   // size = 2^rank (always a power of 2)
         engine.dense.set_state(rk, a.data()); }
+
+    // ===== Phase-0/1/2 boundary-edge capture (lightweight semantic-key SUFFICIENCY proof) ==============
+    // Per measurement boundary on the AUTHORITATIVE path (bit-exact vs Python), capture a RICH key
+    // {sid_in, inv_sig, pend_sig, m_sig, frame parity xb/zb, i1, kind, oracle/antis} and the resulting EDGE
+    // {p0, outcome, sid_out, rec}.  A Python harness proves: same (mp,key) -> same p0, and same
+    // (mp,key,outcome) -> same (sid_out, rec).  A mismatch == "key too small" (names the missing field).
+    // Uses ONLY authoritative measure_z, so edges are correct by construction (NO F4/imem/plan/bplan cache).
+    bool bcap_on=false; double bcap_p0=0.0; bool bcap_antis=false;
+    struct BCapRec { int mp; uint32_t sid_in, inv_sig, pend_sig, m_sig; uint8_t xb, zb, i1, kind, oracle, outcome; uint32_t sid_out; uint8_t rec; double p0; };
+    std::vector<BCapRec> bcap;
+    // canonical interner (separate pool; -0.0 -> +0.0 so signed-zero-only differences don't split a state into
+    // two ids, which would read as a spurious "key insufficient").  Persists across shots -> stable global ids.
+    std::unordered_map<uint64_t,std::vector<int>> bcap_intern; std::vector<std::vector<cd>> bcap_amp;
+    std::vector<cd> bcap_buf;
+    int bcap_sid(const cd* a, int rank){
+        size_t N=(size_t)1<<rank; bcap_buf.resize(N);
+        for(size_t j=0;j<N;j++) bcap_buf[j]=cd(a[j].real()+0.0, a[j].imag()+0.0);   // canonicalize signed zero
+        uint64_t fp=dfnv(1469598103934665603ULL, bcap_buf.data(), sizeof(cd)*N);
+        auto& cand=bcap_intern[fp];
+        for(int id:cand){ if(bcap_amp[id].size()==N){ bool eq=true; for(size_t j=0;j<N;j++) if(bcap_amp[id][j]!=bcap_buf[j]){eq=false;break;} if(eq) return id; } }
+        int id=(int)bcap_amp.size(); bcap_amp.emplace_back(bcap_buf); cand.push_back(id); return id; }
+    uint32_t bcap_inv_sig(){ uint64_t h=1469598103934665603ULL; int n=engine.n;
+        for(int i=0;i<n;i++){ uint8_t a=engine.inverse_frame.ax[i].phase, z=engine.inverse_frame.az[i].phase; h=dfnv(h,&a,1); h=dfnv(h,&z,1);} return (uint32_t)(h^(h>>32)); }
+    uint32_t bcap_pend_sig(){ uint64_t h=1469598103934665603ULL;
+        for(auto&e:engine.pending.slots) if(e.generation==engine.pending.gen){ for(int w=0;w<engine.W;w++){ h=dfnv(h,&e.p.x[w],8); h=dfnv(h,&e.p.z[w],8);} h=dfnv(h,&e.p.phase,1); double th=e.theta; h=dfnv(h,&th,8);} return (uint32_t)(h^(h>>32)); }
+    uint32_t bcap_m_sig(){ uint64_t h=1469598103934665603ULL; for(int m:engine.M){ int mm=m; h=dfnv(h,&mm,sizeof(int)); } return (uint32_t)(h^(h>>32)); }
+
+    // ===== Phase-3: authoritative-edge cache (run_mcache) =============================================
+    // Proven (bcap) design: a lightweight semantic key K=(mp,kind,sid_in,inv_sig,pend_sig,m_sig) determines
+    // the boundary EDGE.  MISS -> run the AUTHORITATIVE measure_z (NO F4/imem), store the edge + snapshot the
+    // post-boundary engine into a DEDUPED pool (one EngSnap per distinct post-state).  HIT -> draw Born rv,
+    // pick outcome, RESTORE the pool snapshot, set record via XOR rule -> measure_z SKIPPED.  Eager inverse so
+    // the inverse frame is always materialized (snapshot-able).  anti_s boundaries (idraw2 coin) stay LIVE.
+    struct EngSnap { int r=0; std::vector<cd> dense; std::vector<int> M;
+        std::vector<PackedPauli> ax, az, Xc, Zc; std::vector<PendingEntry> pend; uint32_t rot_uid=0; };
+    std::vector<EngSnap> mc_pool;
+    std::unordered_map<uint64_t,std::vector<int>> mc_pool_idx;          // exact-dedup: fingerprint -> pool ids (collision chain)
+    struct MEdge { double p0=-2.0; uint8_t antis=0; bool has[2]={false,false}; int pool[2]={-1,-1}; uint8_t disp[2]={0,0};
+                   int sid_out[2]={-1,-1}; };   // Phase-4 carry: dense-block id per outcome (so the next key needs NO dense re-hash)
+    std::vector<std::unordered_map<uint64_t,MEdge>> mc_edges;            // [mp] -> key -> edge (persists across shots)
+    long mc_hit=0, mc_miss=0, mc_partial=0, mc_antis=0, mc_verify=0, mc_mismatch=0, mc_restore=0;
+    int mc_mode=0;          // 0 off, 1 SHADOW (build+verify, no skip), 2 FAST-snapshot, 3 FAST-carry (carried sid, no dense re-hash)
+    int mc_cur_sid=-1;      // Phase-4: carried dense-block id (sid_in(B+1)==sid_out(B); dense only changes at a measure)
+    // Step 3-1 hit-cost decomposition (rdtsc, default OFF, zero cost when off).  cyc[]:
+    // 0 key-hash, 1 lookup-find, 2 eng_restore (hit), 3 measure_z (live), 4 pool_intern (miss dedup),
+    // 5 hit-total, 6 live-total, 7 (reserved)
+    bool mc_time=false; uint64_t mc_cyc[8]={0,0,0,0,0,0,0,0};
+    // Control-plane decomposition (rdtsc per opcode category, default OFF).  opcyc[]:
+    // 0 OUTER_FRAME, 1 ENGINE_GATE(tableau/inverse/pending conj), 2 ROT(pending create), 3 NOISE,
+    // 4 DORMANT/record-cond, 5 BOUNDARY(measure: hit-path / miss measure_z + record/frame), 6 OTHER, 7 whole-loop
+    bool mc_optime=false; uint64_t mc_opcyc[8]={0,0,0,0,0,0,0,0};
+    // Ablation (TIMING-ONLY; output is WRONG when set) — skip a category's WORK to measure its cost by the
+    // clean-wall delta (no per-op timer overhead).  bits: 1 OUTER_FRAME, 2 ENGINE_GATE, 4 ROT, 8 NOISE,
+    // 16 DORMANT/readout, 32 BOUNDARY(measure).  The per-op branch is present in full + ablated runs -> cancels.
+    int mc_skip=0;
+    static int mc_catof(uint8_t k){
+        switch((MdamOp)k){
+            case MO_FRAME_H: case MO_FRAME_CNOT: case MO_FRAME_CZ: case MO_FRAME_SWAP: case MO_FRAME_S: return 0;
+            case MO_ARRAY_CNOT: case MO_ARRAY_CZ: case MO_MULTI_CNOT: case MO_MULTI_CZ: case MO_ARRAY_S:
+            case MO_EXPAND: case MO_ARRAY_H: case MO_ARRAY_U2: case MO_ARRAY_U4: return 1;
+            case MO_ARRAY_T: case MO_ARRAY_T_DAG: case MO_EXPAND_T: case MO_EXPAND_T_DAG:
+            case MO_ARRAY_ROT: case MO_EXPAND_ROT: return 2;
+            case MO_NOISE: case MO_NOISE_BLOCK: case MO_READOUT_NOISE: return 3;
+            case MO_MEAS_DORM_STATIC: case MO_MEAS_DORM_RANDOM: case MO_APPLY_PAULI: return 4;
+            case MO_SWAP_MEAS_INTERFERE: case MO_MEAS_ACTIVE_DIAGONAL: case MO_MEAS_ACTIVE_INTERFERE: return 5;
+            default: return 6;
+        }
+    }
+    void mc_reset(){ mc_pool.clear(); mc_pool_idx.clear(); mc_edges.clear();
+        mc_hit=mc_miss=mc_partial=mc_antis=mc_verify=mc_mismatch=mc_restore=0;
+        for(int i=0;i<8;i++){ mc_cyc[i]=0; mc_opcyc[i]=0; }
+        bcap_intern.clear(); bcap_amp.clear(); }
+    // ===== Clean-room SEGMENT/automaton SEPARABILITY shadow (path-3, default OFF, authoritative untouched) ==
+    // Load-bearing premise of the lean boundary-walk: the boundary SIGNATURE sequence is a deterministic
+    // automaton driven ONLY by Born outcomes.  The inter-boundary gate-walk (100% symbolic F2 on
+    // tableau/inverse-frame/pending — NO dense; verified in code) is a pure function of (prev boundary key,
+    // outcome), INDEPENDENT of the per-shot noise/feedback (which only drives the SEPARATE outer-frame/record
+    // layer — sampler.apply_site + apply_mask touch ONLY the outer NativeFrame).  The one possible coupling is
+    // rot() reading frame.xb(slot) for the rotation sign; this shadow tests whether that coupling ever changes
+    // the automaton.  Runs the authoritative gate-walk and verifies key(mp+1) == f(mp, key(mp), outcome(mp))
+    // across shots with different noise.  viol>0 names noise->automaton coupling (=> key needs frame parity).
+    int  sg_shadow=0;                                    // 0 off, 1 on
+    int  sg_signs=0;                                     // 1 = fold in-segment rotation-sign bits into the source key
+    std::unordered_map<uint64_t,uint64_t> sg_trans;      // source-key -> next_key (persists across shots)
+    long sg_checks=0, sg_viol=0, sg_edges=0, sg_bounds=0;
+    uint64_t sg_prev_key=0; int sg_prev_out=-1, sg_prev_mp=-1; bool sg_have_prev=false;
+    uint64_t sg_seg_signs=1469598103934665603ULL;        // order-hash of xb bits rot() read since the last boundary
+    inline void sg_sign_acc(int slot,int xb){ sg_seg_signs = (sg_seg_signs*1099511628211ULL) ^ (uint64_t)((slot<<1)|(xb&1)); }
+    inline void sg_rot_sign(int slot,int xb){ if(sg_shadow||ln_active) sg_sign_acc(slot,xb); }
+    // shared edge-key (source of a boundary edge): must be byte-identical between the sg shadow (build) and
+    // run_lean (walk).  Includes the in-segment rotation signs (sg_signs must be ON for the lean table).
+    inline uint64_t sg_edge_key(int prev_mp, uint64_t prev_node, int prev_out) const {
+        uint64_t tk=1469598103934665603ULL;
+        tk=dfnv(tk,&prev_mp,4); tk=dfnv(tk,&prev_node,8); tk=dfnv(tk,&prev_out,4);
+        tk=dfnv(tk,&sg_seg_signs,8);
+        return tk;
+    }
+    inline void sg_note_boundary(int mp, uint64_t K, int b){
+        if(!sg_shadow) return;
+        sg_bounds++;
+        int cur_id = ln_id[K];                           // interned by sg_note_p0 (called just before)
+        if(sg_have_prev){
+            uint64_t tk = sg_signs ? sg_edge_key(sg_prev_mp, sg_prev_key, sg_prev_out)
+                                   : [&]{ uint64_t t=1469598103934665603ULL; t=dfnv(t,&sg_prev_mp,4);
+                                          t=dfnv(t,&sg_prev_key,8); t=dfnv(t,&sg_prev_out,4); return t; }();
+            auto it=sg_trans.find(tk);
+            if(it==sg_trans.end()){ sg_trans.emplace(tk,K); sg_edges++; }
+            else { sg_checks++; if(it->second!=K) sg_viol++; }
+            // int-keyed edge for the lean walk (determinism proven by the sg_trans check above)
+            if(sg_signs) ln_edge.emplace(sg_edge_key_id(sg_prev_id, sg_prev_out), cur_id);
+        }
+        sg_prev_key=K; sg_prev_out=b; sg_prev_mp=mp; sg_prev_id=cur_id; sg_have_prev=true;
+        sg_seg_signs=1469598103934665603ULL;             // reset for the NEXT segment
+    }
+    // premise-2 (Mealy completeness): the Born threshold p0 must be a deterministic function of the node key,
+    // so the lean walk can draw the outcome from a cached p0 WITHOUT the engine measure_z.  Also verify the
+    // antis-ness (stabilizer coin vs Born) is node-consistent (antis nodes stay LIVE in the lean walk).
+    std::unordered_map<uint64_t,double> sg_p0;           // node key -> p0
+    std::unordered_map<uint64_t,uint8_t> sg_antis;       // node key -> antis flag
+    long sg_p0_checks=0, sg_p0_viol=0, sg_antis_checks=0, sg_antis_viol=0;
+    inline void sg_note_p0(uint64_t K, double p0, uint8_t antis){
+        if(!sg_shadow) return;
+        { auto it=sg_antis.find(K); if(it==sg_antis.end()) sg_antis.emplace(K,antis);
+          else { sg_antis_checks++; if(it->second!=antis) sg_antis_viol++; } }
+        // intern node -> dense id + p0/antis arrays (int-keyed lean walk)
+        auto r=ln_id.emplace(K,(int)ln_p0v.size());
+        if(r.second){ ln_p0v.push_back(p0); ln_antisv.push_back(antis); }
+        if(antis) return;                                // antis -> no Born p0 (kept live)
+        auto it=sg_p0.find(K); if(it==sg_p0.end()) sg_p0.emplace(K,p0);
+        else { sg_p0_checks++; if(it->second!=p0) sg_p0_viol++; }
+    }
+    void sg_reset(){ sg_trans.clear(); sg_checks=sg_viol=sg_edges=sg_bounds=0; sg_have_prev=false;
+        sg_seg_signs=1469598103934665603ULL; sg_prev_id=-1;
+        sg_p0.clear(); sg_antis.clear(); sg_p0_checks=sg_p0_viol=sg_antis_checks=sg_antis_viol=0;
+        ln_id.clear(); ln_edge.clear(); ln_p0v.clear(); ln_antisv.clear(); }
+    // ===== path-3 REDUCED-EXECUTION lean walk (run_lean): frame-layer + noise + the automaton table only;
+    // SKIPS the entire engine gate-walk (tableau/inverse-frame/pending/dense/measure_z = the 85% opcode_loop).
+    // Correctness rests on: frame⊥engine (separate objects), engine layer RNG-free (verified), automaton
+    // complete (node->p0/antis/next all deterministic, 0 viol).  Uses the warm sg table (sg_signs=1).  A shot
+    // that hits an uncached edge/node aborts to ln_incomplete (excluded from the record comparison, counted).
+    bool ln_active=false;
+    int ln_prev_out=0, ln_cur_id=-1;
+    bool ln_incomplete=false; long ln_incomplete_shots=0, ln_miss=0;
+    // int-node-id automaton (built during the warm sg run): node key -> dense id; dense p0/antis arrays;
+    // edge = FNV(prev_id, prev_out, in-segment signs) -> next id.  ONE hash lookup + 2 array reads per boundary
+    // (vs 1 FNV + 3 unordered_map.find on the 64-bit key path).  id encodes mp (K=mc_key includes mp).
+    std::unordered_map<uint64_t,int> ln_id, ln_edge;
+    std::vector<double> ln_p0v; std::vector<uint8_t> ln_antisv;
+    int sg_prev_id=-1;                                         // interned id of the previous boundary (edge build); -1 = virtual start
+    inline uint64_t sg_edge_key_id(int prev_id, int prev_out) const {
+        uint64_t tk=1469598103934665603ULL; tk=dfnv(tk,&prev_id,4); tk=dfnv(tk,&prev_out,4); tk=dfnv(tk,&sg_seg_signs,8); return tk; }
+    inline void lean_rot(int slot){ int q=(slot<(int)slot2id.size())?slot2id[slot]:-1; if(q<0) return;
+        int xb=frame.xb(slot); sg_sign_acc(slot,xb); }        // == rot()'s sign capture (q<0 guard); pending SKIPPED
+    int lean_measure(){
+        uint64_t ek=sg_edge_key_id(ln_cur_id, ln_prev_out);
+        auto it=ln_edge.find(ek);
+        if(it==ln_edge.end()){ ln_incomplete=true; ln_miss++; return -1; }   // uncached trajectory
+        int id=it->second, b;
+        if(ln_antisv[id]){ b=(int)idraw2(); }                 // stabilizer coin (1 idraw2, matches authoritative antis)
+        else { double rv=udraw(); b=(rv<ln_p0v[id])?0:1; }    // Born (1 udraw, matches authoritative)
+        ln_cur_id=id; ln_prev_out=b;
+        sg_seg_signs=1469598103934665603ULL;                  // reset segment signs (== sg_note_boundary)
+        return b;
+    }
+    // ===== Gate N: frame-block superinstruction (default OFF) =========================
+    // distillation is 81% pure MO_FRAME_* opcodes (1625/1995) in 90 runs (mean 18, max 52).
+    // Each costs one big-switch dispatch (6 array loads + jump) for an ~8-cyc body.  Batch each
+    // maximal run into ONE dispatch + a tight inner loop with grow() hoisted out.  Executes the
+    // identical ops in identical order -> bit-exact by construction.
+    bool mc_fblock=false;
+    bool fb_blk_built=false; size_t fb_blk_N=0;
+    std::vector<int>     fbi_at;                 // pc -> block id (run start) or -1
+    std::vector<int>     fb_off, fb_len, fb_maxslot;
+    std::vector<uint8_t> fb_sub;                 // flat sub-op kinds (MO_FRAME_H..MO_FRAME_S)
+    std::vector<int32_t> fb_s1, fb_s2;
+    void fb_build_blocks(const MdamProgram& p){
+        size_t N=p.kind.size();
+        fbi_at.assign(N,-1); fb_off.clear(); fb_len.clear(); fb_maxslot.clear();
+        fb_sub.clear(); fb_s1.clear(); fb_s2.clear();
+        size_t i=0;
+        while(i<N){
+            if(p.kind[i]<=MO_FRAME_S){                       // 0..4 = MO_FRAME_{H,CNOT,CZ,SWAP,S}
+                size_t j=i; int ms=0;
+                while(j<N && p.kind[j]<=MO_FRAME_S){
+                    if(p.a1[j]>ms) ms=p.a1[j]; if(p.a2[j]>ms) ms=p.a2[j]; j++;
+                }
+                if(j-i>=3){                                  // worth batching
+                    fbi_at[i]=(int)fb_len.size(); fb_off.push_back((int)fb_sub.size());
+                    fb_len.push_back((int)(j-i)); fb_maxslot.push_back(ms);
+                    for(size_t t=i;t<j;t++){ fb_sub.push_back(p.kind[t]); fb_s1.push_back(p.a1[t]); fb_s2.push_back(p.a2[t]); }
+                    i=j; continue;
+                }
+            }
+            i++;
+        }
+        fb_blk_built=true; fb_blk_N=N;
+    }
+    inline void fb_exec(int b){
+        frame.grow((size_t)fb_maxslot[b]);                   // hoist grow out of the per-op path
+        uint8_t* X=frame.x.data(); uint8_t* Z=frame.z.data();
+        int off=fb_off[b], L=fb_len[b];
+        for(int j=0;j<L;j++){ int s=off+j; int a1=fb_s1[s], a2=fb_s2[s]; uint8_t t;
+            switch(fb_sub[s]){
+                case MO_FRAME_H:    t=X[a1]; X[a1]=Z[a1]; Z[a1]=t; break;
+                case MO_FRAME_CNOT: X[a2]^=X[a1]; Z[a1]^=Z[a2]; break;
+                case MO_FRAME_CZ:   Z[a1]^=X[a2]; Z[a2]^=X[a1]; break;
+                case MO_FRAME_SWAP: t=X[a1];X[a1]=X[a2];X[a2]=t; t=Z[a1];Z[a1]=Z[a2];Z[a2]=t; break;
+                case MO_FRAME_S:    Z[a1]^=X[a1]; break;
+            }
+        }
+    }
+    // ===== LEAN frame-block: in run_lean, MO_ARRAY_{CNOT,CZ,S,H} act as PURE frame ops (engine SKIPPED) ==
+    // identical to MO_FRAME_{CNOT,CZ,S,H}.  So the lean block builder batches BOTH families into longer runs
+    // -> fewer big-switch dispatches (attacks the dispatch residual).  Separate arrays -> shared fb_* (used by
+    // run_mcache, where ARRAY_* also do engine work) is UNTOUCHED.  Action codes: 0=H 1=CNOT 2=CZ 3=SWAP 4=S.
+    bool lfb_built=false; size_t lfb_N=0;
+    std::vector<int> lfb_at, lfb_off, lfb_len, lfb_maxslot;
+    std::vector<uint8_t> lfb_act; std::vector<int32_t> lfb_s1, lfb_s2;
+    static inline int lfb_action(uint8_t k){
+        switch((MdamOp)k){ case MO_FRAME_H: case MO_ARRAY_H: return 0;
+            case MO_FRAME_CNOT: case MO_ARRAY_CNOT: return 1; case MO_FRAME_CZ: case MO_ARRAY_CZ: return 2;
+            case MO_FRAME_SWAP: return 3; case MO_FRAME_S: case MO_ARRAY_S: return 4; default: return -1; } }
+    void lfb_build(const MdamProgram& p){
+        size_t N=p.kind.size(); lfb_at.assign(N,-1); lfb_off.clear(); lfb_len.clear(); lfb_maxslot.clear();
+        lfb_act.clear(); lfb_s1.clear(); lfb_s2.clear(); size_t i=0;
+        while(i<N){ if(lfb_action(p.kind[i])>=0){ size_t j=i; int ms=0;
+                while(j<N && lfb_action(p.kind[j])>=0){ if(p.a1[j]>ms) ms=p.a1[j]; if(p.a2[j]>ms) ms=p.a2[j]; j++; }
+                if(j-i>=3){ lfb_at[i]=(int)lfb_len.size(); lfb_off.push_back((int)lfb_act.size());
+                    lfb_len.push_back((int)(j-i)); lfb_maxslot.push_back(ms);
+                    for(size_t t=i;t<j;t++){ lfb_act.push_back((uint8_t)lfb_action(p.kind[t])); lfb_s1.push_back(p.a1[t]); lfb_s2.push_back(p.a2[t]); }
+                    i=j; continue; } }
+            i++; }
+        lfb_built=true; lfb_N=N;
+    }
+    inline void lfb_exec(int b){
+        frame.grow((size_t)lfb_maxslot[b]); uint8_t* X=frame.x.data(); uint8_t* Z=frame.z.data();
+        int off=lfb_off[b], L=lfb_len[b];
+        for(int j=0;j<L;j++){ int s=off+j; int a1=lfb_s1[s], a2=lfb_s2[s]; uint8_t t;
+            switch(lfb_act[s]){
+                case 0: t=X[a1]; X[a1]=Z[a1]; Z[a1]=t; break;
+                case 1: X[a2]^=X[a1]; Z[a1]^=Z[a2]; break;
+                case 2: Z[a1]^=X[a2]; Z[a2]^=X[a1]; break;
+                case 3: t=X[a1];X[a1]=X[a2];X[a2]=t; t=Z[a1];Z[a1]=Z[a2];Z[a2]=t; break;
+                case 4: Z[a1]^=X[a1]; break;
+            }
+        }
+    }
+    void eng_snapshot(EngSnap& s){ auto&e=engine; int n=e.n; size_t N=(size_t)1<<e.dense.r;
+        s.r=e.dense.r; s.dense.assign(e.dense.resident.begin(), e.dense.resident.begin()+N);
+        for(auto& z:s.dense) z=cd(z.real()+0.0, z.imag()+0.0);                     // canonicalize signed zero (stable dedup)
+        s.M=e.M;
+        s.ax.assign(e.inverse_frame.ax.begin(), e.inverse_frame.ax.begin()+n);
+        s.az.assign(e.inverse_frame.az.begin(), e.inverse_frame.az.begin()+n);
+        s.Xc.assign(e.tableau.Xc.begin(), e.tableau.Xc.begin()+n);
+        s.Zc.assign(e.tableau.Zc.begin(), e.tableau.Zc.begin()+n);
+        s.pend.clear(); for(auto&pe:e.pending.slots) if(pe.generation==e.pending.gen) s.pend.push_back(pe);
+        s.rot_uid=e.rot_uid; }
+    int mc_dense_sid=-1;        // Phase-4 lazy dense: which sid the LIVE engine.dense currently holds (-1 stale)
+    void mc_materialize_dense(int sid){ const std::vector<cd>& a=bcap_amp[sid]; int rk=(int)__builtin_ctzll(a.size());
+        engine.dense.set_state(rk, a.data()); mc_dense_sid=sid; }
+    void eng_restore(const EngSnap& s, bool with_dense=true){ auto&e=engine; int n=e.n;
+        if(with_dense) e.dense.set_state(s.r, s.dense.data());   // lazy-dense carry skips this on hits (dense carried by sid)
+        e.M=s.M;
+        for(int i=0;i<n;i++){ e.inverse_frame.ax[i]=s.ax[i]; e.inverse_frame.az[i]=s.az[i]; e.tableau.Xc[i]=s.Xc[i]; e.tableau.Zc[i]=s.Zc[i]; }
+        e.pending.gen++;                                                            // invalidate all live; re-create the saved live set
+        for(auto&pe:s.pend){ if(pe.uid>=e.pending.slots.size()) e.pending.slots.resize(pe.uid+1, PendingEntry{PackedPauli(e.W),0.0,0,0});
+            e.pending.slots[pe.uid]=pe; e.pending.slots[pe.uid].generation=e.pending.gen; }
+        e.rot_uid=s.rot_uid; e.inv_dirty=false; e.basis_valid=false; mc_restore++; }
+    uint64_t eng_fingerprint(){ auto&e=engine; int n=e.n; size_t N=(size_t)1<<e.dense.r;
+        bcap_buf.resize(N); for(size_t j=0;j<N;j++) bcap_buf[j]=cd(e.dense.resident[j].real()+0.0, e.dense.resident[j].imag()+0.0);
+        uint64_t h=dfnv(1469598103934665603ULL, bcap_buf.data(), sizeof(cd)*N);
+        int rr=e.dense.r; h=dfnv(h,&rr,sizeof(int));
+        for(int m:e.M){ int mm=m; h=dfnv(h,&mm,sizeof(int)); }
+        for(int i=0;i<n;i++){ h=dfnv(h,&e.inverse_frame.ax[i],sizeof(PackedPauli)); h=dfnv(h,&e.inverse_frame.az[i],sizeof(PackedPauli));
+                              h=dfnv(h,&e.tableau.Xc[i],sizeof(PackedPauli)); h=dfnv(h,&e.tableau.Zc[i],sizeof(PackedPauli)); }
+        for(auto&pe:e.pending.slots) if(pe.generation==e.pending.gen){ h=dfnv(h,&pe.p,sizeof(PackedPauli)); double th=pe.theta; h=dfnv(h,&th,8); h=dfnv(h,&pe.uid,4); }
+        return h; }
+    bool eng_equal(const EngSnap& s){ auto&e=engine; int n=e.n; size_t N=(size_t)1<<e.dense.r;
+        if(s.r!=e.dense.r || s.M!=e.M) return false;
+        for(size_t j=0;j<N;j++){ cd z(e.dense.resident[j].real()+0.0, e.dense.resident[j].imag()+0.0); if(s.dense[j]!=z) return false; }
+        for(int i=0;i<n;i++){ if(memcmp(&s.ax[i],&e.inverse_frame.ax[i],sizeof(PackedPauli))) return false;
+                              if(memcmp(&s.az[i],&e.inverse_frame.az[i],sizeof(PackedPauli))) return false;
+                              if(memcmp(&s.Xc[i],&e.tableau.Xc[i],sizeof(PackedPauli))) return false;
+                              if(memcmp(&s.Zc[i],&e.tableau.Zc[i],sizeof(PackedPauli))) return false; }
+        size_t np=0; for(auto&pe:e.pending.slots) if(pe.generation==e.pending.gen) np++;
+        if(np!=s.pend.size()) return false;
+        size_t k=0; for(auto&pe:e.pending.slots) if(pe.generation==e.pending.gen){ const PendingEntry& q=s.pend[k++];
+            if(memcmp(&pe.p,&q.p,sizeof(PackedPauli))||pe.theta!=q.theta||pe.uid!=q.uid) return false; }
+        return true; }
+    int mc_pool_intern(){                                                          // dedup current engine post-state -> pool id
+        uint64_t fp=eng_fingerprint(); auto& cand=mc_pool_idx[fp];
+        for(int id:cand) if(eng_equal(mc_pool[id])) return id;
+        int id=(int)mc_pool.size(); mc_pool.emplace_back(); eng_snapshot(mc_pool.back()); cand.push_back(id); return id; }
+    uint64_t mc_key(int mp,int kind){
+        uint64_t h=1469598103934665603ULL; int mm=mp; h=dfnv(h,&mm,4); h=dfnv(h,&kind,4);
+        uint32_t a;
+        if(mc_mode==3 && mc_cur_sid>=0) a=(uint32_t)mc_cur_sid;             // Phase-4 carry: NO dense re-hash (the 72-86% hit cost)
+        else { a=(uint32_t)bcap_sid(engine.dense.resident.data(),engine.dense.r); if(mc_mode==3){ mc_cur_sid=(int)a; mc_dense_sid=(int)a; } }  // live dense just interned -> it holds this sid
+        uint32_t b=bcap_inv_sig(), c=bcap_pend_sig(), d=bcap_m_sig();
+        h=dfnv(h,&a,4); h=dfnv(h,&b,4); h=dfnv(h,&c,4); h=dfnv(h,&d,4); return h; }
     // Gate I (Imem): compiled-control memo replacing the live-inverse pullback in the magic plan.
     // Gate I-D PROVED rpp (per-rotation pullback phase) + measurement sign are a DETERMINISTIC (Z4-affine)
     // function of (mp, Mpack, keepbit-history).  So we cache (sign, rpp-vector) keyed on that and skip the
@@ -241,10 +564,12 @@ struct MdamShot {
         // §4: size the magic scratch ONCE.  Live-pending upper bound = # rotation-creating ops
         // (ARRAY_T/T_DAG + EXPAND_T/T_DAG); a rotation is consumed only by a magic measurement, so the
         // number live at any measurement <= total rotations created.  +engine_n margin for axes.
-        int nrot=0; for (uint8_t k : p.kind) if (k==MO_ARRAY_T||k==MO_ARRAY_T_DAG||k==MO_EXPAND_T||k==MO_EXPAND_T_DAG) nrot++;
+        int nrot=0; for (uint8_t k : p.kind) if (k==MO_ARRAY_T||k==MO_ARRAY_T_DAG||k==MO_EXPAND_T||k==MO_EXPAND_T_DAG
+                                                  ||k==MO_ARRAY_ROT||k==MO_EXPAND_ROT) nrot++;
         magic_scratch.reserve_for(p.engine_n, nrot + p.engine_n + 8);
-        // §5: pre-size the core cache (1 magic measure_z per SWAP_MEAS op) so shot 0 does no resize.
-        int nmagic=0; for (uint8_t k : p.kind) if (k==MO_SWAP_MEAS_INTERFERE) nmagic++;
+        // §5: pre-size the core cache (1 magic measure_z per SWAP_MEAS / MEAS_ACTIVE_* op) so shot 0 does no resize.
+        int nmagic=0; for (uint8_t k : p.kind) if (k==MO_SWAP_MEAS_INTERFERE
+                                                   ||k==MO_MEAS_ACTIVE_DIAGONAL||k==MO_MEAS_ACTIVE_INTERFERE) nmagic++;
         core_cache.resize(nmagic + 4); for (auto& v : core_cache) v.reserve(p.engine_n + 4);
         plan_cache.assign(nmagic + 4, {});             // F4: per-magic-point M-keyed skeleton variant list
         for (auto& v : plan_cache) v.reserve(8);       // <=4 variants/boundary observed; reserve avoids realloc
@@ -283,9 +608,11 @@ struct MdamShot {
 
     // measure_z dispatch: compiled plan/execute (1 Born draw) else oracle (1 Born draw)
     int measure_z(int q) {
+        if (bcap_on) bcap_antis = false;          // Phase-0/1/2: per-boundary reset (oracle sets it true on the anti_s branch)
         if (magic_seen == dump_before_magic && !dumped) dump_engine();
         magic_seen++;
         int mp = magic_point++;                       // per-shot magic-point index (cache key)
+        if(pb_cap_on()) pb_mp()=mp;   // Step 1: tag boundary for pullback invariance
         long _icap_mpack=0; uint64_t _ip=0;
         if(icap_on||imem_mode){ _icap_mpack=(long)engine.M.size(); for(size_t _k=0;_k<engine.M.size();_k++) _icap_mpack|=((long)(engine.M[_k]&15))<<(4*(_k+1));
             int _n=engine.n; if(_n<=8) for(int _i=0;_i<_n;_i++){ _ip|=((uint64_t)(engine.inverse_frame.ax[_i].phase&3))<<(4*_i);
@@ -331,6 +658,7 @@ struct MdamShot {
             if(!R.ok){err=R.err;return 0;} return R.outcome; }
 #endif
         if (pl.feasible) { double rv = udraw(); magic_compiled++;
+            if (bcap_on) { NativeMagicTrace tr; int oc = magic_execute(engine, pl, rv, &tr); bcap_p0 = tr.p0; return oc; }
             if (core_capture) {                  // Gate G: snapshot this core's kernel inputs
                 CoreCap cc; cc.r_in=engine.dense.r; cc.r_mat=pl.rmat; cc.nrot=(int)pl.rx().size();
                 cc.nlm=(int)pl.lt().size(); cc.m_bit=pl.m_idx; cc.sign=pl.sign;
@@ -354,7 +682,7 @@ struct MdamShot {
                 magic_log.push_back({q, pl.rin, pl.rmat, (int)pl.rx().size(), (int)pl.lt().size(), 1, oc, tr.p0}); return oc; }
             { ITIME_BEG(IT_EXEC); int _oc=magic_execute(engine, pl, rv, nullptr); ITIME_END(IT_EXEC);
               if(icap_on){ icap.push_back(mp); icap.push_back(_icap_mpack); icap.push_back((long)_ip); icap.push_back(pl.sign>0?0:1); icap.push_back(_oc);
-                int _nr=(int)magic_scratch.rpp.size(); icap.push_back(_nr); for(int _i=0;_i<_nr;_i++) icap.push_back(magic_scratch.rpp[_i]); }
+                int _nr=(int)magic_scratch.rpp_uf.size(); icap.push_back(_nr); for(int _i=0;_i<_nr;_i++) icap.push_back(magic_scratch.rpp_uf[_i]); }
               if(imem_mode && engine.n<=8){ imem_store_verify(_imem_key,_ms,pl.sign); }
               return _oc; }  // hot path: NO trace -> 0 allocation
         }
@@ -363,6 +691,7 @@ struct MdamShot {
         uint64_t _dsh=0; if(dsig_on){ size_t Nin=(size_t)1<<engine.dense.r; _dsh=dfnv(1469598103934665603ULL, engine.dense.resident.data(), sizeof(cd)*Nin); }
         ITIME_BEG(IT_ORACLE); OracleResult R = oracle_measure_magic_counted(q); ITIME_END(IT_ORACLE);
         magic_oracle++; magic_last_p0=R.p0;     // Gate K shadow: stash oracle Born p0 for the edge-cache verify
+        if(bcap_on) bcap_p0=R.p0;               // Phase-0/1/2 boundary capture: oracle Born p0
         if(dsig_on){ uint64_t _kh=_dsh; if(!engine.M.empty()) _kh=dfnv(_kh, engine.M.data(), sizeof(int)*engine.M.size());  // oracle key = (state, M) approx (missing its core phases -> optimistic)
             dsig.push_back((uint64_t)mp); dsig.push_back(_kh); dsig.push_back(_dsh); dsig.push_back(1ULL); }
         if (magic_log_on) magic_log.push_back({q, rin_before, -1, -1, -1, 0, R.outcome, R.p0});
@@ -373,15 +702,15 @@ struct MdamShot {
     // Gate I (Imem): on shadow verify memo==live (else mismatch++); on fast-miss / first-shadow store live.
     inline void imem_store_verify(uint64_t key, ImemEntry* ms, double sign){
         if(imem_mode==2 && ms && ms->valid){ imem_hits++; return; }   // fast hit (already injected)
-        if(ms && ms->valid){                                          // shadow: compare memo vs live
-            bool ok=(ms->sign==sign) && (ms->rpp.size()==magic_scratch.rpp.size());
-            if(ok) for(size_t j=0;j<ms->rpp.size();j++) if(ms->rpp[j]!=magic_scratch.rpp[j]){ ok=false; break; }
+        if(ms && ms->valid){                                          // shadow: compare memo vs live (UNFOLDED rpp)
+            bool ok=(ms->sign==sign) && (ms->rpp.size()==magic_scratch.rpp_uf.size());
+            if(ok) for(size_t j=0;j<ms->rpp.size();j++) if(ms->rpp[j]!=magic_scratch.rpp_uf[j]){ ok=false; break; }
             if(!ok) imem_mismatch++;
             return;
         }
         if(imem_mode==2) imem_misses++;                              // fast miss -> store
         ImemEntry e; e.valid=true; e.sign=sign;
-        e.rpp.assign(magic_scratch.rpp.begin(), magic_scratch.rpp.end());
+        e.rpp.assign(magic_scratch.rpp_uf.begin(), magic_scratch.rpp_uf.end());
         imem[key]=std::move(e);
     }
     // wrapper so the oracle's single rng.next_double() is counted in rng_draws
@@ -392,16 +721,18 @@ struct MdamShot {
         std::vector<int>& anti_s = magic_scratch.anti_s; anti_s.clear();
         ORC_T(2, { for (int i=0;i<engine.n;i++){ bool inM=false; for(int m:engine.M) if(m==i) inM=true;
             if(!inM && !engine.tableau.Zc_commutes_with_Zq(i,q)) anti_s.push_back(i); } });
+        if(bcap_on) bcap_antis = !anti_s.empty();   // Phase-0/1/2: flag the stabilizer ag_measure branch (coin, not Born)
         if (!anti_s.empty()) {
             PackedPauli Pmphys(engine.W); Pmphys.z[PackedPauli::word(q)]=PackedPauli::bit(q);  // physical Z_q
             int out = (int)idraw2();                  // _ag_measure: integers(0,2)
-            engine.ag_measure(Pmphys, anti_s[0], out);
-            if(!engine.reduce_full_is_noop()) return {-1,0.0,false,"reduce_full would fire"};
+            ORC_T(8, engine.ag_measure(Pmphys, anti_s[0], out));
+            bool _rfn; ORC_T(9, _rfn=engine.reduce_full_is_noop());
+            if(!_rfn) return {-1,0.0,false,"reduce_full would fire"};
             return {out, 0.0, true, nullptr};
         }
         double sign; int r;
         ORC_T(3, { PackedPauli Pm(engine.W); Pm.z[PackedPauli::word(q)]=PackedPauli::bit(q);
-                   PackedPauli pm = engine.pullback(Pm);
+                   pb_kind()=1; PackedPauli pm = engine.pullback(Pm);   // oracle_Pm (counted path)
                    r = oracle_localize(engine, pm, q, sign, magic_scratch); });
         double p0; int outcome;
         if (r<0){ p0=std::max(0.0,std::min(1.0,(1.0+sign)/2.0)); outcome=(udraw()<p0)?0:1;
@@ -431,13 +762,29 @@ struct MdamShot {
     void rot(const MdamProgram& p, int slot, double angle){
         int q = (slot<(int)slot2id.size())?slot2id[slot]:-1; if(q<0) return;
         int xb = frame.xb(slot);
+        sg_rot_sign(slot,xb);           // segment-shadow: capture the (noise/feedback-driven) rotation sign bit
         double theta = xb ? -angle : angle;
         if (rot_log_on) rot_log.push_back({(double)slot,(double)xb,angle,theta});
         engine.apply_rotation(q, theta);
     }
 
+    // Adaptive lazy-inverse policy.  lazy is a BIG win for maxM=0 circuits (frame never read -> 0 rebuilds,
+    // d5_r1 0.93x->6.6x, d7_r1 ->35000x) but a ~40% LOSS for magic-heavy circuits (full rebuild-on-read vs
+    // eager incremental fwd; cult_d5/rx).  Both are BIT-EXACT, so we auto-pick: run_batch probes shot 0
+    // (lazy), then uses eager for the rest iff that shot materialized any magic (engine.magic_ever).
+    // Env override: MDAM_LAZY=force lazy, MDAM_NOLAZY=force eager.  lazy_env: -2 unread,-1 auto,0 eager,1 lazy.
+    int lazy_env_cache=-2; bool batch_lazy_hint=true;
+    int lazy_env(){ if(lazy_env_cache==-2) lazy_env_cache = std::getenv("MDAM_LAZY")?1:(std::getenv("MDAM_NOLAZY")?0:-1); return lazy_env_cache; }
     bool frame_log_on=false; std::vector<std::array<uint64_t,2>> frame_log;
     void run(const MdamProgram& p){
+        // Lazy inverse frame: defer the AG-projection inverse-frame rebuild to the first frame READ, so a
+        // maxM=0 trajectory (the frame is never read) pays ZERO rebuilds.  It is bit-exact on every CORRECT
+        // circuit; the prior blocker (it perturbed coherent_rx_d3_r3's R_X drift) is RESOLVED — rx_d3_r3 is
+        // now 25/25 under FUSED, and lazy==eager 25/25 on all 8 feasible benches (d3_r1/d3_r3/d5_r1/d5_r5/
+        // rx_d3_r1/rx_d3_r3/cult_d3/cult_d5).  So it is now a pure optimization -> DEFAULT ON (opt-out via
+        // MDAM_NOLAZY).  Wall effect: d5_r1 0.93x->6.64x, d3_r1 0.11x->0.30x; d5_r5 unchanged (maxM=12
+        // materializes the frame on first read = identical to eager).  run_batch auto-picks (batch_lazy_hint).
+        { int le=lazy_env(); engine.lazy_inverse = (le==1) ? true : (le==0 ? false : batch_lazy_hint); }
         size_t N=p.kind.size();
         for(size_t i=0;i<N && !err;i++){
             if(frame_log_on){ uint64_t fx=0,fz=0; for(int s=0;s<p.num_qubits&&s<64;s++){ if(frame.xb(s))fx|=1ULL<<s; if(frame.zb(s))fz|=1ULL<<s; } frame_log.push_back({fx,fz}); }
@@ -481,11 +828,96 @@ struct MdamShot {
                     frame.swap(a1,a2);
                     int q=slot2id[a2]; if(q<0) break;
                     engine.h(q);
+                    int _bmp=0; uint32_t _bsi=0,_biv=0,_bpd=0,_bms=0; uint8_t _bxb=0,_bzb=0; int _bmo=0;
+                    if(bcap_on){ _bmp=magic_point; _bsi=bcap_sid(engine.dense.resident.data(),engine.dense.r);
+                        _biv=bcap_inv_sig(); _bpd=bcap_pend_sig(); _bms=bcap_m_sig();
+                        _bxb=frame.xb(a2); _bzb=frame.zb(a2); _bmo=magic_oracle; }
                     int b=measure_z(q);
                     slot2id[a2]=-1;
                     int m_abs = b ^ frame.zb(a2);
                     record.set((uint32_t)i0, m_abs^i1);
                     frame.set_xz(a2,(uint8_t)m_abs,0);
+                    if(bcap_on){ uint32_t so=bcap_sid(engine.dense.resident.data(),engine.dense.r);
+                        uint8_t orc=(magic_oracle>_bmo)?(bcap_antis?2:1):0;
+                        bcap.push_back({_bmp,_bsi,_biv,_bpd,_bms,_bxb,_bzb,(uint8_t)i1,(uint8_t)2,orc,(uint8_t)b,so,(uint8_t)((m_abs^i1)&1),bcap_p0}); }
+                } break;
+                // ---- Gate L1: coherent opcodes (authoritative path) ----
+                case MO_ARRAY_ROT: rot(p,a1,dv); break;                  // arbitrary-theta diagonal rotation
+                case MO_EXPAND_ROT: { newq(a1); engine.h(slot2id[a1]); rot(p,a1,dv); } break;  // birth + rotation
+                case MO_ARRAY_SWAP: {                                    // pure slot relabel (no engine op)
+                    int i_1=slot2id[a1], i_2=slot2id[a2];
+                    slot2id[a1]=-1; slot2id[a2]=-1;
+                    if(i_1>=0) slot2id[a2]=i_1; if(i_2>=0) slot2id[a1]=i_2;
+                    frame.swap(a1,a2);
+                } break;
+                case MO_MEAS_ACTIVE_DIAGONAL: {                          // Z-basis active-register measurement
+                    int q=slot2id[a1]; if(q<0) break;
+                    int _bmp=0; uint32_t _bsi=0,_biv=0,_bpd=0,_bms=0; uint8_t _bxb=0,_bzb=0; int _bmo=0;
+                    if(bcap_on){ _bmp=magic_point; _bsi=bcap_sid(engine.dense.resident.data(),engine.dense.r);
+                        _biv=bcap_inv_sig(); _bpd=bcap_pend_sig(); _bms=bcap_m_sig();
+                        _bxb=frame.xb(a1); _bzb=frame.zb(a1); _bmo=magic_oracle; }
+                    int b=measure_z(q);
+                    slot2id[a1]=-1;
+                    int m_abs = b ^ frame.xb(a1);                        // diagonal: XOR X-frame parity
+                    record.set((uint32_t)i0, m_abs^i1);                  // i1 = FLAG_SIGN
+                    frame.set_xz(a1,(uint8_t)m_abs,0);
+                    if(bcap_on){ uint32_t so=bcap_sid(engine.dense.resident.data(),engine.dense.r);
+                        uint8_t orc=(magic_oracle>_bmo)?(bcap_antis?2:1):0;
+                        bcap.push_back({_bmp,_bsi,_biv,_bpd,_bms,_bxb,_bzb,(uint8_t)i1,(uint8_t)0,orc,(uint8_t)b,so,(uint8_t)((m_abs^i1)&1),bcap_p0}); }
+                } break;
+                case MO_MEAS_ACTIVE_INTERFERE: {                         // X-basis (H then Z) active measurement
+                    int q=slot2id[a1]; if(q<0) break;
+                    engine.h(q);
+                    int _bmp=0; uint32_t _bsi=0,_biv=0,_bpd=0,_bms=0; uint8_t _bxb=0,_bzb=0; int _bmo=0;
+                    if(bcap_on){ _bmp=magic_point; _bsi=bcap_sid(engine.dense.resident.data(),engine.dense.r);
+                        _biv=bcap_inv_sig(); _bpd=bcap_pend_sig(); _bms=bcap_m_sig();
+                        _bxb=frame.xb(a1); _bzb=frame.zb(a1); _bmo=magic_oracle; }
+                    int b=measure_z(q);
+                    slot2id[a1]=-1;
+                    int m_abs = b ^ frame.zb(a1);                        // interfere: XOR Z-frame parity
+                    record.set((uint32_t)i0, m_abs^i1);
+                    frame.set_xz(a1,(uint8_t)m_abs,0);
+                    if(bcap_on){ uint32_t so=bcap_sid(engine.dense.resident.data(),engine.dense.r);
+                        uint8_t orc=(magic_oracle>_bmo)?(bcap_antis?2:1):0;
+                        bcap.push_back({_bmp,_bsi,_biv,_bpd,_bms,_bxb,_bzb,(uint8_t)i1,(uint8_t)1,orc,(uint8_t)b,so,(uint8_t)((m_abs^i1)&1),bcap_p0}); }
+                } break;
+                // ---- Gate L Tier-3 (de-fused dialect): birth |+> + active Hadamard ----
+                case MO_EXPAND: { newq(a1); engine.h(slot2id[a1]); } break;   // _birth: new |0> qubit -> H -> |+> (state-prep, frame untouched)
+                case MO_ARRAY_H: { int q=slot2id[a1]; if(q>=0) engine.h(q); frame.h(a1); } break;
+                // ---- Gate L Tier-3 DIRECT (fused dialect): frame-keyed fused unitaries (preserve maxM) ----
+                // == backend.py _apply_u2: select 2x2 by incoming frame (in_state), apply its ZXZ
+                // (Rz(d)Rx(c)Rz(b)) on the magic axis WITHOUT frame sign-flip (frame consumed by selection),
+                // then reset frame to the node's out.  i0 = cp_idx, i1 unused.
+                case MO_ARRAY_U2: {
+                    int q=slot2id[a1];
+                    int in_state=(frame.zb(a1)<<1)|frame.xb(a1);
+                    int idx=i0*4+in_state; const double* bcd=&p.u2_bcd[(size_t)idx*3];
+                    double bb=bcd[0], cc=bcd[1], dd=bcd[2];
+                    if(q>=0){
+                        if(std::abs(dd)>1e-12) engine.apply_rotation_pauli(q,0,1,dd);   // Rz(d)
+                        if(std::abs(cc)>1e-12) engine.apply_rotation_pauli(q,1,0,cc);   // Rx(c)
+                        if(std::abs(bb)>1e-12) engine.apply_rotation_pauli(q,0,1,bb);   // Rz(b)
+                    }
+                    uint8_t out=p.u2_out[idx]; frame.set_xz(a1,out&1,(out>>1)&1);
+                } break;
+                // == backend.py _apply_u4: select 4x4 by 2-axis frame in_state, replay the precomputed
+                // cx/cz/rot1 op-list on (lo=a1, hi=a2), then reset both frames to the node's out.
+                case MO_ARRAY_U4: {
+                    int lo=slot2id[a1], hi=slot2id[a2];
+                    int in_state=(frame.zb(a2)<<3)|(frame.xb(a2)<<2)|(frame.zb(a1)<<1)|frame.xb(a1);
+                    int idx=i0*16+in_state; int st=p.u4_start[idx], cnt=p.u4_cnt[idx];
+                    if(cnt<0){ err="MO_ARRAY_U4: non-structural fused-U4 in_state selected (rot2/general not native-supported)"; break; }
+                    if(lo>=0 && hi>=0){
+                        for(int kk=0;kk<cnt;kk++){
+                            const double* op=&p.u4_ops[(size_t)(st+kk)*5];
+                            int ot=(int)op[0], which=(int)op[1], px=(int)op[2], pz=(int)op[3]; double th=op[4];
+                            if(ot==0) engine.cx(lo,hi);                      // cx control=lo target=hi
+                            else if(ot==1) engine.cz(lo,hi);                 // cz
+                            else { int qq=which?hi:lo; engine.apply_rotation_pauli(qq,px,pz,th); } // rot1
+                        }
+                    }
+                    uint8_t out=p.u4_out[idx];
+                    frame.set_xz(a1,out&1,(out>>1)&1); frame.set_xz(a2,(out>>2)&1,(out>>3)&1);
                 } break;
                 case MO_END: default: break;
             }
@@ -508,6 +940,150 @@ struct MdamShot {
             }
 #endif
         }
+    }
+
+    // ===== Phase-3 authoritative-edge cache: per-boundary measure with cache (mc_mode) ===============
+    // mc_mode 1 SHADOW: always live measure_z; store edge + verify repeats reproduce p0/post-state (no skip).
+    // mc_mode 2 FAST: full HIT (key present, drawn branch filled, non-antis) -> draw Born, RESTORE pool snapshot,
+    // SKIP measure_z; miss/partial/antis -> live measure_z (+ store).  rng stream stays aligned (full hit draws
+    // the same 1 Born; partial injects the pre-draw; antis stays live=coin).  Returns the outcome bit b.
+    int mc_measure(int q, int kind){
+        uint64_t _t0=mc_time?__rdtsc():0;
+        int mp = magic_point;
+        uint64_t K = mc_key(mp, kind);
+        uint64_t _t1=mc_time?__rdtsc():0; if(mc_time) mc_cyc[0]+=_t1-_t0;           // [0] key-hash
+        MEdge* he=nullptr;
+        if(mp<(int)mc_edges.size()){ auto it=mc_edges[mp].find(K); if(it!=mc_edges[mp].end()) he=&it->second; }
+        if(mc_time) mc_cyc[1]+=__rdtsc()-_t1;                                       // [1] lookup-find
+        if(mc_mode>=2 && he){                                     // FAST (snapshot=2, carry=3)
+            if(he->antis){ mc_antis++; }                          // coin (idraw2) -> keep live
+            else {
+                double rv=udraw(); int b=(rv<he->p0)?0:1;
+                if(he->has[b]){ uint64_t _tr=mc_time?__rdtsc():0;
+                    eng_restore(mc_pool[he->pool[b]], mc_mode!=3);          // mode 3: frame-only (dense carried by sid -> NO full snapshot restore)
+                    if(mc_time){ mc_cyc[2]+=__rdtsc()-_tr; mc_cyc[5]+=__rdtsc()-_t0; }   // [2] restore, [5] hit-total
+                    magic_point++; magic_seen++; if(he->disp[b]) magic_oracle++; else magic_compiled++;
+                    if(mc_mode==3) mc_cur_sid = he->sid_out[b];             // carry id (no re-hash); mc_dense_sid stays stale -> materialize on next live boundary
+                    mc_hit++; sg_note_p0(K,he->p0,0); sg_note_boundary(mp,K,b); return b; }
+                kfast_inj_rv=rv; kfast_use_inj=true; mc_partial++;  // drawn branch absent -> reuse rv on the live path
+            }
+        } else if(mc_mode>=2){ mc_miss++; }                        // no entry -> live + store
+        if(mc_mode==3 && mc_dense_sid!=mc_cur_sid && mc_cur_sid>=0) mc_materialize_dense(mc_cur_sid);   // lazy dense: bring the carried state live for measure_z
+        uint64_t _tm=mc_time?__rdtsc():0;
+        int mo=magic_oracle; bcap_on=true; int b=measure_z(q); bcap_on=false;   // LIVE authoritative (miss/partial/antis/shadow)
+        if(mc_time) mc_cyc[3]+=__rdtsc()-_tm;                                       // [3] measure_z
+        int disp=(magic_oracle>mo)?1:0; bool is_antis=bcap_antis;
+        int so=(mc_mode==3)?(int)bcap_sid(engine.dense.resident.data(),engine.dense.r):-1;   // carry: re-id the (changed) post dense (live only = rare)
+        if((int)mc_edges.size()<=mp) mc_edges.resize(mp+1);
+        auto& ed=mc_edges[mp][K];
+        if(ed.p0<=-2.0){ ed.p0=bcap_p0; ed.antis=is_antis?1:0; }
+        else if(mc_mode==1){ mc_verify++; if(ed.p0!=bcap_p0||ed.antis!=(is_antis?1:0)) mc_mismatch++; }
+        if(!is_antis){ uint64_t _tp=mc_time?__rdtsc():0; int pid=mc_pool_intern();
+            if(mc_time) mc_cyc[4]+=__rdtsc()-_tp;                                   // [4] pool_intern
+            if(!ed.has[b]){ ed.has[b]=true; ed.pool[b]=pid; ed.disp[b]=(uint8_t)disp; ed.sid_out[b]=so; }
+            else if(mc_mode==1){ if(ed.pool[b]!=pid) mc_mismatch++; } }
+        if(mc_mode==3){ mc_cur_sid=so; mc_dense_sid=so; }                          // carry after every live boundary (antis too); live dense now holds `so`
+        if(mc_time) mc_cyc[6]+=__rdtsc()-_t0;                                       // [6] live-total
+        sg_note_p0(K,bcap_p0,is_antis?1:0); sg_note_boundary(mp,K,b);
+        return b;
+    }
+    // run a shot with the authoritative-edge cache active (eager inverse; cache built from authoritative measure_z).
+    void run_mcache(const MdamProgram& p){
+        engine.lazy_inverse = false;     // eager: inverse frame always materialized (snapshot-able)
+        mc_cur_sid = -1; mc_dense_sid = -1;   // Phase-4 carry: per-shot reset (dense resets each shot)
+        // segment-shadow: automaton restarts each shot from a fixed VIRTUAL START node, so the first boundary
+        // (start --seg0 signs--> node0) is a covered edge too (lean walk needs it to begin without the engine).
+        sg_have_prev = true; sg_prev_key = 0xA5A5A5A5A5A5A5A5ULL; sg_prev_mp = -2; sg_prev_out = -2; sg_prev_id = -1;
+        sg_seg_signs = 1469598103934665603ULL;
+        size_t N=p.kind.size();
+        if(mc_fblock && (!fb_blk_built || fb_blk_N!=N)) fb_build_blocks(p);
+        uint64_t _lp0=mc_optime?__rdtsc():0;
+        for(size_t i=0;i<N && !err;i++){
+            if(mc_fblock && fbi_at[i]>=0){ int b=fbi_at[i];      // frame-block superinstruction
+                uint64_t _ob=mc_optime?__rdtsc():0;
+                if(!(mc_skip&1)) fb_exec(b);
+                if(mc_optime) mc_opcyc[0]+=__rdtsc()-_ob;
+                i += (size_t)fb_len[b]-1; continue; }
+            int a1=p.a1[i], a2=p.a2[i], i0=p.i0[i], i1=p.i1[i]; double dv=p.dval[i];
+            uint64_t _ot=mc_optime?__rdtsc():0;
+            switch((MdamOp)p.kind[i]){
+                case MO_FRAME_H: if(!(mc_skip&1)) frame.h(a1); break;
+                case MO_FRAME_CNOT: if(!(mc_skip&1)) frame.cnot(a1,a2); break;
+                case MO_FRAME_CZ: if(!(mc_skip&1)) frame.cz(a1,a2); break;
+                case MO_FRAME_SWAP: if(!(mc_skip&1)) frame.swap(a1,a2); break;
+                case MO_FRAME_S: if(!(mc_skip&1)) frame.s_gate(a1); break;
+                case MO_APPLY_PAULI: { int rc=record.get((uint32_t)i0); if(rc==1) apply_mask(p.cp_masks[i1]); } break;
+                case MO_NOISE: if(!(mc_skip&8) && sampler.should_fire(i0)) sampler.apply_site(i0, p.noise_sites[i0], frame); break;   // inline-guard: skip the call for non-firing sites
+                case MO_NOISE_BLOCK: if(!(mc_skip&8)) for(int s=i0;s<i0+i1;s++){ if(sampler.should_fire(s)) sampler.apply_site(s, p.noise_sites[s], frame); } break;
+                case MO_READOUT_NOISE: if(!(mc_skip&8)){ if(udraw()<dv) record.flip((uint32_t)i0); } break;
+                case MO_MEAS_DORM_STATIC: if(!(mc_skip&16)) record.set((uint32_t)i0, frame.xb(a1)^i1); break;
+                case MO_MEAS_DORM_RANDOM: if(!(mc_skip&16)){ int m=(int)idraw2(); record.set((uint32_t)i0, m^i1); frame.set_xz(a1,(uint8_t)m,0); } break;
+                case MO_ARRAY_CNOT: { int u=slot2id[a1], v=slot2id[a2]; if(u>=0&&v>=0&&!(mc_skip&2)) engine.cx(u,v); if(!(mc_skip&1)) frame.cnot(a1,a2); } break;
+                case MO_ARRAY_CZ: { int u=slot2id[a1], v=slot2id[a2]; if(u>=0&&v>=0&&!(mc_skip&2)) engine.cz(u,v); if(!(mc_skip&1)) frame.cz(a1,a2); } break;
+                case MO_MULTI_CNOT: { int tgt=a1, t=slot2id[tgt]; uint64_t mask=p.mmask[i0];
+                    while(mask){ int ctrl=__builtin_ctzll(mask); mask&=mask-1; if(ctrl==tgt) continue;
+                        int c=slot2id[ctrl]; if(t>=0&&c>=0&&!(mc_skip&2)) engine.cx(c,t); if(!(mc_skip&1)) frame.cnot(ctrl,tgt); } } break;
+                case MO_MULTI_CZ: { uint64_t mask=p.mmask[i0];
+                    while(mask){ int tgt=__builtin_ctzll(mask); mask&=mask-1; if(tgt==a1) continue;
+                        int u=slot2id[a1], v=slot2id[tgt]; if(u>=0&&v>=0&&!(mc_skip&2)) engine.cz(u,v); if(!(mc_skip&1)) frame.cz(a1,tgt); } } break;
+                case MO_ARRAY_T: if(!(mc_skip&4)) rot(p,a1,NV_T_ANGLE); break;
+                case MO_ARRAY_T_DAG: if(!(mc_skip&4)) rot(p,a1,-NV_T_ANGLE); break;
+                case MO_ARRAY_S: { int q=slot2id[a1]; if(q>=0&&!(mc_skip&2)) engine.s(q,false); if(!(mc_skip&1)) frame.s_gate(a1); } break;
+                case MO_EXPAND_T: { newq(a1); engine.h(slot2id[a1]); if(!(mc_skip&4)) rot(p,a1,NV_T_ANGLE); } break;
+                case MO_EXPAND_T_DAG: { newq(a1); engine.h(slot2id[a1]); if(!(mc_skip&4)) rot(p,a1,-NV_T_ANGLE); } break;
+                case MO_SWAP_MEAS_INTERFERE: {
+                    int i_1=slot2id[a1], i_2=slot2id[a2]; slot2id[a1]=-1; slot2id[a2]=-1;
+                    if(i_1>=0) slot2id[a2]=i_1; if(i_2>=0) slot2id[a1]=i_2;
+                    if(!(mc_skip&1)) frame.swap(a1,a2);
+                    int q=slot2id[a2]; if(q<0) break;
+                    engine.h(q);
+                    int b=(mc_skip&32)?0:mc_measure(q,2);
+                    slot2id[a2]=-1;
+                    int m_abs = b ^ frame.zb(a2); record.set((uint32_t)i0, m_abs^i1); frame.set_xz(a2,(uint8_t)m_abs,0);
+                } break;
+                case MO_ARRAY_ROT: if(!(mc_skip&4)) rot(p,a1,dv); break;
+                case MO_EXPAND_ROT: { newq(a1); engine.h(slot2id[a1]); if(!(mc_skip&4)) rot(p,a1,dv); } break;
+                case MO_ARRAY_SWAP: { int i_1=slot2id[a1], i_2=slot2id[a2]; slot2id[a1]=-1; slot2id[a2]=-1;
+                    if(i_1>=0) slot2id[a2]=i_1; if(i_2>=0) slot2id[a1]=i_2; if(!(mc_skip&1)) frame.swap(a1,a2); } break;
+                case MO_MEAS_ACTIVE_DIAGONAL: {
+                    int q=slot2id[a1]; if(q<0) break;
+                    int b=(mc_skip&32)?0:mc_measure(q,0);
+                    slot2id[a1]=-1;
+                    int m_abs = b ^ frame.xb(a1); record.set((uint32_t)i0, m_abs^i1); frame.set_xz(a1,(uint8_t)m_abs,0);
+                } break;
+                case MO_MEAS_ACTIVE_INTERFERE: {
+                    int q=slot2id[a1]; if(q<0) break;
+                    engine.h(q);
+                    int b=(mc_skip&32)?0:mc_measure(q,1);
+                    slot2id[a1]=-1;
+                    int m_abs = b ^ frame.zb(a1); record.set((uint32_t)i0, m_abs^i1); frame.set_xz(a1,(uint8_t)m_abs,0);
+                } break;
+                case MO_EXPAND: { newq(a1); engine.h(slot2id[a1]); } break;
+                case MO_ARRAY_H: { int q=slot2id[a1]; if(q>=0) engine.h(q); frame.h(a1); } break;
+                case MO_ARRAY_U2: {
+                    int q=slot2id[a1]; int in_state=(frame.zb(a1)<<1)|frame.xb(a1);
+                    int idx=i0*4+in_state; const double* bcd=&p.u2_bcd[(size_t)idx*3]; double bb=bcd[0], cc=bcd[1], dd=bcd[2];
+                    if(q>=0){ if(std::abs(dd)>1e-12) engine.apply_rotation_pauli(q,0,1,dd);
+                              if(std::abs(cc)>1e-12) engine.apply_rotation_pauli(q,1,0,cc);
+                              if(std::abs(bb)>1e-12) engine.apply_rotation_pauli(q,0,1,bb); }
+                    uint8_t out=p.u2_out[idx]; frame.set_xz(a1,out&1,(out>>1)&1);
+                } break;
+                case MO_ARRAY_U4: {
+                    int lo=slot2id[a1], hi=slot2id[a2];
+                    int in_state=(frame.zb(a2)<<3)|(frame.xb(a2)<<2)|(frame.zb(a1)<<1)|frame.xb(a1);
+                    int idx=i0*16+in_state; int st=p.u4_start[idx], cnt=p.u4_cnt[idx];
+                    if(cnt<0){ err="MO_ARRAY_U4: non-structural fused-U4 in_state selected"; break; }
+                    if(lo>=0 && hi>=0){ for(int kk=0;kk<cnt;kk++){ const double* op=&p.u4_ops[(size_t)(st+kk)*5];
+                        int ot=(int)op[0], which=(int)op[1], px=(int)op[2], pz=(int)op[3]; double th=op[4];
+                        if(ot==0) engine.cx(lo,hi); else if(ot==1) engine.cz(lo,hi);
+                        else { int qq=which?hi:lo; engine.apply_rotation_pauli(qq,px,pz,th); } } }
+                    uint8_t out=p.u4_out[idx]; frame.set_xz(a1,out&1,(out>>1)&1); frame.set_xz(a2,(out>>2)&1,(out>>3)&1);
+                } break;
+                case MO_END: default: break;
+            }
+            if(mc_optime) mc_opcyc[mc_catof(p.kind[i])] += __rdtsc()-_ot;
+        }
+        if(mc_optime) mc_opcyc[7] += __rdtsc()-_lp0;
     }
 
     // ===== Gate F-B region compiler =====================================================
@@ -589,6 +1165,7 @@ struct MdamShot {
     // Gate F-B shot loop.  COMPILE (first shot) = full replay + record snapshots.  SHADOW = full
     // replay + verify each boundary.  FAST = skip active-gate engine work, load snapshots at boundaries.
     void run_fb(const MdamProgram& p) {
+        engine.lazy_inverse=false;   // F-B path maintains the inverse frame live (snapshot tableau != live)
         bool compiling = !fb_compiled;
         bool fast   = (!compiling && fb_mode==FB_FAST);
         bool shadow = (!compiling && fb_mode==FB_SHADOW);
@@ -633,6 +1210,11 @@ struct MdamShot {
                 case MO_ARRAY_S: { int q=slot2id[a1]; if(q>=0){ if(fast){ ISKIP(ISK_INV_FWD, engine.s_inv(q,false)); } else engine.s(q,false);} ISKIP(ISK_FRAME, frame.s_gate(a1)); } break;
                 case MO_EXPAND_T: { newq(a1); int q2=slot2id[a1]; if(fast){ ISKIP(ISK_INV_FWD, engine.h_inv(q2)); } else engine.h(q2); cap_theta(a1,NV_T_ANGLE); } break;
                 case MO_EXPAND_T_DAG: { newq(a1); int q2=slot2id[a1]; if(fast){ ISKIP(ISK_INV_FWD, engine.h_inv(q2)); } else engine.h(q2); cap_theta(a1,-NV_T_ANGLE); } break;
+                // ---- Gate L: coherent rotations (arbitrary-theta dv; cap_theta applies xb sign + creates pending) ----
+                case MO_ARRAY_ROT: cap_theta(a1,dv); break;
+                case MO_EXPAND_ROT: { newq(a1); int q2=slot2id[a1]; if(fast){ ISKIP(ISK_INV_FWD, engine.h_inv(q2)); } else engine.h(q2); cap_theta(a1,dv); } break;
+                case MO_ARRAY_SWAP: { int i_1=slot2id[a1], i_2=slot2id[a2]; slot2id[a1]=-1; slot2id[a2]=-1;
+                    if(i_1>=0) slot2id[a2]=i_1; if(i_2>=0) slot2id[a1]=i_2; ISKIP(ISK_FRAME, frame.swap(a1,a2)); } break;
                 case MO_SWAP_MEAS_INTERFERE: {
                     int i_1=slot2id[a1], i_2=slot2id[a2];
                     slot2id[a1]=-1; slot2id[a2]=-1;
@@ -652,6 +1234,23 @@ struct MdamShot {
                     record.set((uint32_t)i0, m_abs^i1);
                     ISKIP(ISK_FRAME, frame.set_xz(a2,(uint8_t)m_abs,0));
                 } break;
+                case MO_MEAS_ACTIVE_DIAGONAL:                            // Gate L: coherent active measure (no swap; slot a1)
+                case MO_MEAS_ACTIVE_INTERFERE: {                         // DIAGONAL: no H, xb; INTERFERE: H, zb
+                    bool interfere = ((MdamOp)p.kind[i]==MO_MEAS_ACTIVE_INTERFERE);
+                    int q=slot2id[a1]; if(q<0) break;
+                    if(interfere){ if(fast){ ISKIP(ISK_INV_FWD, engine.h_inv(q)); } else engine.h(q); }   // boundary H (interfere only)
+                    int b=fb_region;
+                    if(compiling) fb_record_boundary(b, fb_phase_prev);
+                    else if(shadow) fb_shadow_boundary(b, fb_phase_prev);
+                    else if(fast) { ITIME_BEG(IT_REGION); fb_load_boundary(b); ITIME_END(IT_REGION); }
+                    int bit=measure_z(q);
+                    if(!fast) fb_capture_phase(fb_phase_prev);
+                    fb_region++;
+                    slot2id[a1]=-1;
+                    int m_abs = bit ^ (interfere ? frame.zb(a1) : frame.xb(a1));
+                    record.set((uint32_t)i0, m_abs^i1);
+                    ISKIP(ISK_FRAME, frame.set_xz(a1,(uint8_t)m_abs,0));
+                } break;
                 case MO_END: default: break;
             }
         }
@@ -670,11 +1269,14 @@ struct MdamShot {
         const uint64_t RNG_EXCL = ((uint64_t)1 << 63) - 1;     // integers(0, 2**63-1) -> #values
         if (stats) *stats = NativeBatchStats{};
         const size_t nm = (size_t)p.num_measurements;
+        batch_lazy_hint = true; engine.magic_ever = false;     // adaptive: probe shot 0 in lazy, then decide
         for (uint64_t sh = 0; sh < num_shots; sh++) {
             uint64_t sd = master.bounded(RNG_EXCL);            // per-shot seed from master stream
             __uint128_t st, inc; SeedExpand::seedseq_pcg64(sd, st, inc);
             reset_shot(p, (uint64_t)(st >> 64), (uint64_t)st, (uint64_t)(inc >> 64), (uint64_t)inc);
             if (fb_mode != FB_OFF) run_fb(p); else run(p);
+            // after shot 0, if this circuit materialized magic, eager is faster for the remaining shots.
+            if (sh == 0 && lazy_env() == -1) batch_lazy_hint = !engine.magic_ever;
             std::memcpy(out_record + (size_t)sh * nm, record.bits.data(), nm);
             if (stats) { stats->total_draws += rng_draws; stats->total_compiled += magic_compiled;
                          stats->total_oracle += magic_oracle; }
@@ -688,6 +1290,132 @@ struct MdamShot {
         }
         if (stats) { stats->m_state_hi=(uint64_t)(master.state>>64); stats->m_state_lo=(uint64_t)master.state;
             stats->m_inc_hi=(uint64_t)(master.inc>>64); stats->m_inc_lo=(uint64_t)master.inc; }
+        if (out_err) out_err[0] = 0;
+        return 0;
+    }
+
+    // Phase-3: batch driver for run_mcache (same master-seed expansion as run_batch -> fair vs sample_batch).
+    int run_mcache_batch(const MdamProgram& p, uint64_t num_shots,
+                         uint64_t mshi, uint64_t mslo, uint64_t mihi, uint64_t milo,
+                         uint8_t* out_record, char* out_err, int errlen) {
+        NativeRng master; master.seed_from_state(mshi, mslo, mihi, milo);
+        const uint64_t RNG_EXCL = ((uint64_t)1 << 63) - 1;
+        const size_t nm = (size_t)p.num_measurements;
+        for (uint64_t sh = 0; sh < num_shots; sh++) {
+            uint64_t sd = master.bounded(RNG_EXCL);
+            __uint128_t st, inc; SeedExpand::seedseq_pcg64(sd, st, inc);
+            reset_shot(p, (uint64_t)(st >> 64), (uint64_t)st, (uint64_t)(inc >> 64), (uint64_t)inc);
+            run_mcache(p);
+            std::memcpy(out_record + (size_t)sh * nm, record.bits.data(), nm);
+            if (err) { if(out_err){ std::strncpy(out_err, err, errlen-1); out_err[errlen-1]=0; } return 1; }
+        }
+        if (out_err) out_err[0] = 0;
+        return 0;
+    }
+
+    // run_lean: one shot via the reduced lean walk (frame layer + automaton; NO engine gate-walk).
+    void run_lean(const MdamProgram& p){
+        size_t N=p.kind.size();
+        if(mc_fblock && (!lfb_built || lfb_N!=N)) lfb_build(p);              // lean frame-block (batches FRAME_* + ARRAY_{CNOT,CZ,S,H})
+        ln_cur_id=-1; ln_prev_out=-2;                                        // virtual start (== sg_prev_id/sg_prev_out)
+        ln_incomplete=false; sg_seg_signs=1469598103934665603ULL; ln_active=true;
+        for(size_t i=0;i<N && !err && !ln_incomplete;i++){
+            if(mc_fblock && lfb_at[i]>=0){ if(!(mc_skip&1)) lfb_exec(lfb_at[i]); i += (size_t)lfb_len[lfb_at[i]]-1; continue; }
+            switch((MdamOp)p.kind[i]){                                        // operands loaded lazily per-case (fewer SoA loads/op)
+                case MO_FRAME_H: if(!(mc_skip&1)) frame.h(p.a1[i]); break;
+                case MO_FRAME_CNOT: if(!(mc_skip&1)) frame.cnot(p.a1[i],p.a2[i]); break;
+                case MO_FRAME_CZ: if(!(mc_skip&1)) frame.cz(p.a1[i],p.a2[i]); break;
+                case MO_FRAME_SWAP: if(!(mc_skip&1)) frame.swap(p.a1[i],p.a2[i]); break;
+                case MO_FRAME_S: if(!(mc_skip&1)) frame.s_gate(p.a1[i]); break;
+                case MO_APPLY_PAULI: { int rc=record.get((uint32_t)p.i0[i]); if(rc==1) apply_mask(p.cp_masks[p.i1[i]]); } break;
+                case MO_NOISE: if(!(mc_skip&8) && sampler.should_fire(p.i0[i])) sampler.apply_site(p.i0[i], p.noise_sites[p.i0[i]], frame); break;
+                case MO_NOISE_BLOCK: if(!(mc_skip&8)){ int i0=p.i0[i],e=i0+p.i1[i]; for(int s=i0;s<e;s++){ if(sampler.should_fire(s)) sampler.apply_site(s, p.noise_sites[s], frame); } } break;
+                case MO_READOUT_NOISE: if(!(mc_skip&8)){ if(udraw()<p.dval[i]) record.flip((uint32_t)p.i0[i]); } break;
+                case MO_MEAS_DORM_STATIC: record.set((uint32_t)p.i0[i], frame.xb(p.a1[i])^p.i1[i]); break;
+                case MO_MEAS_DORM_RANDOM: { int m=(int)idraw2(); record.set((uint32_t)p.i0[i], m^p.i1[i]); frame.set_xz(p.a1[i],(uint8_t)m,0); } break;
+                case MO_ARRAY_CNOT: if(!(mc_skip&1)) frame.cnot(p.a1[i],p.a2[i]); break;         // engine.cx SKIPPED (dead on hit)
+                case MO_ARRAY_CZ: if(!(mc_skip&1)) frame.cz(p.a1[i],p.a2[i]); break;
+                case MO_MULTI_CNOT: if(!(mc_skip&1)){ int tgt=p.a1[i]; uint64_t mask=p.mmask[p.i0[i]];
+                    while(mask){ int ctrl=__builtin_ctzll(mask); mask&=mask-1; if(ctrl==tgt) continue; frame.cnot(ctrl,tgt); } } break;
+                case MO_MULTI_CZ: if(!(mc_skip&1)){ int a1=p.a1[i]; uint64_t mask=p.mmask[p.i0[i]];
+                    while(mask){ int tgt=__builtin_ctzll(mask); mask&=mask-1; if(tgt==a1) continue; frame.cz(a1,tgt); } } break;
+                case MO_ARRAY_S: if(!(mc_skip&1)) frame.s_gate(p.a1[i]); break;
+                case MO_ARRAY_H: if(!(mc_skip&1)) frame.h(p.a1[i]); break;
+                case MO_ARRAY_T: case MO_ARRAY_T_DAG: case MO_ARRAY_ROT: if(!(mc_skip&4)) lean_rot(p.a1[i]); break;   // sign only, pending SKIPPED
+                case MO_EXPAND_T: case MO_EXPAND_T_DAG: case MO_EXPAND_ROT: { newq(p.a1[i]); if(!(mc_skip&4)) lean_rot(p.a1[i]); } break;  // engine.h SKIPPED
+                case MO_EXPAND: { newq(p.a1[i]); } break;                     // engine.h SKIPPED (frame untouched)
+                case MO_ARRAY_SWAP: { int a1=p.a1[i],a2=p.a2[i]; int i_1=slot2id[a1], i_2=slot2id[a2]; slot2id[a1]=-1; slot2id[a2]=-1;
+                    if(i_1>=0) slot2id[a2]=i_1; if(i_2>=0) slot2id[a1]=i_2; if(!(mc_skip&1)) frame.swap(a1,a2); } break;
+                case MO_SWAP_MEAS_INTERFERE: {
+                    int a1=p.a1[i],a2=p.a2[i]; int i_1=slot2id[a1], i_2=slot2id[a2]; slot2id[a1]=-1; slot2id[a2]=-1;
+                    if(i_1>=0) slot2id[a2]=i_1; if(i_2>=0) slot2id[a1]=i_2;
+                    if(!(mc_skip&1)) frame.swap(a1,a2);
+                    int q=slot2id[a2]; if(q<0) break;
+                    int b=(mc_skip&32)?0:lean_measure(); if(b<0) break;
+                    slot2id[a2]=-1;
+                    int m_abs=b^frame.zb(a2); record.set((uint32_t)p.i0[i], m_abs^p.i1[i]); frame.set_xz(a2,(uint8_t)m_abs,0);
+                } break;
+                case MO_MEAS_ACTIVE_DIAGONAL: {
+                    int a1=p.a1[i]; int q=slot2id[a1]; if(q<0) break;
+                    int b=(mc_skip&32)?0:lean_measure(); if(b<0) break;
+                    slot2id[a1]=-1;
+                    int m_abs=b^frame.xb(a1); record.set((uint32_t)p.i0[i], m_abs^p.i1[i]); frame.set_xz(a1,(uint8_t)m_abs,0);
+                } break;
+                case MO_MEAS_ACTIVE_INTERFERE: {
+                    int a1=p.a1[i]; int q=slot2id[a1]; if(q<0) break;
+                    int b=(mc_skip&32)?0:lean_measure(); if(b<0) break;
+                    slot2id[a1]=-1;
+                    int m_abs=b^frame.zb(a1); record.set((uint32_t)p.i0[i], m_abs^p.i1[i]); frame.set_xz(a1,(uint8_t)m_abs,0);
+                } break;
+                case MO_ARRAY_U2: case MO_ARRAY_U4: ln_incomplete=true; break;  // non-structural; unsupported in lean
+                case MO_END: default: break;
+            }
+        }
+        ln_active=false;
+        if(ln_incomplete) ln_incomplete_shots++;
+    }
+    // run_lean_batch: same master-seed expansion as run_batch/run_mcache_batch.  out_incomplete[sh]=1 if the
+    // shot hit an uncached edge (excluded from the record comparison).  Uses the pre-warmed sg table.
+    int run_lean_batch(const MdamProgram& p, uint64_t num_shots,
+                       uint64_t mshi, uint64_t mslo, uint64_t mihi, uint64_t milo,
+                       uint8_t* out_record, uint8_t* out_incomplete, char* out_err, int errlen){
+        NativeRng master; master.seed_from_state(mshi, mslo, mihi, milo);
+        const uint64_t RNG_EXCL = ((uint64_t)1 << 63) - 1;
+        const size_t nm = (size_t)p.num_measurements;
+        for (uint64_t sh = 0; sh < num_shots; sh++) {
+            uint64_t sd = master.bounded(RNG_EXCL);
+            __uint128_t st, inc; SeedExpand::seedseq_pcg64(sd, st, inc);
+            reset_shot(p, (uint64_t)(st >> 64), (uint64_t)st, (uint64_t)(inc >> 64), (uint64_t)inc);
+            run_lean(p);
+            std::memcpy(out_record + (size_t)sh * nm, record.bits.data(), nm);
+            if(out_incomplete) out_incomplete[sh] = ln_incomplete?1:0;
+            if (err) { if(out_err){ std::strncpy(out_err, err, errlen-1); out_err[errlen-1]=0; } return 1; }
+        }
+        if (out_err) out_err[0] = 0;
+        return 0;
+    }
+
+    // run_lean_fb_batch: FAST-PATH driver — lean walk with miss-fallback to run_mcache (full engine, bit-exact).
+    // On an uncached edge run_lean aborts (ln_incomplete); we re-seed the SAME per-shot seed and replay the shot
+    // through run_mcache so the record is exact.  For a saturating (warm) automaton the fallback ~never fires.
+    // Uses the pre-warmed sg table + mc cache (mc_mode/fblock/rb set by caller).  ln_fb_count = #fallback shots.
+    long ln_fb_count=0;
+    int run_lean_fb_batch(const MdamProgram& p, uint64_t num_shots,
+                          uint64_t mshi, uint64_t mslo, uint64_t mihi, uint64_t milo,
+                          uint8_t* out_record, char* out_err, int errlen){
+        NativeRng master; master.seed_from_state(mshi, mslo, mihi, milo);
+        const uint64_t RNG_EXCL = ((uint64_t)1 << 63) - 1;
+        const size_t nm = (size_t)p.num_measurements;
+        for (uint64_t sh = 0; sh < num_shots; sh++) {
+            uint64_t sd = master.bounded(RNG_EXCL);
+            __uint128_t st, inc; SeedExpand::seedseq_pcg64(sd, st, inc);
+            uint64_t shi=(uint64_t)(st>>64), slo=(uint64_t)st, ihi=(uint64_t)(inc>>64), ilo=(uint64_t)inc;
+            reset_shot(p, shi,slo,ihi,ilo);
+            run_lean(p);
+            if(ln_incomplete){ ln_fb_count++; reset_shot(p, shi,slo,ihi,ilo); run_mcache(p); }
+            std::memcpy(out_record + (size_t)sh * nm, record.bits.data(), nm);
+            if (err) { if(out_err){ std::strncpy(out_err, err, errlen-1); out_err[errlen-1]=0; } return 1; }
+        }
         if (out_err) out_err[0] = 0;
         return 0;
     }

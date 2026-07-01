@@ -37,6 +37,7 @@ struct MagicScratch {
     std::vector<std::array<int,3>> lm;
     // kernel inputs
     std::vector<uint64_t> rx, rz; std::vector<int> rpp; std::vector<double> rc, rs, rtheta;
+    std::vector<int> rpp_uf;                     // UNFOLDED rpp (pre-fold, StaticPlan order) — Imem/icap key payload
     std::vector<int> lt, la, lb;
     std::vector<int> M_A;                       // post-measurement M
     std::vector<int> anti_s;                    // oracle stabilizer-branch candidates
@@ -48,7 +49,7 @@ struct MagicScratch {
         live.reserve(P); in_core.reserve(P); stack.reserve(P); core.reserve(P);
         M_mat.reserve(n + 4); pulled_p.reserve(P); pulled_pp.reserve(P); pulled_theta.reserve(P);
         supp.reserve(n + 4); Wg.reserve(2 * (n + 4)); Wout.reserve(2 * (n + 4)); lm.reserve(2 * (n + 4));
-        rx.reserve(P); rz.reserve(P); rpp.reserve(P); rc.reserve(P); rs.reserve(P); rtheta.reserve(P);
+        rx.reserve(P); rz.reserve(P); rpp.reserve(P); rpp_uf.reserve(P); rc.reserve(P); rs.reserve(P); rtheta.reserve(P);
         lt.reserve(2 * (n + 4)); la.reserve(2 * (n + 4)); lb.reserve(2 * (n + 4)); M_A.reserve(n + 4);
         anti_s.reserve(n + 4);
     }
@@ -180,13 +181,13 @@ inline MagicPlan magic_plan(NativeDenseEngineState& st, int q, MagicScratch& scr
             // Gate I (Imem): inject the cached pullback phase (hit) or compute it live (miss/shadow).
             if (inj_rpp) { scr.rpp[i] = (*inj_rpp)[i]; }
             else ISKIP(ISK_PULLBACK, {
-            PackedPauli pb = st.pullback(e->p);
+            pb_kind()=3; PackedPauli pb = st.pullback(e->p);   // PLAN_rot
             scr.rpp[i] = (int)((pb.phase + e->p.phase) & 3); }); }
         if (inj_sign) { P.sign = *inj_sign; }
         else { P.sign = 1.0;
         ISKIP(ISK_SIGN, {
         PackedPauli Pm_log(W); Pm_log.z[PackedPauli::word(q)] = PackedPauli::bit(q);
-        PackedPauli Pp = st.pullback(Pm_log);
+        pb_kind()=0; PackedPauli Pp = st.pullback(Pm_log);   // PLAN_Pm
         for (auto& g : pc->Wout) { if (g.type==0) pconj_h(Pp,g.a); else if (g.type==1) pconj_s(Pp,g.a,g.sdag); else pconj_cx(Pp,g.a,g.b); }
         P.sign = ((Pp.phase & 3)==0) ? 1.0 : -1.0; }); }
         P.m_idx=pc->m_idx; P.r_qubit=pc->r_qubit; P.rin=pc->rin; P.rmat=pc->rmat; P.rout=pc->rout;
@@ -217,7 +218,7 @@ inline MagicPlan magic_plan(NativeDenseEngineState& st, int q, MagicScratch& scr
     auto in_Mmat = [&](int qq){ for (int m : M_mat) if (m==qq) return true; return false; };
     scr.pulled_p.clear(); scr.pulled_pp.clear(); scr.pulled_theta.clear();
     for (auto* e : scr.core) {
-        PackedPauli pb = st.pullback(e->p); uint8_t pp = (uint8_t)((pb.phase + e->p.phase) & 3);
+        pb_kind()=3; PackedPauli pb = st.pullback(e->p); uint8_t pp = (uint8_t)((pb.phase + e->p.phase) & 3);   // PLAN_rot
         scr.pulled_p.push_back(pb); scr.pulled_pp.push_back(pp); scr.pulled_theta.push_back(e->theta);
         for (int qq = 0; qq < n; qq++) if (pb.getx(qq) && !in_Mmat(qq)) M_mat.push_back(qq);
     }
@@ -226,7 +227,7 @@ inline MagicPlan magic_plan(NativeDenseEngineState& st, int q, MagicScratch& scr
 #endif
     for (int i = 0; i < n; i++) if (!in_Mmat(i) && !st.tableau.Zc_commutes_with_Zq(i, q)) { if(pc) pc->state=2; P.feasible=false; return P; }
     PackedPauli Pm_log(W); Pm_log.z[PackedPauli::word(q)] = PackedPauli::bit(q);
-    PackedPauli pm = st.pullback(Pm_log);
+    pb_kind()=0; PackedPauli pm = st.pullback(Pm_log);   // PLAN_Pm
     auto tb = [&](const PackedPauli& X, uint64_t& xb, uint64_t& zb){ xb=zb=0;
         for (size_t l=0;l<M_mat.size();l++){ int qq=M_mat[l]; if (X.getx(qq)) xb|=1ULL<<l; if (X.getz(qq)) zb|=1ULL<<l; } };
     uint64_t Mx, Mz; tb(pm, Mx, Mz);
@@ -278,9 +279,55 @@ inline MagicPlan magic_plan(NativeDenseEngineState& st, int q, MagicScratch& scr
 
 // Execute the planned compiled measurement with a predetermined Born uniform; commit survivor + frame.
 // prof_kernel/prof_commit (PROFILE only): split the dense kernel (arithmetic) from the symbolic commit.
+// Operator folding (exact): combine core rotations with identical Pauli (rx,rz,pp) whose Pauli COMMUTES
+// with every other core rotation (so the factors can be freely gathered).  R(θ1)·R(θ2) on the same Pauli
+// G (G²=I) = R(θ1+θ2).  An EXACT representation-minimizing step: fewer kernel passes, identical operator
+// -> identical state/Born/survivor.  cultivation cores are S² of mutually-commuting X-rotations -> 2×.
+// In-place compaction of the kernel-input arrays (scratch is rebuilt every measurement, so safe).
+inline void fold_core_rotations(MagicScratch& s) {
+    int n = (int)s.rx.size();
+    if (n < 2) return;
+    // Early-out (the P2-folding cost check, intrinsic): if no two rotations share a Pauli, folding can
+    // reduce nothing -> skip the O(n^2) commute scan.  O(n log n) sort by key.  This keeps no-duplicate
+    // cores (off-diagonal d5_r5, off-axis rx) at zero folding overhead.
+    static thread_local std::vector<int> idx; idx.resize(n);
+    for (int i = 0; i < n; i++) idx[i] = i;
+    auto key = [&](int i){ return std::make_tuple(s.rx[i], s.rz[i], s.rpp[i]); };
+    std::sort(idx.begin(), idx.end(), [&](int a, int b){ return key(a) < key(b); });
+    bool any_dup = false;
+    for (int i = 1; i < n; i++) if (key(idx[i]) == key(idx[i-1])) { any_dup = true; break; }
+    if (!any_dup) return;
+    auto commute1 = [](uint64_t xa, uint64_t za, uint64_t xb, uint64_t zb){
+        return ((__builtin_popcountll(xa & zb) + __builtin_popcountll(za & xb)) & 1) == 0; };
+    static thread_local std::vector<char> used; used.assign(n, 0);
+    int w = 0;
+    for (int i = 0; i < n; i++) {
+        if (used[i]) continue;
+        bool foldable = true;                                // G_i commutes with every other-Pauli rotation?
+        for (int k = 0; k < n && foldable; k++) {
+            if (s.rx[k]==s.rx[i] && s.rz[k]==s.rz[i] && s.rpp[k]==s.rpp[i]) continue;
+            if (!commute1(s.rx[i], s.rz[i], s.rx[k], s.rz[k])) foldable = false;
+        }
+        double th = s.rtheta[i];
+        if (foldable)
+            for (int j = i+1; j < n; j++)
+                if (!used[j] && s.rx[j]==s.rx[i] && s.rz[j]==s.rz[i] && s.rpp[j]==s.rpp[i]) { th += s.rtheta[j]; used[j]=1; }
+        used[i]=1;
+        s.rx[w]=s.rx[i]; s.rz[w]=s.rz[i]; s.rpp[w]=s.rpp[i];
+        s.rtheta[w]=th; s.rc[w]=std::cos(th/2.0); s.rs[w]=std::sin(th/2.0); w++;
+    }
+    s.rx.resize(w); s.rz.resize(w); s.rpp.resize(w); s.rtheta.resize(w); s.rc.resize(w); s.rs.resize(w);
+}
+
 inline int magic_execute(NativeDenseEngineState& st, MagicPlan& P, double rand_val, NativeMagicTrace* tr=nullptr,
                          double* prof_kernel=nullptr, double* prof_commit=nullptr) {
     MagicScratch& s = *P.s;
+    static int _fold = -1; if (_fold < 0) _fold = (getenv("MDAM_NOFOLD") == nullptr) ? 1 : 0;
+    // Snapshot the UNFOLDED rpp (StaticPlan order) BEFORE folding: the cmode5/Imem fast path applies the
+    // StaticPlan's unfolded rx/rz, so its cached rpp must match that (unfolded) count — folding would shrink
+    // s.rpp (38->19) and desync the edge cache.  The authoritative kernel below still uses the FOLDED scratch.
+    s.rpp_uf.assign(s.rpp.begin(), s.rpp.end());
+    if (_fold) fold_core_rotations(s);                  // DEFAULT exact operator folding (opt-out MDAM_NOFOLD)
     int nrot=(int)s.rx.size(), nlm=(int)s.lt.size();
 #ifdef MDAM_PROFILE
     double _tk0 = prof_kernel ? (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -341,7 +388,8 @@ inline uint64_t* mcf_cyc(){ static uint64_t c[2]={0,0}; return c; }
 //   [0]=reconstruct_inverse  [1]=flush_core  [2]=anti_s scan  [3]=pullback+oracle_localize
 //   [4]=branch_sqnorm+project+normalize  [5]=drop+reduce  [6]=read_phase_pack  [7]=measure_z(oracle) total
 inline int& orc_time(){ static int t=0; return t; }
-inline uint64_t* orc_cyc(){ static uint64_t c[8]={0,0,0,0,0,0,0,0}; return c; }
+// [8]=anti_s ag_measure  [9]=anti_s reduce_full_is_noop  [10]=magic-branch reduce_full  [11]=spare
+inline uint64_t* orc_cyc(){ static uint64_t c[12]={0,0,0,0,0,0,0,0,0,0,0,0}; return c; }
 #define ORC_T(slot, code) do{ if(mdam::orc_time()){ uint64_t _o=__rdtsc(); code; mdam::orc_cyc()[slot]+=__rdtsc()-_o; } else { code; } }while(0)
 inline int magic_compiled_fast(NativeDenseEngineState& st, const StaticPlan& pc,
                                const std::vector<int>& rpp, double sign,

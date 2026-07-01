@@ -1,7 +1,0 @@
-metric,ms
-MDAM_cpp_cores_only,9.01733
-MDAM_full_sample,130.34014
-MDAM_non_core_overhead,121.32281
-Clifft_full_sample,8600.27262
-full_sample_speedup,65.98330
-old_core_only_speedup,953.74940

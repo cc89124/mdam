@@ -1,0 +1,36 @@
+### Phase-4 REALISTIC fresh-run end-to-end (cold cache, fresh seeds; NOT warm all-hit) ###
+== distillation: COLD fresh-run 8000 shots (cache built during run) ==
+   ns/shot: authoritative=17720  snapshot=14969  carry=14650  Clifft=11691
+            carry/snapshot=0.98x  carry/auth=0.83x  carry/Clifft=1.25x
+   cache after cold 8000: hit_rate=95.4%  miss=31  pool=58  sid=51  edges=31  mem=0.1MB (pool=0.0 sid=0.0 edge=0.0)
+   growth (cold reset each):
+      T=  2000: sid=     51 (0.03/shot)  hit=94.7%  mem=0.1MB
+      T=  4000: sid=     51 (0.01/shot)  hit=95.2%  mem=0.1MB
+      T=  8000: sid=     51 (0.01/shot)  hit=95.4%  mem=0.1MB
+      T= 16000: sid=     51 (0.00/shot)  hit=95.4%  mem=0.1MB
+
+== cultivation_d3: COLD fresh-run 8000 shots (cache built during run) ==
+   ns/shot: authoritative=15280  snapshot=8789  carry=8488  Clifft=2305
+            carry/snapshot=0.97x  carry/auth=0.56x  carry/Clifft=3.68x
+   cache after cold 8000: hit_rate=97.4%  miss=899  pool=914  sid=798  edges=899  mem=1.1MB (pool=1.0 sid=0.1 edge=0.1)
+   growth (cold reset each):
+      T=  2000: sid=    399 (0.20/shot)  hit=95.2%  mem=0.5MB
+      T=  4000: sid=    570 (0.14/shot)  hit=96.4%  mem=0.8MB
+      T=  8000: sid=    798 (0.10/shot)  hit=97.4%  mem=1.1MB
+      T= 16000: sid=   1103 (0.07/shot)  hit=98.1%  mem=1.6MB
+
+== cultivation_d5: COLD fresh-run 4000 shots (cache built during run) ==
+   ns/shot: authoritative=200052  snapshot=209920  carry=189405  Clifft=82083
+            carry/snapshot=0.90x  carry/auth=0.95x  carry/Clifft=2.31x
+   cache after cold 4000: hit_rate=57.4%  miss=25118  pool=24417  sid=22521  edges=25118  mem=209.7MB (pool=136.0 sid=71.9 edge=1.8)
+   growth (cold reset each):
+      T=  2000: sid=  12298 (6.15/shot)  hit=54.1%  mem=113.2MB
+      T=  4000: sid=  22521 (5.63/shot)  hit=57.4%  mem=209.7MB
+      T=  8000: sid=  39751 (4.97/shot)  hit=61.9%  mem=373.8MB
+      T=  8000: sid=  39751 (4.97/shot)  hit=61.9%  mem=373.8MB
+
+== cultivation_d5: three regimes (carry mode 3, 4000 shots) ==
+   (a) warm all-hit (replay seed):  hit~100%       carry=59987 ns/shot   [BEST CASE, not realistic]
+   (b) warm-then-fresh (partial):   hit=69.7%       carry=170184 ns/shot
+   (c) fresh cold (empty->run):     hit=59.3%       carry=182805 ns/shot   [realistic first run]
+

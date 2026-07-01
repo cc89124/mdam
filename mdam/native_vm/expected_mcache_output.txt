@@ -1,0 +1,48 @@
+### Phase 0-2: lightweight semantic-key SUFFICIENCY (authoritative path) ###
+== distillation: 20000 shots, 100000 boundary obs ==
+   distinct qkeys=29  distinct interned states=51  antis_obs=4518
+   T1 p0 conflicts=0   T2 sid_out conflicts=0   T3 antis conflicts=0   T4 rec-XOR viol=0
+   FULL KEY (mp,sid,inv,pend,m,kind): SUFFICIENT
+   MINIMAL sufficient subset(s) (size 2): [('mp', 'sid'), ('mp', 'inv'), ('sid', 'kind'), ('inv', 'kind')]
+
+== cultivation_d3: 20000 shots, 100000 boundary obs ==
+   distinct qkeys=1634  distinct interned states=1366  antis_obs=173
+   T1 p0 conflicts=0   T2 sid_out conflicts=0   T3 antis conflicts=0   T4 rec-XOR viol=0
+   FULL KEY (mp,sid,inv,pend,m,kind): SUFFICIENT
+   MINIMAL sufficient subset(s) (size 4): [('sid', 'inv', 'pend', 'm')]
+
+== cultivation_d5: 20000 shots, 300000 boundary obs ==
+   distinct qkeys=95076  distinct interned states=82738  antis_obs=396
+   T1 p0 conflicts=0   T2 sid_out conflicts=0   T3 antis conflicts=0   T4 rec-XOR viol=0
+   FULL KEY (mp,sid,inv,pend,m,kind): SUFFICIENT
+   MINIMAL sufficient subset(s) (size 4): [('sid', 'inv', 'pend', 'm')]
+
+
+### Phase 3: run_mcache correctness + perf (SHADOW + FAST + BATCH) ###
+== distillation: warm=3000 test=2000 ==
+   SHADOW: records==authoritative 3000/3000  mismatch=0  verify=14969  pool=58 edges=31 states=27
+   FAST warmed: 2000/2000 bit-exact   FAST fresh: 2000/2000 bit-exact
+   FAST counters (cumulative): hit=19117 miss=0 partial=0 antis=883 mismatch=0 restore=19117
+      hit_rate=95.6%  pool(distinct post-states)=58  edges=31  interned states=27
+   BATCH 4000: mcache!=authoritative = 0   pool=58 edges=31 states=27
+   timing ns/shot: authoritative=17616  mcache_FAST=13807  Clifft=11109   (auth/mc=1.28x  mc/Clifft=1.24x  auth/Clifft=1.59x)
+   RESULT: CORRECT (shadow+fast bit-exact, 0 mismatch)
+
+== cultivation_d3: warm=4000 test=2000 ==
+   SHADOW: records==authoritative 4000/4000  mismatch=0  verify=19348  pool=656 edges=652 states=488
+   FAST warmed: 2000/2000 bit-exact   FAST fresh: 2000/2000 bit-exact
+   FAST counters (cumulative): hit=19806 miss=145 partial=17 antis=32 mismatch=0 restore=19806
+      hit_rate=99.0%  pool(distinct post-states)=800  edges=797  interned states=597
+   BATCH 4000: mcache!=authoritative = 0   pool=1063 edges=1071 states=809
+   timing ns/shot: authoritative=15462  mcache_FAST=8362  Clifft=2138   (auth/mc=1.85x  mc/Clifft=3.91x  auth/Clifft=7.23x)
+   RESULT: CORRECT (shadow+fast bit-exact, 0 mismatch)
+
+== cultivation_d5: warm=1500 test=800 ==
+   SHADOW: records==authoritative 1500/1500  mismatch=0  verify=12210  pool=10016 edges=10290 states=9185
+   FAST warmed: 800/800 bit-exact   FAST fresh: 800/800 bit-exact
+   FAST counters (cumulative): hit=18836 miss=5045 partial=97 antis=22 mismatch=0 restore=18836
+      hit_rate=78.5%  pool(distinct post-states)=14936  edges=15335  interned states=13663
+   BATCH 4000: mcache!=authoritative = 0   pool=35444 edges=36560 states=32243
+   timing ns/shot: authoritative=180451  mcache_FAST=97134  Clifft=83102   (auth/mc=1.86x  mc/Clifft=1.17x  auth/Clifft=2.17x)
+   RESULT: CORRECT (shadow+fast bit-exact, 0 mismatch)
+

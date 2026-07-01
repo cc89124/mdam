@@ -1,8 +1,0 @@
-{
- "struct_pass": true,
- "sweep_pass": 1200,
- "sweep_total": 1200,
- "worst": 4.518280359883027e-16,
- "fails": [],
- "verdict": true
-}

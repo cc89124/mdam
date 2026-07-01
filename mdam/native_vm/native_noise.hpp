@@ -50,7 +50,7 @@ struct NativeNoiseSampler {
         double prob_sum = 0.0; for (auto& c : site.channels) prob_sum += c.prob;
         if (prob_sum <= 0.0) { advance(); return; }
         double u = udraw() * prob_sum;
-        double cum = 0.0;
+        double cum = 0.0; size_t ci = 0;
         for (auto& c : site.channels) {
             cum += c.prob;
             if (u < cum) {
@@ -59,10 +59,13 @@ struct NativeNoiseSampler {
                     while (w) { int b = __builtin_ctzll(w); w &= w-1; frame.apply_x((uint32_t)(wi*64+b)); } }
                 for (size_t wi = 0; wi < c.z_words.size(); wi++) { uint64_t w = c.z_words[wi];
                     while (w) { int b = __builtin_ctzll(w); w &= w-1; frame.apply_z((uint32_t)(wi*64+b)); } } });
-                if (log_on) fire_log.push_back({(uint64_t)site_idx,
-                    c.x_words.empty()?0:c.x_words[0], c.z_words.empty()?0:c.z_words[0]});
+                // Record the CHANNEL INDEX (not word[0] of the Pauli): word[0] cannot uniquely identify a
+                // multi-word channel (qubits > 64 live in higher words) -> the compiled/shadow paths matched
+                // the wrong channel -> wrong dynbit.  noise_base[site]+ci is exactly compile_jprogram's mapping.
+                if (log_on) fire_log.push_back({(uint64_t)site_idx, (uint64_t)ci, 0});
                 break;
             }
+            ci++;
         }
         advance();
     }

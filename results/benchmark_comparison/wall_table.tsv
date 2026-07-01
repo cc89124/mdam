@@ -1,0 +1,22 @@
+# bench	k	nmeas	clifft_ns	auth_ns	speedup_auth	lean_N	lean_ns	fallback_pct	speedup_lean	best_path	best_speedup	bitexact
+# TWO MDAM paths measured for EVERY bench, cold-amortized ns/shot (total_wall/N), taskset -c 2, single-thread BLAS.
+#   auth  = authoritative path (run()/sample_batch): no cache, exact per-shot, CONSTANT. Wins via r<<k localization.
+#   lean  = path-3 lean-walk (run_lean_fb_batch): skip engine gate-walk via magic-core automaton, miss->best-stack fallback.
+#           cold-AMORTIZED (empty table -> fallback builds it), target N=10M, per-bench wall-cap ~30s -> lean_N.
+#   speedup_X = clifft_ns / X_ns  (>1 => MDAM faster than the Clifft paper baseline). clifft_ns REUSED (constant).
+#   fallback_pct = lean-miss rate = SATURATION diagnostic (fb->0 as N grows => automaton saturates; high => never saturates).
+#   best_path / best_speedup = pick min(auth_ns, lean_ns) per bench = the actual best MDAM path.
+# RULE: fb is a DIAGNOSTIC, not the decision (lean falls back to best-stack, not auth). Decide by min(auth_ns,lean_ns).
+#   Physical predictor: localizable r<<k (small auth_ns despite big k, fb~100%) => auth; bounded magic core (fb->0) => lean.
+# bit-exact = lean fallback guarantees it; spot-checked (2 seeds x 2000 shots) vs authoritative sample_batch.
+coherent_rx_d3_r1	14	17	131084.0	165294.8	0.79x	10000000	2506.8	0.2	52.29x	lean	52.29x	OK
+coherent_rx_d3_r3	14	33	393710.8	974037.6	0.40x	911520	32921.2	7.2	11.96x	lean	11.96x	OK
+distillation	5	85	11713.9	17875.3	0.66x	5100000	5894.3	0.0	1.99x	lean	1.99x	OK
+cultivation_d3	4	21	2348.4	14914.2	0.16x	10000000	2142.5	0.1	1.10x	lean	1.10x	OK
+coherent_d3_r1	5	17	1390.3	4540.4	0.31x	10000000	1356.1	0.0	1.03x	lean	1.03x	OK
+surface_d7_r7	0	385	8993.8	21096.4	0.43x	3340000	8985.2	0.0	1.00x	lean	1.00x	OK
+cultivation_d5	10	112	82109.8	191335.6	0.43x	266166	114173.6	34.2	0.72x	lean	0.72x	OK
+coherent_d3_r3	8	33	14098.8	46602.6	0.30x	767907	39230.3	100.0	0.36x	lean	0.36x	OK
+coherent_d5_r1	13	49	205263.3	29980.3	6.85x	286389	107729.5	98.4	1.91x	auth	6.85x	OK
+coherent_d7_r1	25	97	3996135191.4	112357.7	35566.63x	76356	402481.1	100.0	9928.75x	auth	35566.63x	OK
+coherent_d5_r5	24	145	8695465444.5	10608325.9	819.68x	0	OOM	100.0	NA(lean-OOM)	auth	819.68x	OK(auth)

@@ -1,6 +1,0 @@
-circuit,shot_id,meas_idx,step_id,record_id,meas_qubit,pending_rot_before,nc_core_rot,not_needed_this_meas,nc_core_qubits,nc_state_log2_transient,nc_state_log2_resident,clifft_active_rank_at_meas,state_gap_log2,core_rot_ids,core_qubit_ids
-cultivation_d3,0,0,181,7,0,8,8,0,4,4,3,4,0,0 1 2 3 4 5 6 7,0 1 2 3
-cultivation_d3,0,1,292,14,3,14,14,0,4,4,3,4,0,8 9 10 11 12 13 14 15 16 17 18 19 20 21,1 2 3 4
-cultivation_d3,0,2,315,15,4,5,4,1,4,4,3,4,0,22 23 24 26,2 3 4 5
-cultivation_d3,0,3,324,17,5,2,2,0,3,3,0,3,0,25 27,2 3 5
-cultivation_d3,0,4,336,19,2,1,1,0,1,2,0,2,0,28,1

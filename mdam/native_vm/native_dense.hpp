@@ -21,6 +21,18 @@ namespace mdam {
 
 using cd = std::complex<double>;
 
+// Dense FLOP accounting (default-ON, ~free), SAME convention as clifft_flop_from_schedule
+// (offdiag=12, diag=6, perm=0, meas=12 per 2^r).  Namespace-level so BOTH the compiled kernel
+// (execute_core) and the oracle path (lincomb) charge the SAME counters.  Split: CORE = the
+// NECESSARY dense work (rotations + measurement collapse, which Clifft also pays); LOC = the
+// localizer Cliffords on the block (an implementation choice; a direct projector would avoid them).
+static inline uint64_t& dense_flop_rot(){      static uint64_t c=0; return c; }   // core rotation factors
+static inline uint64_t& dense_flop_collapse(){ static uint64_t c=0; return c; }   // Born+project+norm (measurement)
+static inline uint64_t& dense_flop_loc(){      static uint64_t c=0; return c; }   // localizer Cliffords on the block
+static inline int&      dense_peak_r(){        static int p=0;      return p; }   // peak materialized rank (== max_M)
+// CORE (necessary, == Clifft pays) = rotations + collapse.  LOC (localizer) is the separable implementation extra.
+static inline uint64_t  dense_flop_core(){ return dense_flop_rot() + dense_flop_collapse(); }
+
 // the verified kernel (linked from cpp/mdm_core_executor.cpp)
 extern "C" int mdm_execute_core(const cd* phi_in, cd* joint, cd* survivor,
     int r_in, int r_mat,
@@ -35,22 +47,39 @@ enum CoreMode { FORCE_ZERO = 0, FORCE_ONE = 1, USE_RANDOM = 2 };
 struct CoreResult { int outcome; double p0; double norm2; int r_out; };
 
 struct NativeDenseState {
-    std::vector<cd> resident, joint, survivor;   // all 2^max_work, allocated once
+    std::vector<cd> resident, joint, survivor;   // sized to 2^cap_rank (lazy-grow, monotone)
     int r = 0;                                   // current resident rank
-    int max_work = 0;
+    int max_work = 0;                            // soft cap from make_prog (peak_rank+2); informational
+    int cap_rank = -1;                           // log2(capacity) actually allocated so far
+    static constexpr int INIT_FLOOR = 4;         // start at 2^4 = 16 cd to avoid tiny-realloc churn
+
+    // Grow the three buffers to hold rank `need` (== 2^need amplitudes) if not already.  MONOTONE:
+    // capacity only ever increases and PERSISTS across shots (reset() never shrinks), so after the
+    // first shot reaches the circuit's peak materialized rank (maxM, the near-Clifford-localized core
+    // rank — NOT 2^max_work) every subsequent shot reuses the buffers with ZERO realloc in the hot
+    // loop (§11.10 invariant holds in steady state).  resident is PRESERVED across grow (resize keeps
+    // its first 2^r amplitudes); joint/survivor are kernel scratch so they are just re-sized to cap.
+    void ensure_cap(int need) {
+        if (need <= cap_rank) return;
+        size_t cap = (size_t)1 << need;
+        resident.resize(cap, cd(0, 0));          // preserve existing amplitudes (state lives here)
+        joint.resize(cap, cd(0, 0));             // scratch (kernel writes before read)
+        survivor.resize(cap, cd(0, 0));          // scratch (kernel writes before read)
+        cap_rank = need;
+    }
 
     void init(int max_work_rank) {
         max_work = max_work_rank;
-        size_t cap = (size_t)1 << max_work;
-        resident.assign(cap, cd(0, 0));
-        joint.assign(cap, cd(0, 0));
-        survivor.assign(cap, cd(0, 0));
+        cap_rank = -1;
+        resident.clear(); joint.clear(); survivor.clear();
+        ensure_cap(INIT_FLOOR < max_work ? INIT_FLOOR : (max_work > 0 ? max_work : 0));
         reset();
     }
-    void reset() { r = 0; resident[0] = cd(1, 0); }   // scalar-1 initial state, no realloc
+    void reset() { r = 0; resident[0] = cd(1, 0); }   // scalar-1 initial state, no realloc/shrink
 
     // load a resident state of rank `rank_` from amplitudes (for snapshot replay / engine resume)
     void set_state(int rank_, const cd* amps) {
+        ensure_cap(rank_);
         r = rank_; size_t N = (size_t)1 << r;
         for (size_t i = 0; i < N; i++) resident[i] = amps[i];
     }
@@ -64,6 +93,14 @@ struct NativeDenseState {
                             const double* rot_c, const double* rot_s, int nrot,
                             const int* lm_type, const int* lm_a, const int* lm_b, int nlm,
                             int m_bit, double sign, int mode, double rand_val) {
+        ensure_cap(r_mat);                       // lazy-grow: joint holds the 2^r_mat materialized core
+        // Dense FLOP (same convention as the oracle path + Clifft): each rotation 12(butterfly)/6(diag) x 2^r_mat,
+        // one measurement collapse 12 x 2^r_mat -> CORE; localizer h/s 12/6 x 2^r_mat -> LOC (cnot = perm = 0).
+        for (int i = 0; i < nrot; i++) dense_flop_rot() += (uint64_t)(rot_x[i] ? 12 : 6) << r_mat;
+        dense_flop_collapse() += (uint64_t)12 << r_mat;
+        if (r_mat > dense_peak_r()) dense_peak_r() = r_mat;
+        for (int i = 0; i < nlm; i++) { int ty = lm_type[i]; if (ty==0) dense_flop_loc() += (uint64_t)12 << r_mat;
+                                        else if (ty==1) dense_flop_loc() += (uint64_t)6 << r_mat; }
         double p0, p1, nrm; int srk;
         int outcome = mdm_execute_core(resident.data(), joint.data(), survivor.data(),
                                        r, r_mat, rot_x, rot_z, rot_pp, rot_c, rot_s, nrot,

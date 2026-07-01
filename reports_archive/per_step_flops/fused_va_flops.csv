@@ -1,9 +1,0 @@
-circuit,clifft_k,fused_ws,fused_matmul_flop,fused_norm_flop,fused_total_flop
-coherent_d3_r1,5,1,288,288,576
-coherent_d3_r3,8,4,50784,7020,57804
-coherent_d5_r1,13,1,864,864,1728
-coherent_d5_r5,24,12,141984000,26078540,168062540
-cultivation_d3,4,3,5088,1568,6656
-cultivation_d5,10,9,3445584,250400,3695984
-distillation,5,3,2808,860,3668
-surface_d7_r7,0,0,0,0,0

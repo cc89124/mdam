@@ -6,6 +6,6 @@ set -e
 cd "$(dirname "$0")"
 g++ -O3 -march=native -std=c++17 -DNDEBUG -shared -fPIC \
     native_mdam_vm.cpp \
-    ../clifft_axis/cpp/mdm_core_executor.cpp \
+    ../backend/clifft_axis/cpp/mdm_core_executor.cpp \
     -o native_mdam_vm.so
 echo "built native_mdam_vm.so ($(stat -c%s native_mdam_vm.so) bytes)"

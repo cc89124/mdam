@@ -1,14 +1,26 @@
-# Clifft Benchmark Scripts
+# clifft-paper — MDAM near-Clifford simulator
 
-Scripts for simulations and benchmarks from the [paper](https://arxiv.org/abs/2604.27058) introducing [Clifft](https://github.com/unitaryfoundation/clifft), a fast simulator for near-Clifford quantum circuits.
+This repo is organized around **`mdam`**, the MDAM near-Clifford simulator. The latest implementation is the
+**native batch VM** at [`mdam/native_vm/`](mdam/native_vm/), which runs cultivation_d3 magic-core sampling
+end-to-end in native C++, **bit-exact** to the in-tree Python oracle, reaching **~1.08–1.10× Clifft (parity)**.
 
-This repository houses each category of simulation in its own subflorder, with its own `pyproject.toml`, `uv.lock`, and installation flow.
+See [`PROJECT_STRUCTURE.md`](PROJECT_STRUCTURE.md) for the full layout and [`results/RESULTS.md`](results/RESULTS.md)
+for the result write-up.
 
-## Workspaces
+## Quick start
 
-| Workspace | Purpose | Notes |
-|-----------|---------|-------|
-| `qec_bench/` | QEC and paper-style benchmarks | Contains `clifford_bench`, `cultivation_bench`, `distillation_bench`, `coherent_noise_bench`, plus shared `bench_common.py` and `tsim_compile_check.py` |
-| `qv_bench/` | Quantum Volume benchmark | Separate environment for Qiskit, Qulacs, qsim, and Qrack dependencies |
-| `magic_state_cultivation/` | S-proxy vs T-gate magic state cultivation fidelity comparison | Reproduces and extends Gidney et al. (arXiv:2409.17595); requires a 512-qubit Clifft source build |
-| `ttn_backend/` | Experimental Python TTN backend, RASL analysis, memory-risk metrics, and validation scripts | See `ttn_backend/README.md`; run tools with `python -m ttn_backend.scripts.<name>` |
+```bash
+cd mdam/native_vm
+./build.sh
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
+  taskset -c 2 /home/jung/clifft_env/bin/python gate_k_shadow.py
+```
+
+## Layout (summary)
+
+- `mdam/` — the implementation: `frame/` (frame layer, was ttn_backend), `backend/` (near-Clifford backend,
+  was nearclifford_backend; holds the dense-core kernel `clifft_axis/cpp/`), `native_vm/` (the C++ native VM).
+- `qec_bench/` — benchmark circuits (experiment input).
+- `results/` — consolidated results (`RESULTS.md`).
+
+> External dependency: `clifft` (the reference simulator, installed separately) is imported by the verify scripts.

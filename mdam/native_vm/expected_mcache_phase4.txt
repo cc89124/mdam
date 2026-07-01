@@ -1,0 +1,38 @@
+### Phase-4 multi-seed correctness (SHADOW fingerprint mode1 + CARRY mode3) ###
+== distillation: 8 master seeds x 8000 = 64000 shots/pass ==
+   SHADOW(1) record!=auth = 0   edge mismatch(fingerprint) = 0
+   CARRY(3)  cold pass record!=auth = 0   warmed pass = 0
+   carry hit=611626 miss=31 antis=28314 pool=58 edges=31  mismatch=0
+   PASS
+
+== cultivation_d3: 8 master seeds x 8000 = 64000 shots/pass ==
+   SHADOW(1) record!=auth = 0   edge mismatch(fingerprint) = 0
+   CARRY(3)  cold pass record!=auth = 0   warmed pass = 0
+   carry hit=635793 miss=2854 antis=954 pool=2780 edges=2854  mismatch=0
+   PASS
+
+== cultivation_d5: 8 master seeds x 1500 = 12000 shots/pass ==
+   SHADOW(1) record!=auth = 0   edge mismatch(fingerprint) = 0
+   CARRY(3)  cold pass record!=auth = 0   warmed pass = 0
+   carry hit=295992 miss=62357 antis=267 pool=60308 edges=62357  mismatch=0
+   PASS
+
+### Phase-4 hit-cost decomposition (cyc; bottleneck was KEY-HASH, not snapshot restore) ###
+== distillation: timed 4000 shots, hits=19097 miss=0 ==
+   per-boundary:  key-hash=1299  lookup=68
+   per-HIT:       restore=133   hit-total=1564  (key+lookup+rng+restore)
+   per-LIVE/miss: measure_z=2636320  pool_intern=0  live-total=3206522
+   SNAPSHOT RESTORE share of hit = 8.5%   KEY-HASH share of hit = 83.0% (key over all bnd / total hit)
+
+== cultivation_d3: timed 4000 shots, hits=19976 miss=0 ==
+   per-boundary:  key-hash=1030  lookup=65
+   per-HIT:       restore=142   hit-total=1350  (key+lookup+rng+restore)
+   per-LIVE/miss: measure_z=286030  pool_intern=0  live-total=322706
+   SNAPSHOT RESTORE share of hit = 10.5%   KEY-HASH share of hit = 76.3% (key over all bnd / total hit)
+
+== cultivation_d5: timed 1500 shots, hits=22473 miss=0 ==
+   per-boundary:  key-hash=15845  lookup=1240
+   per-HIT:       restore=2141   hit-total=19434  (key+lookup+rng+restore)
+   per-LIVE/miss: measure_z=2204190  pool_intern=0  live-total=2672084
+   SNAPSHOT RESTORE share of hit = 11.0%   KEY-HASH share of hit = 81.5% (key over all bnd / total hit)
+

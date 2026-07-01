@@ -10,7 +10,7 @@ import os, sys, ctypes
 import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 import clifft
-from nearclifford_backend.backend import NearCliffordBackend
+from mdam.backend.backend import NearCliffordBackend
 from verify_mdam_oneshot import translate, load_lib, make_prog, pcg, BENCH, _ROOT
 
 def make_backend(prog):
