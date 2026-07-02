@@ -217,6 +217,7 @@ struct MdamShot {
     struct EngSnap { int r=0; std::vector<cd> dense; std::vector<int> M;
         std::vector<PackedPauli> ax, az, Xc, Zc; std::vector<PendingEntry> pend; uint32_t rot_uid=0; };
     std::vector<EngSnap> mc_pool;
+    size_t mc_pool_bytes_live=0;      // running sum of pooled snapshot bytes -> O(1) memory-budget estimate
     std::unordered_map<uint64_t,std::vector<int>> mc_pool_idx;          // exact-dedup: fingerprint -> pool ids (collision chain)
     struct MEdge { double p0=-2.0; uint8_t antis=0; bool has[2]={false,false}; int pool[2]={-1,-1}; uint8_t disp[2]={0,0};
                    int sid_out[2]={-1,-1}; };   // Phase-4 carry: dense-block id per outcome (so the next key needs NO dense re-hash)
@@ -249,7 +250,7 @@ struct MdamShot {
             default: return 6;
         }
     }
-    void mc_reset(){ mc_pool.clear(); mc_pool_idx.clear(); mc_edges.clear();
+    void mc_reset(){ mc_pool.clear(); mc_pool_idx.clear(); mc_edges.clear(); mc_pool_bytes_live=0;
         mc_hit=mc_miss=mc_partial=mc_antis=mc_verify=mc_mismatch=mc_restore=0;
         for(int i=0;i<8;i++){ mc_cyc[i]=0; mc_opcyc[i]=0; }
         bcap_intern.clear(); bcap_amp.clear(); }
@@ -268,7 +269,7 @@ struct MdamShot {
     }
     // Free the mcache (dense-core pool + edges).  Safe on demote: AUTH (run()) never reads it.
     void mc_pool_free(){ { std::vector<EngSnap> a; mc_pool.swap(a); }
-        mc_pool_idx.clear(); mc_edges.clear(); }
+        mc_pool_idx.clear(); mc_edges.clear(); mc_pool_bytes_live=0; }
     // ===== Clean-room SEGMENT/automaton SEPARABILITY shadow (path-3, default OFF, authoritative untouched) ==
     // Load-bearing premise of the lean boundary-walk: the boundary SIGNATURE sequence is a deterministic
     // automaton driven ONLY by Born outcomes.  The inter-boundary gate-walk (100% symbolic F2 on
@@ -489,7 +490,12 @@ struct MdamShot {
     int mc_pool_intern(){                                                          // dedup current engine post-state -> pool id
         uint64_t fp=eng_fingerprint(); auto& cand=mc_pool_idx[fp];
         for(int id:cand) if(eng_equal(mc_pool[id])) return id;
-        int id=(int)mc_pool.size(); mc_pool.emplace_back(); eng_snapshot(mc_pool.back()); cand.push_back(id); return id; }
+        int id=(int)mc_pool.size(); mc_pool.emplace_back(); eng_snapshot(mc_pool.back());
+        { const auto& s=mc_pool.back(); mc_pool_bytes_live += sizeof(EngSnap) + s.dense.capacity()*sizeof(cd)
+            + s.M.capacity()*sizeof(int)
+            + (s.ax.capacity()+s.az.capacity()+s.Xc.capacity()+s.Zc.capacity())*sizeof(PackedPauli)
+            + s.pend.capacity()*sizeof(PendingEntry); }
+        cand.push_back(id); return id; }
     uint64_t mc_key(int mp,int kind){
         uint64_t h=1469598103934665603ULL; int mm=mp; h=dfnv(h,&mm,4); h=dfnv(h,&kind,4);
         uint32_t a;
@@ -1453,11 +1459,14 @@ struct MdamShot {
     double ad_fb_demote=0.95;
     int    ad_final_policy=0; long ad_demote_shot=-1, ad_windows=0, ad_slow_shots=0;   // filled by adapt batch
     double ad_node_rate_init=-1, ad_node_rate_last=-1, ad_lean_ns_last=-1, ad_slow_ns_last=-1, ad_fb_rate_last=-1;
-    // EXACT, O(pool).  Called in the shot loop ONLY behind the O(1) fb gate (a hitting winner never reaches it),
-    // and once per run for stats.  Dense-core snapshot sizes vary within a circuit, so an O(1) last-snapshot
-    // proxy under-counts and demotes late (measured: d5_r5 slipped @191->@639, RSS 1.7GB->5.7GB) -> use exact.
+    // EXACT, O(pool): stats only (called ~1x/run).
     size_t ad_mem_est() const { return ln_id.size()*64 + ln_edge.size()*48 + ln_p0v.size()*9
                                      + mc_pool_bytes(); }
+    // O(1) memory-budget estimate for the shot loop: lean tables + the running dense-core byte counter
+    // (mc_pool_bytes_live, maintained at the single mc_pool_intern site).  mc_pool dense is the dominant term,
+    // so this tracks the exact ad_mem_est() closely (measured cult_d5: live vs exact within ~2%).
+    size_t ad_mem_est_live() const { return ln_id.size()*64 + ln_edge.size()*48 + ln_p0v.size()*9
+                                          + mc_pool_bytes_live; }
 
     int run_lean_adapt_batch(const MdamProgram& p, uint64_t num_shots,
                              uint64_t mshi, uint64_t mslo, uint64_t mihi, uint64_t milo,
@@ -1471,6 +1480,7 @@ struct MdamShot {
         ad_final_policy=0; ad_demote_shot=-1; ad_windows=0; ad_slow_shots=0;
         ad_node_rate_init=-1; ad_node_rate_last=-1; ad_lean_ns_last=-1; ad_slow_ns_last=-1; ad_fb_rate_last=-1;
         long   w_fb0=ln_fb_count; size_t w_node0=ln_id.size(); long w_shots=0;
+        size_t f_node0=ln_id.size();                 // fine-window (64-shot) node baseline for the memory-budget gate
         double w_t0=now_ns(), w_slow_sum=0; long w_slow_n=0; int bad_windows=0;
         // Demote = "cache won't close": stop growing it (sg_shadow off), free lean tables + dense-core mcache,
         // switch to AUTH (run(), constant memory).  run_mcache is NOT the demote target (it kept interning + is
@@ -1503,14 +1513,15 @@ struct MdamShot {
             std::memcpy(out_record+(size_t)sh*nm, record.bits.data(), nm);
             if(err){ if(out_err){ std::strncpy(out_err,err,errlen-1); out_err[errlen-1]=0; } return 1; }
             w_shots++;
-            // Fine OOM-safety (every 64 shots): heavy cache + ~all-miss => demote before OOM.  The fb gate
-            // (recent miss rate ~1.0) spares cult_d5 (has hits); the mem gate spares small-core 100%-fb circuits.
+            // MEMORY BUDGET (every 64 shots, O(1) via the live byte counter): a cache that has grown past the
+            // budget AND is still non-saturating (new nodes in this 64-window) => AUTH.  No fb gate: this fires for
+            // BOTH heavy-core all-miss (d5_r5, ~3.75MB/shot -> @191) AND light-core hitting-but-non-saturating
+            // caches (cult_d5, ~0.029MB/shot -> demotes near the budget instead of ballooning to multi-GB).  A
+            // saturating cache (node_rate~0) is spared even above budget; a small cache never reaches the budget.
+            // Bounding the cache is what makes shot-parallel scaling safe (else memory = budget x workers).
             if(policy==0 && (sh & 63)==63){
-                double fbr = w_shots>0 ? (double)(ln_fb_count-w_fb0)/(double)w_shots : 1.0;
-                // fb gate FIRST (O(1)): only a ~all-miss window can demote, so the exact O(pool) byte scan is
-                // skipped entirely for a hitting winner (cult_d5, fb~0.5) -> zero overhead.  When fb IS high the
-                // demote is early (d5_r5: sh~191) so the pool is still small and the exact scan is cheap.
-                if(fbr>ad_fb_demote && (long)ad_mem_est()>ad_mem_cap){ ad_fb_rate_last=fbr; do_demote((long)sh); }
+                double nr_fine=(double)(ln_id.size()-f_node0)/64.0; f_node0=ln_id.size();
+                if((long)ad_mem_est_live()>ad_mem_cap && nr_fine>ad_node_floor) do_demote((long)sh);
             }
             if(policy==0 && w_shots>=ad_window){  // window boundary: conservative demote decision
                 double lean_ns=(now_ns()-w_t0)/(double)w_shots;
@@ -1521,10 +1532,9 @@ struct MdamShot {
                 if(ad_node_rate_init<0) ad_node_rate_init=node_rate;
                 ad_node_rate_last=node_rate; ad_lean_ns_last=lean_ns; ad_slow_ns_last=slow_ns;
                 ad_fb_rate_last=(double)(ln_fb_count-w_fb0)/(double)w_shots;
-                // Unconditional hard cap = pure count backstop for maxM=0 localization (d7_r1/d5_r1: node table
-                // explodes, dense-core mcache stays tiny).  Memory-byte pressure is handled by the fine check
-                // above (fb-gated) so a heavy-but-hitting winner (cult_d5) is NOT force-demoted by bytes alone.
-                bool cap_hit=((long)node_now>ad_node_cap)||((long)ln_edge.size()>ad_edge_cap);
+                // Node/edge COUNT cap removed: the memory budget (fine check above) counts lean-table bytes too,
+                // so a node-table explosion (maxM=0 localization) trips the byte budget the same way -- and those
+                // circuits are already caught earlier by loc_demote.  Memory is now the single OOM/size backstop.
                 bool past_horizon=(long)sh>=ad_horizon;
                 bool not_decaying=node_rate>ad_node_floor;      // sustained new-node growth => non-saturating
                 bool cost_bad=slow_ns>0 && lean_ns>ad_cost_margin*slow_ns;
@@ -1535,7 +1545,7 @@ struct MdamShot {
                 // excludes every magic circuit (cult_*, coherent_d3_r3); the fb gate excludes maxM=0 circuits
                 // that DO saturate (surface, coherent_d3_r1: fb=0).  d7_r1/d5_r1 -> AUTH within one window.
                 bool loc_demote = !engine.magic_ever && ad_fb_rate_last>ad_fb_demote && not_decaying;
-                if(cap_hit || loc_demote || bad_windows>=ad_bad_needed) do_demote((long)sh);
+                if(loc_demote || bad_windows>=ad_bad_needed) do_demote((long)sh);
                 w_fb0=ln_fb_count; w_node0=ln_id.size(); w_shots=0; w_t0=now_ns(); w_slow_sum=0; w_slow_n=0;
             }
         }

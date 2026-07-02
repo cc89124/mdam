@@ -74,13 +74,20 @@ for bench,N in [("distillation",130000),("cultivation_d3",130000)]:
     print(f"  {bench:16s} N={N} single-call: final_policy={'AUTH!' if pol==1 else 'LEAN'} "
           f"nodes={nodes} node_rate_last={nrl:.4f} demote_shot={int(st2[1])}  {'PROTECTED' if pol==0 else 'REGRESSION!'}  ({dt2:.2f}s)")
 
-print(); print("="*78); print("(3b) DEMOTE PATH: fires when lean is genuinely worse (100% fallback); NOT when lean wins"); print("="*78)
-for bench,N in [("coherent_d3_r3",20000),("cultivation_d5",20000)]:
+print(); print("="*78); print("(3b) MEMORY BUDGET: a non-saturating cache is demoted to AUTH when it crosses the budget"); print("="*78)
+# coherent_d3_r3: tiny cores -> never hits the 512MB budget, demotes via the cost path (aggressive cfg).
+# cultivation_d5: light-but-non-saturating cache -> crosses 512MB and demotes on MEMORY (bounded RSS), NOT cost.
+import resource
+def rss(): return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024.0
+for bench,N,cfg in [("coherent_d3_r3",20000,(2048,-1,-1,-1,0,-1.0,1.0,1)),
+                    ("cultivation_d5",60000,None)]:            # cult_d5 DEFAULT cfg (512MB budget)
     ph,vm,va,nm=load(bench); setup_lean(vm); fresh(vm)
-    lib.nvm_adapt_config(vm, 2048, -1,-1,-1, 0, -1.0, 1.0, 1)   # horizon=0, cost_margin=1.0 => demote iff lean>slow
-    big=np.zeros((N,nm),np.uint8)
+    if cfg: lib.nvm_adapt_config(vm,*cfg)
+    big=np.zeros((N,nm),np.uint8); r0=rss()
     lib.nvm_run_lean_adapt_batch(ph,vm,N,*pcg(555),big.ctypes.data,eb,256)
     st=adapt_stats(vm); lib.nvm_sg_shadow(vm,0); lib.nvm_rb_static(0)
-    verdict = "DEMOTED (lean>slow, correct)" if int(st[0])==1 else "kept LEAN (lean<=slow, correct)"
-    print(f"  {bench:16s} N={N}: {'AUTH' if int(st[0])==1 else 'LEAN'} demote_shot={int(st[1])} "
-          f"lean_ns={st[6]:.0f} slow_ns={st[7]:.0f} node_rate={st[5]:.2f}  -> {verdict}")
+    dem=int(st[0])==1
+    why = "MEMORY budget" if bench=="cultivation_d5" else "cost path"
+    verdict = f"DEMOTED via {why} (bounded)" if dem else "kept LEAN (under budget)"
+    print(f"  {bench:16s} N={N}: {'AUTH@%d'%int(st[1]) if dem else 'LEAN'} "
+          f"mc_pool={int(st[12])} pool_MB={st[13]/1e6:.0f} peakRSS={rss():.0f}MB  -> {verdict}")

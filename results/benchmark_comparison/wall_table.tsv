@@ -8,21 +8,23 @@
 #           tables + the dense-core mcache (mc_pool) + turns off shadow interning -> AUTH at constant memory.
 #           adapt_policy: LEAN, or AUTH@<demote_shot>.
 # K reduction: k=nominal magic (Clifft dense=2^k); maxM=MDAM peak materialized magic (maxM<<k => strong localization).
-# ADAPTIVE demote triggers (3, each with a load-bearing gate; node_rate = new lean-nodes/shot):
-#   (1) fb-gated fine MEMORY check (every 64 shots): recent miss-rate>0.95 AND cache bytes>512MB.  The fb gate is checked
-#       FIRST (O(1)) so a hitting winner (cult_d5, fb~0.5) SKIPS the exact O(pool) byte scan = zero overhead; the mem gate
-#       spares small-core 100%-fb circuits.  Fires only for heavy-core all-miss: coherent_d5_r5 (maxM=12, 3.75MB/shot).
+# ADAPTIVE demote triggers (node_rate = new lean-nodes/shot):
+#   (1) MEMORY BUDGET (every 64 shots, O(1) via a running dense-core byte counter): cache bytes > ad_mem_cap (512MB
+#       default) AND still non-saturating (new nodes this 64-window).  This is the SINGLE OOM/size backstop -- it counts
+#       lean-table bytes too, so it also catches node-table explosions (the old node/edge COUNT cap was removed as
+#       redundant).  No fb gate: fires for BOTH heavy-core all-miss (coherent_d5_r5, ~3.75MB/shot -> AUTH@191) AND
+#       light-core hitting-but-non-saturating caches (cultivation_d5, ~0.029MB/shot -> AUTH@~20k, peak RSS 4.5GB->0.86GB).
+#       Bounding the cache makes shot-parallel scaling safe (else RSS = budget x workers).
 #   (2) !engine.magic_ever EARLY-LOCALIZATION demote (first window, no horizon wait): never-materialized-magic AND
 #       miss-rate>0.95 AND node_rate>floor.  !magic_ever excludes every magic circuit; the fb gate excludes maxM=0
 #       circuits that DO saturate (surface_d7_r7, coherent_d3_r1: fb=0).  Fires for d7_r1/d5_r1 (pure r<<k localization).
-#   (3) unconditional node/edge COUNT cap (OOM backstop) + conservative perf path (past horizon AND node_rate>floor AND
-#       windowed lean_ns>1.10*slow_ns over >=3 windows).  node_rate-DECAY (not fallback%) protects slow-saturating
-#       lean winners (cult_d3: node_rate -> ~0 past horizon => never demoted).
-# RESULTS: every LEAN winner stays LEAN (no regression); cult_d5 stays LEAN (fb gate); coherent_d5_r5 OOM SOLVED
-#   (was SIGKILL at ~3.6GB from the dense-core mcache growing unbounded on a 100%-miss non-saturating circuit; now
-#   AUTH@191, peak RSS 1.74GB, tables freed) and recovers auth; d7_r1/d5_r1 demote AUTH@4095 in the FIRST window and
-#   recover most of auth (were run_mcache-bound 1.94x/10145x); coherent_d3_r3 demotes to lazy-AUTH 0.42x which BEATS its
-#   own lean 0.36x (magic_ever=false at runtime = pure localization) -> best_path=adapt for that row.
+#   (3) conservative perf path (past horizon AND node_rate>floor AND windowed lean_ns>1.10*slow_ns over >=3 windows).
+#       node_rate-DECAY (not fallback%) protects slow-saturating lean winners (cult_d3: node_rate -> ~0 => never demoted).
+# RESULTS: every SATURATING lean winner stays LEAN (no regression); coherent_d5_r5 OOM SOLVED (was SIGKILL at ~3.6GB from
+#   the dense-core mcache growing unbounded; now AUTH@191, peak RSS 1.74GB, tables freed) and recovers auth; cultivation_d5
+#   NON-saturating cache is now MEMORY-BOUNDED (AUTH@~20k: peak RSS 4.5GB->0.86GB, speed 0.72x lean -> 0.41x auth = the
+#   memory-for-speed trade on a circuit that loses to Clifft either way); d7_r1/d5_r1 demote AUTH@4095 in the FIRST window
+#   (were run_mcache-bound 1.94x/10145x); coherent_d3_r3 demotes to lazy-AUTH 0.42x which BEATS its own lean 0.36x.
 # NOTES: coherent_d5_r5 adapt measured at N=8000 (probation = 191 heavy run_mcache shots dominates the finite-N average
 #   -> 764x; steady-state N->inf converges to auth 819x since the probation is a one-time 191-shot cost).  best_path =
 #   argmin over auth/lean/adapt (oracle).  Clifft = external paper baseline only (never referenced inside MDAM); ratios
@@ -34,7 +36,7 @@ distillation	5	3	85	11713.9	17875.3	0.66x	5894.3	1.99x	0.0	6058.8	1.93x	LEAN	lea
 cultivation_d3	4	3	21	2348.4	14914.2	0.16x	2142.5	1.10x	0.1	2153.9	1.09x	LEAN	lean	1.10x	magic-sat-saturates	OK
 coherent_d3_r1	5	0	17	1390.3	4540.4	0.31x	1356.1	1.03x	0.0	1459.5	0.95x	LEAN	lean	1.03x	small-k-saturates	OK
 surface_d7_r7	0	0	385	8993.8	21096.4	0.43x	8985.2	1.00x	0.0	9963.1	0.90x	LEAN	lean	1.00x	k0-pure-Clifford	OK
-cultivation_d5	10	9	112	82109.8	191335.6	0.43x	114173.6	0.72x	34.2	131917.0	0.62x	LEAN	lean	0.72x	magic-sat-cache-nonsat	OK
+cultivation_d5	10	9	112	82109.8	191335.6	0.43x	114173.6	0.72x	34.2	202466.0	0.41x	AUTH@19903	lean	0.72x	magic-nonsat-membudget	OK
 coherent_d3_r3	8	4	33	14098.8	46602.6	0.30x	39230.3	0.36x	100.0	33196.3	0.42x	AUTH@4095	adapt	0.42x	small-k-loc-nonsat	OK
 coherent_d5_r1	13	0	49	205263.3	29980.3	6.85x	107729.5	1.91x	98.4	36694.0	5.59x	AUTH@4095	auth	6.85x	r<<k-localization	OK
 coherent_d7_r1	25	0	97	3996135191.4	112357.7	35566.63x	402481.1	9928.75x	100.0	145996.5	27371.44x	AUTH@4095	auth	35566.63x	r<<k-localization	OK

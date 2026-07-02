@@ -56,17 +56,21 @@ the `adaptive` path is a new opt-in unifier (default OFF). Full write-up: `mdam/
   fill the cache). Lean-optimistic start; on judging the cache won't close, **sticky demote straight to `AUTH`
   (`run()`, == `sample_batch`)** — *not* `run_mcache` (which kept interning → OOM and is slower than auth on
   localization). On demote it stops shadow interning (`sg_shadow=0`) and **frees the lean tables + the dense-core
-  mcache (`mc_pool`)**, so AUTH runs at constant memory. Demote fires on: (1) an **fb-gated fine memory check**
-  (every 64 shots, fb checked first so a hitting winner skips the byte scan) — the OOM guard for heavy-core
-  non-saturating circuits (`coherent_d5_r5`, maxM=12, ~3.75 MB/shot → AUTH@191, RSS 1.7 GB vs prior SIGKILL);
-  (2) a **`!engine.magic_ever` early-localization demote** in the first window (never-materialized-magic + ~all-miss
-  + growing node table) for maxM=0 pure localization (`d7_r1`/`d5_r1` → AUTH@4095, recovering most of auth
-  27371×/5.59×, up from run_mcache-bound 10145×/1.94×); or (3) an unconditional node/edge count cap + the
-  conservative perf path (past horizon **and** `node_rate` above floor **and** windowed lean cost > slow cost).
-  Each gate is load-bearing: the memory gate spares small-core 100%-fb circuits, the fb gate spares heavy-but-hitting
-  winners (`cultivation_d5`, fb≈0.5), `!magic_ever` separates localization from magic winners, and the fb gate within
-  maxM=0 keeps saturating pure-Clifford circuits (`surface_d7_r7`, `coherent_d3_r1`, fb=0) in LEAN. **Output is
-  bit-identical to `lean`/auth**; policy only changes speed. Config: `nvm_adapt_config` (+ `ad_mem_cap`,
+  mcache (`mc_pool`)**, so AUTH runs at constant memory. Demote fires on: (1) a **memory-budget check** (every 64
+  shots, O(1) via a running dense-core byte counter): cache bytes > `ad_mem_cap` (512 MB) **and** still
+  non-saturating. This is the **single OOM/size backstop** — it counts lean-table bytes too, so a node-table
+  explosion trips it as well (the old node/edge count cap was removed as redundant). No fb gate: it catches both
+  heavy-core all-miss (`coherent_d5_r5`, ~3.75 MB/shot → AUTH@191, RSS 1.7 GB vs prior SIGKILL) **and** light-core
+  non-saturating caches (`cultivation_d5`, ~0.029 MB/shot → AUTH@~20k, peak RSS 4.5 GB → 0.86 GB, bounding a cache
+  that otherwise balloons to multi-GB); (2) a **`!engine.magic_ever` early-localization demote** in the first window
+  (never-materialized-magic + ~all-miss + growing node table) for maxM=0 pure localization (`d7_r1`/`d5_r1` →
+  AUTH@4095, recovering most of auth 27371×/5.59×, up from run_mcache-bound 10145×/1.94×); or (3) the conservative
+  perf path (past horizon **and** `node_rate` above floor **and** windowed lean cost > slow cost).
+  Each gate is load-bearing: the memory gate's *non-saturating* condition spares small saturating winners
+  (`distillation`, `cultivation_d3` — caches too small to reach the budget), `!magic_ever` separates localization
+  from magic winners, and the fb gate within it keeps saturating pure-Clifford circuits (`surface_d7_r7`,
+  `coherent_d3_r1`, fb=0) in LEAN. Bounding the cache keeps shot-parallel memory at `budget × workers` rather than
+  unbounded. **Output is bit-identical to `lean`/auth**; policy only changes speed. Config: `nvm_adapt_config` (+ `ad_mem_cap`,
   `ad_fb_demote`); stats: `nvm_adapt_stats` (**14 doubles** — callers allocate ≥`D*14`). Verified by
   `verify_adaptive.py` (bit-exact across the switch + cult_d3/distillation/cult_d5 stay LEAN + demote fires) and
   `check_demote_auth.py` (d5_r5/d7_r1/d5_r1: no OOM, tables freed, recover auth). Segment-level mid-shot handoff /
