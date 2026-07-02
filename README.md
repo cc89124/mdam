@@ -222,9 +222,4 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 - `adaptive_wall.py` — 벤치별 cold-amortized 성능 측정(위 결과표를 만드는 스크립트).
 - `check_demote_auth.py` — OOM 해소·LEAN→AUTH 전환·peak RSS 확인.
 
-**"기본 OFF"의 뜻:** native VM에서 `lean`/`adaptive` 같은 빠른 경로는 **명시적으로 켜야** 도는 opt-in
-플래그다. 아무것도 안 켜면 기본은 authoritative `run()` / `nvm_mdam_sample_batch`(= 정답 기준)로 돈다. 위
-스크립트가 이 플래그를 켜고 검증한다. 즉 **authoritative 경로는 손대지 않았고**, 나머지 경로가 그것과
-bit-exact인지 검사받는 구조다.
-
 ---
