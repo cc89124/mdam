@@ -253,6 +253,22 @@ struct MdamShot {
         mc_hit=mc_miss=mc_partial=mc_antis=mc_verify=mc_mismatch=mc_restore=0;
         for(int i=0;i<8;i++){ mc_cyc[i]=0; mc_opcyc[i]=0; }
         bcap_intern.clear(); bcap_amp.clear(); }
+    // Actual heavy memory of the mcache: each pooled EngSnap holds a 2^r dense core (dominant term, 16B/amp).
+    // A non-saturating circuit grows mc_pool one snapshot per distinct post-boundary state -> unbounded.  Used
+    // by the adaptive memory guard so a runaway probation demotes to AUTH BEFORE OOM (not just ln_id count).
+    size_t mc_pool_bytes() const {
+        size_t b = mc_pool.size()*sizeof(EngSnap);
+        for(const auto& s: mc_pool){
+            b += s.dense.capacity()*sizeof(cd) + s.M.capacity()*sizeof(int)
+               + (s.ax.capacity()+s.az.capacity()+s.Xc.capacity()+s.Zc.capacity())*sizeof(PackedPauli)
+               + s.pend.capacity()*sizeof(PendingEntry);
+        }
+        size_t ec=0; for(const auto& m: mc_edges) ec+=m.size();
+        return b + ec*(sizeof(MEdge)+16) + mc_pool_idx.size()*24;
+    }
+    // Free the mcache (dense-core pool + edges).  Safe on demote: AUTH (run()) never reads it.
+    void mc_pool_free(){ { std::vector<EngSnap> a; mc_pool.swap(a); }
+        mc_pool_idx.clear(); mc_edges.clear(); }
     // ===== Clean-room SEGMENT/automaton SEPARABILITY shadow (path-3, default OFF, authoritative untouched) ==
     // Load-bearing premise of the lean boundary-walk: the boundary SIGNATURE sequence is a deterministic
     // automaton driven ONLY by Born outcomes.  The inter-boundary gate-walk (100% symbolic F2 on
@@ -1418,6 +1434,112 @@ struct MdamShot {
         }
         if (out_err) out_err[0] = 0;
         return 0;
+    }
+
+    // ==== Adaptive bounded-regret executor (opt-in via run_lean_adapt_batch; default path unchanged) ====
+    // lean optimistic start; conservative sticky demote to SLOW_ONLY (= run_mcache direct, NOT raw auth).
+    // Runtime lazy cache only (no offline prefill) — every shot is a real output, cache builds inline.
+    // Demote ONLY on (hard table/memory cap) OR (past horizon AND node_rate still above floor AND tail lean
+    // cost > slow cost) sustained over ad_bad_needed windows.  node_rate floor (not absolute fb) is the key
+    // signal: a slow-saturating lean winner (cult_d3) has node_rate -> ~0 past horizon so it is NEVER demoted;
+    // a genuinely non-saturating circuit (cult_d5) keeps node_rate high.  Config via nvm_adapt_config.
+    long   ad_window=4096, ad_node_cap=1000000, ad_edge_cap=4000000, ad_mem_cap=512L*1024*1024, ad_horizon=100000;
+    double ad_node_floor=0.02, ad_cost_margin=1.10; int ad_bad_needed=3;
+    // Fine-grained OOM-safety demote (checked every 64 shots, separate from the 4096 perf-window): if the cache
+    // memory crosses ad_mem_cap AND the recent miss(fallback) rate is ~1.0, LEAN is pure waste on a heavy-core
+    // circuit (d5_r5: 3.75MB/shot, fb=1.0) -> demote to AUTH BEFORE OOM.  Two independent gates each protect a
+    // different LEAN winner: the mem gate spares small-core 100%-fb circuits (coherent_d3_r3, maxM=4); the fb gate
+    // spares heavy-but-hitting circuits (cult_d5, fb~0.5<floor).  Cost(lean vs slow) does NOT separate them.
+    double ad_fb_demote=0.95;
+    int    ad_final_policy=0; long ad_demote_shot=-1, ad_windows=0, ad_slow_shots=0;   // filled by adapt batch
+    double ad_node_rate_init=-1, ad_node_rate_last=-1, ad_lean_ns_last=-1, ad_slow_ns_last=-1, ad_fb_rate_last=-1;
+    // EXACT, O(pool).  Called in the shot loop ONLY behind the O(1) fb gate (a hitting winner never reaches it),
+    // and once per run for stats.  Dense-core snapshot sizes vary within a circuit, so an O(1) last-snapshot
+    // proxy under-counts and demotes late (measured: d5_r5 slipped @191->@639, RSS 1.7GB->5.7GB) -> use exact.
+    size_t ad_mem_est() const { return ln_id.size()*64 + ln_edge.size()*48 + ln_p0v.size()*9
+                                     + mc_pool_bytes(); }
+
+    int run_lean_adapt_batch(const MdamProgram& p, uint64_t num_shots,
+                             uint64_t mshi, uint64_t mslo, uint64_t mihi, uint64_t milo,
+                             uint8_t* out_record, char* out_err, int errlen){
+        NativeRng master; master.seed_from_state(mshi, mslo, mihi, milo);
+        const uint64_t RNG_EXCL = ((uint64_t)1 << 63) - 1;
+        const size_t nm = (size_t)p.num_measurements;
+        int policy = 0;                          // 0=LEAN, 1=AUTH (sticky).  run_mcache is NOT a policy:
+        bool auth_first=false;                   //   it is only the LEAN-miss recovery fallback.  Demote => AUTH.
+        engine.magic_ever=false;                 // high-water reset: track whether THIS batch ever materializes magic
+        ad_final_policy=0; ad_demote_shot=-1; ad_windows=0; ad_slow_shots=0;
+        ad_node_rate_init=-1; ad_node_rate_last=-1; ad_lean_ns_last=-1; ad_slow_ns_last=-1; ad_fb_rate_last=-1;
+        long   w_fb0=ln_fb_count; size_t w_node0=ln_id.size(); long w_shots=0;
+        double w_t0=now_ns(), w_slow_sum=0; long w_slow_n=0; int bad_windows=0;
+        // Demote = "cache won't close": stop growing it (sg_shadow off), free lean tables + dense-core mcache,
+        // switch to AUTH (run(), constant memory).  run_mcache is NOT the demote target (it kept interning + is
+        // slower than auth on localization).  Shared by the fine OOM-safety check and the perf-window decision.
+        auto do_demote = [&](long at){
+            policy=1; ad_demote_shot=at; sg_shadow=0;
+            { std::unordered_map<uint64_t,int> a,b; ln_id.swap(a); ln_edge.swap(b); }
+            { std::unordered_map<uint64_t,double> a; sg_p0.swap(a); }
+            { std::unordered_map<uint64_t,uint8_t> a; sg_antis.swap(a); }
+            { std::unordered_map<uint64_t,uint64_t> a; sg_trans.swap(a); }
+            ln_p0v.clear(); ln_p0v.shrink_to_fit(); ln_antisv.clear(); ln_antisv.shrink_to_fit();
+            mc_pool_free();
+            batch_lazy_hint=true; engine.magic_ever=false; auth_first=true;   // clean AUTH lazy-probe
+        };
+        for (uint64_t sh=0; sh<num_shots; sh++){
+            uint64_t sd=master.bounded(RNG_EXCL);
+            __uint128_t st,inc; SeedExpand::seedseq_pcg64(sd,st,inc);
+            uint64_t shi=(uint64_t)(st>>64),slo=(uint64_t)st,ihi=(uint64_t)(inc>>64),ilo=(uint64_t)inc;
+            if(policy==1){                        // AUTH sticky: authoritative path (== sample_batch), no cache/shadow.
+                reset_shot(p,shi,slo,ihi,ilo);
+                if (fb_mode != FB_OFF) run_fb(p); else run(p);
+                if (auth_first){ if (lazy_env()==-1) batch_lazy_hint = !engine.magic_ever; auth_first=false; }
+                ad_slow_shots++;
+            } else {                              // LEAN optimistic + miss fallback (builds cache lazily)
+                reset_shot(p,shi,slo,ihi,ilo); run_lean(p);
+                if(ln_incomplete){ ln_fb_count++; double ts=now_ns();
+                    reset_shot(p,shi,slo,ihi,ilo); run_mcache(p);
+                    w_slow_sum+=now_ns()-ts; w_slow_n++; }
+            }
+            std::memcpy(out_record+(size_t)sh*nm, record.bits.data(), nm);
+            if(err){ if(out_err){ std::strncpy(out_err,err,errlen-1); out_err[errlen-1]=0; } return 1; }
+            w_shots++;
+            // Fine OOM-safety (every 64 shots): heavy cache + ~all-miss => demote before OOM.  The fb gate
+            // (recent miss rate ~1.0) spares cult_d5 (has hits); the mem gate spares small-core 100%-fb circuits.
+            if(policy==0 && (sh & 63)==63){
+                double fbr = w_shots>0 ? (double)(ln_fb_count-w_fb0)/(double)w_shots : 1.0;
+                // fb gate FIRST (O(1)): only a ~all-miss window can demote, so the exact O(pool) byte scan is
+                // skipped entirely for a hitting winner (cult_d5, fb~0.5) -> zero overhead.  When fb IS high the
+                // demote is early (d5_r5: sh~191) so the pool is still small and the exact scan is cheap.
+                if(fbr>ad_fb_demote && (long)ad_mem_est()>ad_mem_cap){ ad_fb_rate_last=fbr; do_demote((long)sh); }
+            }
+            if(policy==0 && w_shots>=ad_window){  // window boundary: conservative demote decision
+                double lean_ns=(now_ns()-w_t0)/(double)w_shots;
+                size_t node_now=ln_id.size();
+                double node_rate=(double)(node_now-w_node0)/(double)w_shots;
+                double slow_ns=w_slow_n>0? w_slow_sum/(double)w_slow_n : 0.0;
+                ad_windows++;
+                if(ad_node_rate_init<0) ad_node_rate_init=node_rate;
+                ad_node_rate_last=node_rate; ad_lean_ns_last=lean_ns; ad_slow_ns_last=slow_ns;
+                ad_fb_rate_last=(double)(ln_fb_count-w_fb0)/(double)w_shots;
+                // Unconditional hard cap = pure count backstop for maxM=0 localization (d7_r1/d5_r1: node table
+                // explodes, dense-core mcache stays tiny).  Memory-byte pressure is handled by the fine check
+                // above (fb-gated) so a heavy-but-hitting winner (cult_d5) is NOT force-demoted by bytes alone.
+                bool cap_hit=((long)node_now>ad_node_cap)||((long)ln_edge.size()>ad_edge_cap);
+                bool past_horizon=(long)sh>=ad_horizon;
+                bool not_decaying=node_rate>ad_node_floor;      // sustained new-node growth => non-saturating
+                bool cost_bad=slow_ns>0 && lean_ns>ad_cost_margin*slow_ns;
+                if(past_horizon && not_decaying && cost_bad) bad_windows++; else bad_windows=0;
+                // Early localization demote: a circuit that NEVER materialized magic (maxM=0, pure Clifford r<<k
+                // localization) with ~all misses and a still-growing node table -> AUTH is trivially cheap and
+                // the cache is pure waste.  Fires at the FIRST window (no long horizon needed): !magic_ever
+                // excludes every magic circuit (cult_*, coherent_d3_r3); the fb gate excludes maxM=0 circuits
+                // that DO saturate (surface, coherent_d3_r1: fb=0).  d7_r1/d5_r1 -> AUTH within one window.
+                bool loc_demote = !engine.magic_ever && ad_fb_rate_last>ad_fb_demote && not_decaying;
+                if(cap_hit || loc_demote || bad_windows>=ad_bad_needed) do_demote((long)sh);
+                w_fb0=ln_fb_count; w_node0=ln_id.size(); w_shots=0; w_t0=now_ns(); w_slow_sum=0; w_slow_n=0;
+            }
+        }
+        ad_final_policy=policy; if(out_err) out_err[0]=0; return 0;
     }
 
 #ifdef MDAM_PROFILE

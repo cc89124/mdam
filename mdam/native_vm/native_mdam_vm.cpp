@@ -688,6 +688,31 @@ int nvm_run_lean_fb_batch(void* prog, void* vm, uint64_t num_shots,
     auto& p=*reinterpret_cast<MdamProgram*>(prog); auto& s=*reinterpret_cast<MdamShot*>(vm);
     return s.run_lean_fb_batch(p, num_shots, mshi,mslo,mihi,milo, out_record, out_err, errlen);
 }
+// Adaptive bounded-regret executor: lean optimistic start + conservative sticky SLOW_ONLY demote.
+// Output is bit-identical to nvm_run_lean_fb_batch (policy changes speed, never per-shot record).
+int nvm_run_lean_adapt_batch(void* prog, void* vm, uint64_t num_shots,
+                             uint64_t mshi, uint64_t mslo, uint64_t mihi, uint64_t milo,
+                             uint8_t* out_record, char* out_err, int errlen){
+    auto& p=*reinterpret_cast<MdamProgram*>(prog); auto& s=*reinterpret_cast<MdamShot*>(vm);
+    return s.run_lean_adapt_batch(p, num_shots, mshi,mslo,mihi,milo, out_record, out_err, errlen);
+}
+// config: window, node_cap, edge_cap, mem_cap(bytes), horizon(shots), node_floor, cost_margin, bad_needed
+void nvm_adapt_config(void* vm, long window, long node_cap, long edge_cap, long mem_cap, long horizon,
+                      double node_floor, double cost_margin, int bad_needed){
+    auto& s=*reinterpret_cast<MdamShot*>(vm);
+    if(window>0)     s.ad_window=window;      if(node_cap>0) s.ad_node_cap=node_cap;
+    if(edge_cap>0)   s.ad_edge_cap=edge_cap;  if(mem_cap>0)  s.ad_mem_cap=mem_cap;
+    if(horizon>=0)   s.ad_horizon=horizon;    if(node_floor>=0) s.ad_node_floor=node_floor;
+    if(cost_margin>0)s.ad_cost_margin=cost_margin; if(bad_needed>0) s.ad_bad_needed=bad_needed;
+}
+// out: 0 final_policy(0=LEAN,1=SLOW_ONLY), 1 demote_shot, 2 windows, 3 slow_shots, 4 node_rate_init,
+//      5 node_rate_last, 6 lean_ns_last, 7 slow_ns_last, 8 fb_rate_last, 9 nodes, 10 edges, 11 mem_est_bytes
+void nvm_adapt_stats(void* vm, double* out){ auto& s=*reinterpret_cast<MdamShot*>(vm);
+    out[0]=s.ad_final_policy; out[1]=(double)s.ad_demote_shot; out[2]=(double)s.ad_windows;
+    out[3]=(double)s.ad_slow_shots; out[4]=s.ad_node_rate_init; out[5]=s.ad_node_rate_last;
+    out[6]=s.ad_lean_ns_last; out[7]=s.ad_slow_ns_last; out[8]=s.ad_fb_rate_last;
+    out[9]=(double)s.ln_id.size(); out[10]=(double)s.ln_edge.size(); out[11]=(double)s.ad_mem_est();
+    out[12]=(double)s.mc_pool.size(); out[13]=(double)s.mc_pool_bytes(); }
 // out: 0 distinct_edges, 1 edge_checks, 2 edge_viol, 3 boundaries, 4 p0_checks, 5 p0_viol,
 //      6 antis_checks, 7 antis_viol, 8 distinct_nodes(p0 map size)
 void nvm_sg_stats(void* vm, long* out){ auto& s=*reinterpret_cast<MdamShot*>(vm);

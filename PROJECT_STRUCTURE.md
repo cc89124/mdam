@@ -7,11 +7,15 @@ is the **native batch VM** (`mdam/native_vm/`), which verifies bit-exact against
 ```
 clifft-paper/
   mdam/                         # THE implementation (everything needed to run)
-    frame/                      #   frame layer / TTN base   (was: ttn_backend)
+    frame/                      #   Pauli/Clifford frame layer   (was: ttn_backend)
     backend/                    #   near-Clifford backend     (was: nearclifford_backend)
       clifft_axis/cpp/          #     dense measurement-core kernel (mdm_core_executor.cpp)
-    native_vm/                  #   C++ native batch VM — the latest impl (Gate K parity result)
-  qec_bench/                    # experiment INPUT: benchmark circuits (cultivation_d3.stim, …)
+    native_vm/                  #   C++ native batch VM — auth + lean + adaptive executor
+    MDAM_auth_vs_lean.md        #   auth vs lean execution paths: principle · when each wins · decision rule
+    MDAM_localized_computation.md #  localization write-up
+  qec_bench/                    # experiment INPUT: benchmark circuits + BENCHMARKS.md (per-circuit doc)
+  results/benchmark_comparison/ # wall_table.tsv/.md — auth + lean columns + best_path per bench
+  distillation_scaling/         # scaling study (distillation-STYLE family; RESULTS.md has honest caveats)
   results/                      # experiment RESULTS: RESULTS.md (consolidated)
   PROJECT_STRUCTURE.md  README.md  LICENSE
 ```
@@ -20,9 +24,10 @@ clifft-paper/
 
 Three layers, bottom-up (single clean dependency direction `frame → backend → native_vm`):
 
-- **`mdam/frame/`** *(was `ttn_backend`)* — the Pauli frame layer + TTN base. The native VM verifies against
-  `mdam.frame.frame_layer`. Core modules: `frame_layer`, `clifford_frame`, `core`, `treewidth` (+ a few
-  supporting modules).
+- **`mdam/frame/`** *(was `ttn_backend`)* — the Pauli/Clifford frame layer (the `U_C` in `|ψ⟩=U_C|χ⟩`). The
+  native VM uses **only** `mdam.frame.frame_layer` (for verification). The package is the renamed old `ttn_backend`
+  and still contains a legacy tree-tensor-network backend (`core.py`'s `TTNBackend`) from an earlier approach that
+  the current near-Clifford path (auth/lean/adaptive) does **not** use.
 - **`mdam/backend/`** *(was `nearclifford_backend`)* — the authoritative near-Clifford backend (the Python
   **oracle** the native VM is verified against, via `be.run_shot`). Modules: `backend`, `block_magic`,
   `lazy`, `simulator`, plus the magic-core engine `clifft_axis/` (Python: `bounded`, `engine`, `policy3`,
@@ -33,8 +38,45 @@ Three layers, bottom-up (single clean dependency direction `frame → backend �
     `mdm_core_executor.cpp` (`mdm_execute_core`); it is self-contained (stdlib only).
 - **`mdam/native_vm/`** — **the latest implementation.** A C++ batch VM that runs the magic-core sampling
   end-to-end in native code, **bit-exact** to the Python oracle, native path default OFF. `./build.sh` rebuilds
-  `native_mdam_vm.so` (byte-identical 387 944 bytes). See `mdam/native_vm/README.md` for the cmode table and
-  per-file roles. Verification harness: `verify_mdam_oneshot.py`, `verify_mdam_batch.py`, `gate_k_*.py`.
+  `native_mdam_vm.so`. See `mdam/native_vm/README.md` for the cmode table and per-file roles. Verification
+  harness: `verify_mdam_oneshot.py`, `verify_mdam_batch.py`, `gate_k_*.py`, `verify_adaptive.py`.
+
+## Execution paths (auth / lean / adaptive)
+
+There are three runtime paths in the native VM; **`auth` and the current `lean` are behaviorally unchanged**,
+the `adaptive` path is a new opt-in unifier (default OFF). Full write-up: `mdam/MDAM_auth_vs_lean.md`.
+
+- **`auth` (authoritative)** — `nvm_mdam_sample_batch` / `run()`. No cache, exact per-shot, constant time. The
+  bit-exact reference. Wins via `r≪k` localization (coherent benches: e.g. d7_r1 ~10⁴× vs the Clifft paper baseline).
+- **`lean`** — `nvm_run_lean_fb_batch` / `run_lean` + miss-fallback to `run_mcache` (best-stack). Skips the engine
+  gate-walk via a magic-core boundary **automaton built lazily at runtime** (no offline prefill; every shot is a
+  real output). Wins iff the automaton **saturates** (distillation, cult_d3, rx_d3). Flags default OFF.
+- **`adaptive`** — `nvm_run_lean_adapt_batch` (this session). **Exactly two production policies, `LEAN` and
+  `AUTH`.** `run_mcache` is **not** a third policy — it is only the LEAN-miss recovery fallback (recover the shot +
+  fill the cache). Lean-optimistic start; on judging the cache won't close, **sticky demote straight to `AUTH`
+  (`run()`, == `sample_batch`)** — *not* `run_mcache` (which kept interning → OOM and is slower than auth on
+  localization). On demote it stops shadow interning (`sg_shadow=0`) and **frees the lean tables + the dense-core
+  mcache (`mc_pool`)**, so AUTH runs at constant memory. Demote fires on: (1) an **fb-gated fine memory check**
+  (every 64 shots, fb checked first so a hitting winner skips the byte scan) — the OOM guard for heavy-core
+  non-saturating circuits (`coherent_d5_r5`, maxM=12, ~3.75 MB/shot → AUTH@191, RSS 1.7 GB vs prior SIGKILL);
+  (2) a **`!engine.magic_ever` early-localization demote** in the first window (never-materialized-magic + ~all-miss
+  + growing node table) for maxM=0 pure localization (`d7_r1`/`d5_r1` → AUTH@4095, recovering most of auth
+  27371×/5.59×, up from run_mcache-bound 10145×/1.94×); or (3) an unconditional node/edge count cap + the
+  conservative perf path (past horizon **and** `node_rate` above floor **and** windowed lean cost > slow cost).
+  Each gate is load-bearing: the memory gate spares small-core 100%-fb circuits, the fb gate spares heavy-but-hitting
+  winners (`cultivation_d5`, fb≈0.5), `!magic_ever` separates localization from magic winners, and the fb gate within
+  maxM=0 keeps saturating pure-Clifford circuits (`surface_d7_r7`, `coherent_d3_r1`, fb=0) in LEAN. **Output is
+  bit-identical to `lean`/auth**; policy only changes speed. Config: `nvm_adapt_config` (+ `ad_mem_cap`,
+  `ad_fb_demote`); stats: `nvm_adapt_stats` (**14 doubles** — callers allocate ≥`D*14`). Verified by
+  `verify_adaptive.py` (bit-exact across the switch + cult_d3/distillation/cult_d5 stay LEAN + demote fires) and
+  `check_demote_auth.py` (d5_r5/d7_r1/d5_r1: no OOM, tables freed, recover auth). Segment-level mid-shot handoff /
+  node-snapshot deopt is **deferred**; SIMD multi-shot is the separate speed axis for the saturating benches.
+
+> The `wall_table` reports `best_path = argmin over {auth, lean, adapt}` as an **oracle** (measure all, pick best);
+> the adaptive path is the runtime realization for the uniform-profile circuits in the current suite, and for a few
+> rows (e.g. `coherent_d3_r3`) the demote-to-lazy-AUTH it finds is itself the best measured path. Clifft is an
+> **external paper baseline only** — never referenced inside MDAM; speedups are reported as factual ratios, losses
+> included, no "beats Clifft" framing.
 
 > Naming: `ttn_backend` → `mdam.frame`, `nearclifford_backend` → `mdam.backend` (imports rewritten across the
 > tree). Those old top-level package names no longer exist.
