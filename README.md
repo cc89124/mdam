@@ -45,7 +45,7 @@ MDAM은 회로별로 AUTH와 LEAN 중 유리한 경로를 선택한다. AUTH는 
 
 **Environment.** Intel Core i7-8700K (3.7 GHz), 32 GB RAM, Linux. 두 시뮬레이터 모두 단일 코어에
 고정(taskset)하고 single-thread BLAS로 실행한다. 각 수치는 cold-start 배치 하나의 총 실행시간을
-shot 수로 나눈 값(cold-amortized wall-clock)이며, `speedup = clifft_ns / mdam_ns`.
+shot 수로 나눈 값이며, `speedup = clifft_ns / mdam_ns`.
 
 | Benchmark         |  k | maxM | route          |    Adaptive | AUTH-only | LEAN-only |
 | ----------------- | -: | ---: | -------------- | ----------: | --------: | --------: |
