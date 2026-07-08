@@ -304,7 +304,7 @@ G_j=(o_{j,1},o_{j,2},\dots,o_{j,g_j}).
 $M_j$는 active measurement boundary다.
 
 ```math
-M_j=(p_j^{\mathrm{phys}},\operatorname{slot}_j,\text{reset/update rule}).
+M_j=(p_j^{\mathrm{phys}},\mathrm{slot}_j,\text{reset/update rule}).
 ```
 
 ---
@@ -507,7 +507,7 @@ if (record[k]) {
 C_{\mathrm{feedback}}=O(N/w)
 ```
 
-또는 support가 작으면 $O(\operatorname{supp}/w)$.
+또는 support가 작으면 $O(\mathrm{supp}/w)$.
 
 ## 4.5 G 구간 전체 비용
 
@@ -676,7 +676,7 @@ pending list:
 먼저 현재 node가 이미 표현하는 subspace를 $\mathcal W_{v}$라고 하자.
 
 ```math
-\mathcal W_v=\operatorname{span}_{\mathbb F_2}(B_v).
+\mathcal W_v=\mathrm{span}_{\mathbb F_2}(B_v).
 ```
 
 measurement boundary에서 필요한 초기 set은:
@@ -684,7 +684,7 @@ measurement boundary에서 필요한 초기 set은:
 ```math
 \mathcal A^{(0)}_{i,j}
 =
-\mathcal W_{v_i^j}+\operatorname{span}\{\tilde p_{i,j}\}.
+\mathcal W_{v_i^j}+\mathrm{span}\{\tilde p_{i,j}\}.
 ```
 
 이제 pending rotations를 시간 순서대로 또는 backward dependency 순서로 검사한다.
@@ -704,7 +704,7 @@ q_a\text{ is not added at this step.}
 \quad\Rightarrow\quad
 \mathcal A^{(s+1)}_{i,j}
 =
-\mathcal A^{(s)}_{i,j}+\operatorname{span}\{q_a\}.
+\mathcal A^{(s)}_{i,j}+\mathrm{span}\{q_a\}.
 ```
 
 fixed point까지 반복한다.
@@ -712,7 +712,7 @@ fixed point까지 반복한다.
 ```math
 \mathcal A_{i,j}
 =
-\operatorname{Fix}
+\mathrm{Fix}
 \left(
 \mathcal W_{v_i^j},\tilde p_{i,j},\{q_a\}_{a=1}^{\ell}
 \right).
@@ -792,11 +792,11 @@ where:
 \boxed{
  r_{i,j}
  =
- \operatorname{CoreRank}(\mathcal A_{i,j},\mathcal S_{i,j})
+ \mathrm{CoreRank}(\mathcal A_{i,j},\mathcal S_{i,j})
 }
 ```
 
-여기서 $\operatorname{CoreRank}$는 stabilizer quotient 후 남는 non-scalar local Pauli algebra를 표현하는 데 필요한 최소 또는 구현상 선택된 virtual qubit 수다.
+여기서 $\mathrm{CoreRank}$는 stabilizer quotient 후 남는 non-scalar local Pauli algebra를 표현하는 데 필요한 최소 또는 구현상 선택된 virtual qubit 수다.
 
 ## 6.4 Dense workspace 생성
 
@@ -857,7 +857,7 @@ R_{\hat q_a}(\theta_a)\chi_B^{(a-1)}.
 =
 \chi_B^{(\ell)}
 =
-\left(\prod_{a\in\operatorname{Rel}_{i,j}} R_{\hat q_a}(\theta_a)\right)
+\left(\prod_{a\in\mathrm{Rel}_{i,j}} R_{\hat q_a}(\theta_a)\right)
 E_{v\rightarrow B}\chi_v.
 ```
 
@@ -1022,7 +1022,7 @@ p0 = clamp(0.5 * (1.0 + real(expval)), 0.0, 1.0);
 ## 8.3 Sampling
 
 ```math
-u\sim\operatorname{Uniform}(0,1).
+u\sim\mathrm{Uniform}(0,1).
 ```
 
 ```math
@@ -1125,7 +1125,7 @@ k=(j,v,F\text{-sig},\mathcal L\text{-sig},\tilde p\text{-sig}).
 slow path는 다음 transition을 계산한다.
 
 ```math
-\operatorname{BuildEdge}(k)
+\mathrm{BuildEdge}(k)
 =
 \left(p_0(k),v_0'(k),v_1'(k),a(k)\right).
 ```
@@ -1276,7 +1276,7 @@ E(k)=\left(p_0(k),v_0(k),v_1(k),a(k)\right).
 ## 10.2 Hit execution
 
 ```math
-b_{i,j}\sim\operatorname{Bernoulli}(p_0(k_{i,j})).
+b_{i,j}\sim\mathrm{Bernoulli}(p_0(k_{i,j})).
 ```
 
 ```math
@@ -1290,14 +1290,14 @@ v_1(k_{i,j}),&b_{i,j}=1.
 record update:
 
 ```math
-m_i[\operatorname{slot}_j]
+m_i[\mathrm{slot}_j]
 =b_{i,j}\oplus\delta_{i,j}.
 ```
 
 pending consumed or advanced according to edge metadata:
 
 ```math
-\mathcal L_i^{j+1}=\operatorname{UpdatePending}(\mathcal L_i^j,E(k),b_{i,j}).
+\mathcal L_i^{j+1}=\mathrm{UpdatePending}(\mathcal L_i^j,E(k),b_{i,j}).
 ```
 
 구현:
@@ -1374,7 +1374,7 @@ D\approx \Theta((q_{\mathrm{rel}}+c_m)2^r).
 **노드** — dense core 상태의 내용 주소화(interning):
 
 ```math
-v=\operatorname{intern}\left(j,\ \text{core 내용},\ \sigma(F),\ \sigma(\mathcal L)\right).
+v=\mathrm{intern}\left(j,\ \text{core 내용},\ \sigma(F),\ \sigma(\mathcal L)\right).
 ```
 
 **Segment edge** — 두 boundary 사이의 G 구간까지 통째로 접은 전이:
@@ -1393,7 +1393,7 @@ $\sigma_{\mathrm{seg}}$는 그 구간에서 뽑힌 noise가 회전 부호와 분
 W=O\!\left(n_{\mathrm{noise}}C_{\mathrm{rng}}+C_{\mathrm{hash}}+C_{\mathrm{rng}}+C_{\mathrm{record}}\right).
 ```
 
-noise RNG를 소비해 $\sigma_{\mathrm{seg}}$를 만들고, edge를 찾고, $\operatorname{Bernoulli}(p_0)$를 뽑고, record를 쓴다. **G 구간 opcode 실행(frame 갱신·pullback·pending 유지 = $A$)과 dense work($D$)를 모두 하지 않는다.** miss 복구 계층(§10)의 boundary hit이 dense 기대값 계산만 덜었다면, walk는 $A$와 $D$ 전부를 없앤다.
+noise RNG를 소비해 $\sigma_{\mathrm{seg}}$를 만들고, edge를 찾고, $\mathrm{Bernoulli}(p_0)$를 뽑고, record를 쓴다. **G 구간 opcode 실행(frame 갱신·pullback·pending 유지 = $A$)과 dense work($D$)를 모두 하지 않는다.** miss 복구 계층(§10)의 boundary hit이 dense 기대값 계산만 덜었다면, walk는 $A$와 $D$ 전부를 없앤다.
 
 **Miss (fallback)** — 처음 보는 edge를 만나면 그 shot 전체를 **같은 per-shot seed로** §10 cache 실행(miss 시 §9 BuildEdge 경유)으로 재실행한다. 이 재실행이 record를 복원하는 동시에 automaton에 새 노드/edge를 채운다.
 
@@ -1658,7 +1658,7 @@ N_{\mathrm{rem}}\cdot T_{\mathrm{walk}}\cdot S_{\min}\ >\ T_{\mathrm{prep}}
 이고 $r_j$는:
 
 ```math
-r_j=\operatorname{CoreRank}(\mathcal A_j,\mathcal S_j).
+r_j=\mathrm{CoreRank}(\mathcal A_j,\mathcal S_j).
 ```
 
 즉 전체 qubit 수 $N$이 아니라 measurement-relevant independent axis rank가 exponential factor다.
