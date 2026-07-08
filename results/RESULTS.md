@@ -1,81 +1,56 @@
-# MDAM Native Batch VM — Results (consolidated)
+# MDAM Results
 
-One-page summary of the native MDAM (near-Clifford) sampler. The full per-gate development journey
-(Gates A–K, 74 detail files) is archived at `/home/jung/mdam-vm-archive/prev-reports/`.
+near-Clifford QEC 회로 11종에 대한 MDAM 샘플러의 성능·정확성 요약. 상세 데이터와 그림은
+[`benchmark_comparison/`](benchmark_comparison/)에 있다.
 
-Source of truth: `mdam/native_vm/` (see its `README.md` and the repo-root
-`PROJECT_STRUCTURE.md`). It verifies against the in-tree Python oracle (`mdam.frame` + `mdam.backend`)
-+ `mdam.frame`), which is unchanged.
-Benchmark: **cultivation_d3** (n=15 qubits, W=1, peak_rank=4, 322 opcodes/shot, 5 magic measures/shot,
-21 measurements, ~504 noise sites/shot). Compiler g++ 11.4 `-O3 -march=native -std=c++17 -DNDEBUG`,
-CPU i7-8700K @ 3.70 GHz, single-thread, `taskset -c 2`.
+## 측정 조건
 
----
+- **Baseline**: clifft, 기본 컴파일 설정(squeeze 게이트-스케줄 최적화 포함). 비교 기준으로만 사용.
+- **Environment**: Intel Core i7-8700K (3.7 GHz), 32 GB RAM, Linux, 단일 코어 고정(taskset),
+  single-thread BLAS.
+- **지표**: cold-start 배치 하나의 총 실행시간 / shot 수 (cold-amortized wall-clock),
+  `speedup = clifft_ns / mdam_ns`.
+- **정확성**: 표의 모든 값은 authoritative 기준 경로와 shot별 측정 기록이 **bit-exact**함을
+  확인한 실행에서 나왔다 (AUTH / LEAN(interp) / LEAN(compiled) 모든 경로 동일 record).
 
-## What this is
+## 결과
 
-A C++ batch VM that runs near-Clifford QEC magic-state sampling **end-to-end in native code** — one
-`Python→C++` call per batch, zero per-shot Python callbacks — and is **bit-exact** to the authoritative
-Python MDAM runtime (`run_shot` / `sample_batch`). The native path is **default OFF**; the authoritative
-Python path is unchanged and remains the reference oracle.
+| Benchmark         |  k | maxM | route          |    Adaptive | AUTH-only | LEAN-only |
+| ----------------- | -: | ---: | -------------- | ----------: | --------: | --------: |
+| coherent_rx_d3_r1 | 14 |   10 | LEAN(compiled) |  **56.95×** |     0.79× |    56.53× |
+| coherent_rx_d3_r3 | 14 |   11 | LEAN(interp)   |   **3.17×** |     0.40× |     3.30× |
+| coherent_d3_r3    |  8 |    4 | LEAN(compiled) |   **3.41×** |     0.30× |     3.38× |
+| distillation      |  5 |    3 | LEAN(interp)   |   **2.00×** |     0.66× |     1.95× |
+| cultivation_d3    |  4 |    3 | LEAN(compiled) |   **1.59×** |     0.16× |     1.49× |
+| coherent_d3_r1    |  5 |    0 | LEAN(compiled) |   **1.48×** |     0.31× |     1.46× |
+| surface_d7_r7     |  0 |    0 | LEAN(compiled) |   **1.00×** |     0.43× |     1.02× |
+| cultivation_d5    | 10 |    9 | LEAN(interp)   |   **0.74×** |     0.43× |     0.75× |
+| coherent_d5_r1    | 13 |    0 | AUTH           |   **6.68×** |     6.85× |     1.99× |
+| coherent_d7_r1    | 25 |    0 | AUTH           | **34,841×** |   35,566× |   10,318× |
+| coherent_d5_r5    | 24 |   12 | AUTH           |    **815×** |      820× |      652× |
 
-The headline goal: **MDAM must never be meaningfully slower than Clifft, on any case.** cultivation_d3 is
-the hardest case for MDAM — a structural LOSE regime (peak_rank 4 is too small for near-Clifford advantage;
-see Gate G), so reaching parity *here* is the proof.
+## 해석
 
-## Current result (Gate K, cultivation_d3)
+**두 성능 축이 서로 다른 회로군을 이긴다.**
 
-| measure | value |
-|---|---|
-| native batch path | 1 Python→C++ call/batch, 0 per-shot callbacks |
-| correctness | **bit-exact** vs authoritative (25/25 oneshot + 128 000-shot 0 mismatch, every gate) |
-| **warm steady-state speed** | **~1.08–1.10× Clifft, FLAT across 1k→1M shots** (essentially parity) |
-| cold-start (from-scratch) | 1.32× (1k) → 1.09× (128k); warmup amortizes away by ~tens of thousands of shots |
-| RNG stream | identical (noise gap-sampler draws/fires unchanged by all optimizations) |
+- **Localization** (`maxM ≪ k`): 측정이 요구하는 active magic rank가 작아, dense 비용이 `2^k`가
+  아니라 `2^maxM`으로 떨어진다. `coherent_d7_r1`(k=25, maxM=0)의 34,841×, `coherent_d5_r5`
+  (k=24, maxM=12)의 815×가 이 축의 결과이며, adaptive는 이 회로들을 AUTH로 라우팅한다.
+- **BoundaryKey 재사용** (포화 회로): 반복 syndrome 측정에서 같은 measurement-boundary context가
+  재등장하므로, boundary transition 캐시가 gate-walk 비용을 대체한다. off-axis rotation 회로
+  (`coherent_rx_d3_r1` 56.95×)부터 magic 회로(distillation 2.00×, cultivation_d3 1.59×)까지가
+  이 축의 결과이며, adaptive는 LEAN으로 라우팅하고 반복량이 충분하면 walk를 회로 전용
+  바이너리로 컴파일한다(LEAN(compiled)).
 
-**MDAM does not strictly *beat* Clifft on d3 — it reaches parity.** The structural-WIN regime is high-rank
-(d5_r5: Clifft active rank ~24, MDAM ~175× less memory) and is the next validation target.
+**Ablation 열이 각 구성요소의 기여를 분리해 보여준다.**
 
-### How parity was reached — the FAST ladder (all bit-exact)
-```
-  2G (BoundaryPlan)         ~6700 ns   3.0×     compiled magic-boundary plan
-  + state_id key            4814       2.23×    intern resident state → integer id
-  + carried-pp + oracle-fast 4060      1.85×    key on pre-fwd_map pp; Born oracle in FAST path
-  + lazy survivor carry     3870       1.79×    drop eager survivor copy; carry only cur_sid
-  + skip-to-next-fire       ~2344      ~1.09×    gap-sampler next_idx: skip 503/504 no-op noise sites
-```
-- **skip-to-next-fire** was the decisive lever: the noise sampler is a *gap sampler* (draws ~2 RNG/shot to
-  find the next firing site), so 503.5/504 sites/shot are semantic no-ops. Visiting only blocks containing
-  `next_idx` cut noise cost ~1610→~470 ns with **0 change to the RNG stream** (draws/fires identical).
-- **shot-sweep audit** (fair: both sides store full output, rep-interleaved): `warm/Clifft` is flat at
-  1.07/1.08/1.10/1.09/1.08 across 1k→1M → the 1.09× is a robust *warm steady-state*, not a 128k artifact.
-  (A prior "0.92× at 1M, MDAM beats Clifft" claim was **retracted** — it came from an unfair output-handling
-  asymmetry; with output matched MDAM sits at ~1.08–1.11× parity.)
+- `AUTH-only` (캐시 층 없음): LEAN 회로군에서 0.16×–0.79×로 떨어진다 — BoundaryKey 캐시의 기여.
+- `LEAN-only` (AUTH 라우팅 없음): localization 회로군에서 1.99×/10,318×/652×로 떨어진다 —
+  AUTH 옵션의 기여. LEAN 회로군에서는 Adaptive ≈ LEAN-only로, 라우팅 자체의 오버헤드는 측정
+  오차 수준이다.
 
-## The journey, in one paragraph (Gates A–K)
+**메모리.** LEAN의 캐시는 BoundaryKey→transition 자동자 테이블뿐이며(노드당 수십 바이트),
+전 벤치 실측 peak는 63 MB 이하다. AUTH는 상수 메모리로 동작한다.
 
-**A–D**: built the native VM and full-batch sampler; proved the seed/RNG path bit-exact (PCG64 + SeedSequence
-ported exactly); A/C ≈ 300× speedup from removing the Python control plane (4.70 ms → 15.7 µs/shot), leaving
-MDAM ~7× slower than Clifft = pure numerical+symbolic core. **E**: removed all hot-loop heap allocation
-(226→0/shot); boxed the result — MDAM's *dense arithmetic alone* (~1.24–1.47 µs) already **beats** Clifft
-(~2.15 µs); the entire remaining gap is **symbolic control plane** (frame XOR, noise RNG, inverse-frame,
-magic pullback), not arithmetic. **F/F-B/F5**: compiled the measurement-boundary symbolic region (M-keyed
-static skeleton, snapshot+region-const frame fold, live inverse kept) → 4.7× → 3.7× gap. **G**: proved
-cultivation_d3 is a *structural LOSE* case — even a FREE dense kernel loses 3.3× because peak_rank 4 is too
-small; the win regime is high-rank. **I/J**: dissected the control-plane floor (operation-count bound, no hot
-op); built the region-affine compiled-sampler feasibility (frame side fully parity-compilable, magic side
-dense-coupled via amplitude-threshold rank reduction). **K**: the boundary-EDGE / compiled-region FAST path
-(cmode5) that reuses d3's few transitions → **parity with Clifft, bit-exact**.
-
-## Honest limits
-- d3 result is **parity, not a strict win** — expected, since d3 is structurally unfavorable to near-Clifford.
-- The native path is **default OFF**; correctness is always carried by the authoritative Python oracle.
-- Frequency pinning needs sudo (unavailable), so multi-second large-N timings carry mild thermal noise; the
-  cold-vs-warm-at-fixed-N comparison controls for it.
-
-## Next
-1. **High-rank d5_r5** — the structural MDAM-advantage regime (quantify the real win). *(recommended)*
-2. (optional) non-noise floor lever to push d3 *strictly* below Clifft (diminishing returns; parity already met).
-
----
-*Detailed per-gate reports, baselines, profiles, and timing JSONs: `/home/jung/mdam-vm-archive/prev-reports/`.*
+**한계 regime.** `cultivation_d5`(0.74×)는 새로운 BoundaryKey가 계속 등장하는 비포화 회로로,
+localization도 재사용도 충분히 성립하지 않는 유일한 손실 사례다.
