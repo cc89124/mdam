@@ -14,7 +14,6 @@
 | adaptive_algorithm_results/ | 벤치별 adaptive 판정 기록 그림: (A) 누적 distinct BoundaryKey U(n) 포화 곡선, (B) window hit ratio h_w vs 실측 손익분기 h_be, (C) 실측 LEAN vs AUTH runtime 교차. |
 | active_state_results/ | active magic rank(maxM) 관련 그림. |
 | flop_table.md / flop_table_native.csv | FLOP 축 비교표 (wall과 별개 축). |
-| saturation_curve.png / lean_warm_long.png | 포화 진단: marginal miss m(N), distinct key 성장 기울기 β, lean walk 장기 학습 실측. |
 
 ## wall_table.csv 열
 
