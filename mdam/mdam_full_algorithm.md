@@ -1,7 +1,5 @@
 # Measurement-Driven Active Core Simulator: 전체 알고리즘 수학적 설명
 
-> display math는 GitHub 렌더링 호환을 위해 ```math 코드펜스, inline math는 `$...$` 형식으로 작성했다.
-
 > 목적: 이 문서는 **measurement-driven dense core**를 중심으로 한 near-Clifford/QEC 회로 시뮬레이터의 전체 알고리즘을 수학적으로 정리한다.  
 > 포함 범위: Pauli/Clifford 표현, 상태 불변식, `G` 구간 연산, `M` 구간 연산, dense core 생성 원리, AUTH/LEAN 비용 모델과 adaptive 선택, 전체 실행 알고리즘, 구현 관점의 연산량.
 
