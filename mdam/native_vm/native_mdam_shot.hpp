@@ -218,6 +218,15 @@ struct MdamShot {
         std::vector<PackedPauli> ax, az, Xc, Zc; std::vector<PendingEntry> pend; uint32_t rot_uid=0; };
     std::vector<EngSnap> mc_pool;
     size_t mc_pool_bytes_live=0;      // running sum of pooled snapshot bytes -> O(1) memory-budget estimate
+    // mc_pool_off (DEFAULT ON=1 since 2026-07-07, user ruling): MDAM's ONLY cache is BoundaryKey->transition
+    // (sg tables ln_id/ln_edge/p0, ~10s of MB).  Caching dense STATE snapshots contradicts the MDAM principle
+    // (state is materialized only at measurement time), and measurably: pool OFF is win/parity on 9/11 benches,
+    // eliminates every 300-530MB pool peak and every memory-budget event (ablation pool_ablate.tsv, bit-exact
+    // 22/22); only the off-axis rx benches pay -6..-12% (expensive dense-core rebuild on miss).  With the pool
+    // off every fallback boundary stays LIVE (edge has[b] never set -> the existing partial-path rv-injection
+    // keeps the RNG stream aligned) => records BIT-IDENTICAL, fallback just loses its restore shortcut.
+    // nvm_mc_pool_off(vm,0) re-enables for A/B only.
+    int mc_pool_off=1;
     std::unordered_map<uint64_t,std::vector<int>> mc_pool_idx;          // exact-dedup: fingerprint -> pool ids (collision chain)
     struct MEdge { double p0=-2.0; uint8_t antis=0; bool has[2]={false,false}; int pool[2]={-1,-1}; uint8_t disp[2]={0,0};
                    int sid_out[2]={-1,-1}; };   // Phase-4 carry: dense-block id per outcome (so the next key needs NO dense re-hash)
@@ -287,6 +296,12 @@ struct MdamShot {
     uint64_t sg_seg_signs=1469598103934665603ULL;        // order-hash of xb bits rot() read since the last boundary
     inline void sg_sign_acc(int slot,int xb){ sg_seg_signs = (sg_seg_signs*1099511628211ULL) ^ (uint64_t)((slot<<1)|(xb&1)); }
     inline void sg_rot_sign(int slot,int xb){ if(sg_shadow||ln_active) sg_sign_acc(slot,xb); }
+    // U2's engine effect is selected by the FRAME in_state (noise-dependent) -> it must enter the edge key
+    // exactly like a rotation sign, else two shots with different in_state share a key (wrong p0/next node).
+    // Tag-separated from sg_sign_acc's (slot<<1)|xb space via the 0x40000000 marker.  Same guard = no-op on
+    // the authoritative path (bit-exact preserved); folded identically at BUILD (run/run_mcache) and WALK.
+    inline void sg_u2_sign(int slot,int in_state){ if(sg_shadow||ln_active)
+        sg_seg_signs = (sg_seg_signs*1099511628211ULL) ^ (uint64_t)(0x40000000u ^ (uint32_t)((slot<<2)|(in_state&3))); }
     // shared edge-key (source of a boundary edge): must be byte-identical between the sg shadow (build) and
     // run_lean (walk).  Includes the in-segment rotation signs (sg_signs must be ON for the lean table).
     inline uint64_t sg_edge_key(int prev_mp, uint64_t prev_node, int prev_out) const {
@@ -913,6 +928,7 @@ struct MdamShot {
                 case MO_ARRAY_U2: {
                     int q=slot2id[a1];
                     int in_state=(frame.zb(a1)<<1)|frame.xb(a1);
+                    sg_u2_sign(a1,in_state);             // fold branch selection into the segment key (shadow/lean only)
                     int idx=i0*4+in_state; const double* bcd=&p.u2_bcd[(size_t)idx*3];
                     double bb=bcd[0], cc=bcd[1], dd=bcd[2];
                     if(q>=0){
@@ -1000,7 +1016,7 @@ struct MdamShot {
         auto& ed=mc_edges[mp][K];
         if(ed.p0<=-2.0){ ed.p0=bcap_p0; ed.antis=is_antis?1:0; }
         else if(mc_mode==1){ mc_verify++; if(ed.p0!=bcap_p0||ed.antis!=(is_antis?1:0)) mc_mismatch++; }
-        if(!is_antis){ uint64_t _tp=mc_time?__rdtsc():0; int pid=mc_pool_intern();
+        if(!is_antis && !mc_pool_off){ uint64_t _tp=mc_time?__rdtsc():0; int pid=mc_pool_intern();
             if(mc_time) mc_cyc[4]+=__rdtsc()-_tp;                                   // [4] pool_intern
             if(!ed.has[b]){ ed.has[b]=true; ed.pool[b]=pid; ed.disp[b]=(uint8_t)disp; ed.sid_out[b]=so; }
             else if(mc_mode==1){ if(ed.pool[b]!=pid) mc_mismatch++; } }
@@ -1084,6 +1100,7 @@ struct MdamShot {
                 case MO_ARRAY_H: { int q=slot2id[a1]; if(q>=0) engine.h(q); frame.h(a1); } break;
                 case MO_ARRAY_U2: {
                     int q=slot2id[a1]; int in_state=(frame.zb(a1)<<1)|frame.xb(a1);
+                    sg_u2_sign(a1,in_state);             // fold branch selection into the segment key (shadow/lean only)
                     int idx=i0*4+in_state; const double* bcd=&p.u2_bcd[(size_t)idx*3]; double bb=bcd[0], cc=bcd[1], dd=bcd[2];
                     if(q>=0){ if(std::abs(dd)>1e-12) engine.apply_rotation_pauli(q,0,1,dd);
                               if(std::abs(cc)>1e-12) engine.apply_rotation_pauli(q,1,0,cc);
@@ -1389,7 +1406,13 @@ struct MdamShot {
                     slot2id[a1]=-1;
                     int m_abs=b^frame.zb(a1); record.set((uint32_t)p.i0[i], m_abs^p.i1[i]); frame.set_xz(a1,(uint8_t)m_abs,0);
                 } break;
-                case MO_ARRAY_U2: case MO_ARRAY_U4: ln_incomplete=true; break;  // non-structural; unsupported in lean
+                case MO_ARRAY_U2: {                                              // frame-only in lean: select the
+                    int a1=p.a1[i]; int in_state=(frame.zb(a1)<<1)|frame.xb(a1); // branch by frame, fold it into the
+                    sg_u2_sign(a1,in_state);                                     // edge key (== build), reset frame to
+                    uint8_t out=p.u2_out[(size_t)p.i0[i]*4+in_state];            // the node's out.  Engine ZXZ SKIPPED
+                    frame.set_xz(a1,out&1,(out>>1)&1);                           // (its effect lives in the node p0).
+                } break;
+                case MO_ARRAY_U4: ln_incomplete=true; break;                     // U4 still unsupported in lean
                 case MO_END: default: break;
             }
         }
@@ -1459,6 +1482,43 @@ struct MdamShot {
     double ad_fb_demote=0.95;
     int    ad_final_policy=0; long ad_demote_shot=-1, ad_windows=0, ad_slow_shots=0;   // filled by adapt batch
     double ad_node_rate_init=-1, ad_node_rate_last=-1, ad_lean_ns_last=-1, ad_slow_ns_last=-1, ad_fb_rate_last=-1;
+    // ==== v2 measured-criterion state (nvm_adapt_v2; DEFAULT ON — legacy triggers kept behind ad_v2=0) ====
+    int    ad_v2=1;
+    long   v2_cal_max_shots=512;  double v2_cal_max_ns=1.0e9;   // T_auth calibration caps (shots AND wall)
+    int    v2_min_windows=8;      double v2_r2_min=0.70;        // OLS noise handling only (not the criterion)
+    static const int V2K=48;                                    // window-history cap for the log-log fits
+    double v2f_x[V2K], v2f_y[V2K]; int v2f_n=0;                 // (ln shots, ln fb_w)   — fb>0 windows only
+    double v2d_x[V2K], v2d_y[V2K]; int v2d_n=0;                 // (ln shots, ln nodes)
+    double v2_t_auth=-1, v2_t_walk=-1, v2_t_slow=-1;            // measured anchors (ns/shot)
+    double v2_walk_sum=0, v2_slow_sum=0; long v2_walk_cnt=0, v2_slow_cnt=0;
+    long   v2_ref_shots=0, v2_ref_miss=0;                       // since lean start / since pool eviction
+    long   v2_pool_evict_shot=-1, v2_freeze_shot=-1;
+    double v2_beta_fb=0, v2_phi=0, v2_r2=-1, v2_beta_D=0, v2_fb_be=-1, v2_crit_lhs=-1, v2_crit_rhs=-1;
+    static void v2_ols(const double* x,const double* y,int n,double& slope,double& icept,double& r2){
+        double sx=0,sy=0,sxx=0,sxy=0,syy=0;
+        for(int i=0;i<n;i++){ sx+=x[i]; sy+=y[i]; sxx+=x[i]*x[i]; sxy+=x[i]*y[i]; syy+=y[i]*y[i]; }
+        double d=n*sxx-sx*sx; if(d<=0){ slope=0; icept=0; r2=-1; return; }
+        slope=(n*sxy-sx*sy)/d; icept=(sy-slope*sx)/n;
+        double sse=0, sst=0, ym=sy/n;
+        for(int i=0;i<n;i++){ double e=y[i]-(icept+slope*x[i]); sse+=e*e; double t=y[i]-ym; sst+=t*t; }
+        r2 = sst>0 ? 1.0-sse/sst : -1;
+    }
+    static void v2_push(double* xs,double* ys,int& n,double x,double y){
+        if(n==V2K){ std::memmove(xs,xs+1,(V2K-1)*sizeof(double)); std::memmove(ys,ys+1,(V2K-1)*sizeof(double)); n--; }
+        xs[n]=x; ys[n]=y; n++;
+    }
+    // per-window decision trace (for the adaptive-judgement figures; 13 doubles per row):
+    //  0 shots, 1 fb_w, 2 nodes, 3 fb_be, 4 beta_fb, 5 phi, 6 tab_bytes, 7 pool_bytes,
+    //  8 t_walk, 9 t_slow, 10 event(0 window, 1 pool-evict, 2 freeze, 3 demote),
+    //  11 distinct BoundaryKeys U(n) (=edge-cache entries), 12 measured window wall ns/shot (-1 on event rows)
+    std::vector<double> v2_tr;
+    inline void v2_tr_push(double n,double fb_w,double ev,double wns){
+        double tb=(double)(ln_id.size()*64+ln_edge.size()*48+ln_p0v.size()*9);
+        double row[13]={n,fb_w,(double)ln_id.size(),v2_fb_be,v2_beta_fb,v2_phi,tb,
+                        (double)mc_pool_bytes_live,v2_t_walk,v2_t_slow,ev,
+                        (double)ln_edge.size(),wns};
+        v2_tr.insert(v2_tr.end(),row,row+13);
+    }
     // EXACT, O(pool): stats only (called ~1x/run).
     size_t ad_mem_est() const { return ln_id.size()*64 + ln_edge.size()*48 + ln_p0v.size()*9
                                      + mc_pool_bytes(); }
@@ -1468,9 +1528,158 @@ struct MdamShot {
     size_t ad_mem_est_live() const { return ln_id.size()*64 + ln_edge.size()*48 + ln_p0v.size()*9
                                           + mc_pool_bytes_live; }
 
+    // ==== v2: measured-criterion adaptive executor (DEFAULT; legacy triggers via nvm_adapt_v2(vm,0)) ====
+    // All decision quantities are MEASURED: the cost anchors T_auth (calibrated on the first shots via the
+    // authoritative path — those shots are normal output), T_walk (sampled hit shots), T_slow (miss shots),
+    // and the fb(N) trajectory.  They are combined by the exact optimal-stopping reduction: the switch to
+    // AUTH is irreversible and the expected LEAN shot cost is non-increasing, so total cost as a function of
+    // the switch shot is unimodal -> the optimal switch is "now or never".  "Never" wins iff
+    //     integral_n^N [ fb(s)(T_slow - T_walk) + T_walk ] ds  <  (N - n) T_auth .
+    // The ONE model assumption is Heaps-law novelty D(M) = c M^beta => fb(s) = phi s^(beta-1), verified per
+    // run (log-log OLS R^2; the independent fb- and D-slope estimates must agree), giving the closed form
+    //     phi (N^b - n^b)/b (T_slow - T_walk)  <=  (T_auth - T_walk)(N - n).
+    // Memory NEVER decides the regime: over budget frees the fallback-restore pool first (the walk never
+    // reads it), then freezes learning (inserts only; walk + fallback continue, records untouched).  AUTH
+    // demote happens only through the cost criterion, the identity fast path (zero completed walks AND
+    // measured T_slow >= T_auth: currently dominated with no evidence of learnability), or the unchanged
+    // magicless early-localization exit.
+    int run_lean_adapt_batch_v2(const MdamProgram& p, uint64_t num_shots,
+                                uint64_t mshi, uint64_t mslo, uint64_t mihi, uint64_t milo,
+                                uint8_t* out_record, char* out_err, int errlen){
+        NativeRng master; master.seed_from_state(mshi, mslo, mihi, milo);
+        const uint64_t RNG_EXCL = ((uint64_t)1 << 63) - 1;
+        const size_t nm = (size_t)p.num_measurements;
+        int policy = 0; bool auth_first=false;
+        engine.magic_ever=false; batch_lazy_hint=true;
+        ad_final_policy=0; ad_demote_shot=-1; ad_windows=0; ad_slow_shots=0;
+        ad_node_rate_init=-1; ad_node_rate_last=-1; ad_lean_ns_last=-1; ad_slow_ns_last=-1; ad_fb_rate_last=-1;
+        v2f_n=0; v2d_n=0; v2_t_auth=-1; v2_t_walk=-1; v2_t_slow=-1;
+        v2_walk_sum=0; v2_slow_sum=0; v2_walk_cnt=0; v2_slow_cnt=0; v2_ref_shots=0; v2_ref_miss=0;
+        v2_pool_evict_shot=-1; v2_freeze_shot=-1; v2_tr.clear();
+        v2_beta_fb=0; v2_phi=0; v2_r2=-1; v2_beta_D=0; v2_fb_be=-1; v2_crit_lhs=-1; v2_crit_rhs=-1;
+        auto do_demote = [&](long at){
+            policy=1; ad_demote_shot=at; sg_shadow=0;
+            { std::unordered_map<uint64_t,int> a,b; ln_id.swap(a); ln_edge.swap(b); }
+            { std::unordered_map<uint64_t,double> a; sg_p0.swap(a); }
+            { std::unordered_map<uint64_t,uint8_t> a; sg_antis.swap(a); }
+            { std::unordered_map<uint64_t,uint64_t> a; sg_trans.swap(a); }
+            ln_p0v.clear(); ln_p0v.shrink_to_fit(); ln_antisv.clear(); ln_antisv.shrink_to_fit();
+            mc_pool_free();
+            batch_lazy_hint=true; engine.magic_ever=false; auth_first=true;
+        };
+        // ---- [0] T_auth calibration: first shots authoritative (normal output), capped by shots AND wall ----
+        uint64_t cal = v2_cal_max_shots>0 ? (uint64_t)v2_cal_max_shots : 0;
+        if(cal > num_shots/4) cal = num_shots/4;
+        uint64_t sh=0; double cal_t0=now_ns();
+        for(; sh<cal; sh++){
+            uint64_t sd=master.bounded(RNG_EXCL);
+            __uint128_t st,inc; SeedExpand::seedseq_pcg64(sd,st,inc);
+            reset_shot(p,(uint64_t)(st>>64),(uint64_t)st,(uint64_t)(inc>>64),(uint64_t)inc);
+            if (fb_mode != FB_OFF) run_fb(p); else run(p);
+            if (sh==0 && lazy_env()==-1) batch_lazy_hint = !engine.magic_ever;
+            std::memcpy(out_record+(size_t)sh*nm, record.bits.data(), nm);
+            if(err){ if(out_err){ std::strncpy(out_err,err,errlen-1); out_err[errlen-1]=0; } return 1; }
+            ad_slow_shots++;
+            if(now_ns()-cal_t0 > v2_cal_max_ns && sh>=15){ sh++; break; }
+        }
+        if(sh>0) v2_t_auth = (now_ns()-cal_t0)/(double)sh;
+        // ---- main loop: LEAN + measured decisions ----
+        long   w_fb0=ln_fb_count; size_t w_node0=ln_id.size(); long w_shots=0;
+        long   lean_start=(long)sh; double w_t0=now_ns();
+        for(; sh<num_shots; sh++){
+            uint64_t sd=master.bounded(RNG_EXCL);
+            __uint128_t st,inc; SeedExpand::seedseq_pcg64(sd,st,inc);
+            uint64_t shi=(uint64_t)(st>>64),slo=(uint64_t)st,ihi=(uint64_t)(inc>>64),ilo=(uint64_t)inc;
+            if(policy==1){
+                reset_shot(p,shi,slo,ihi,ilo);
+                if (fb_mode != FB_OFF) run_fb(p); else run(p);
+                if (auth_first){ if (lazy_env()==-1) batch_lazy_hint = !engine.magic_ever; auth_first=false; }
+                ad_slow_shots++;
+            } else {
+                bool tsample = ((sh & 7)==0);
+                double t0 = tsample ? now_ns() : 0.0;
+                reset_shot(p,shi,slo,ihi,ilo); run_lean(p);
+                v2_ref_shots++;
+                if(ln_incomplete){ ln_fb_count++; v2_ref_miss++; double ts=now_ns();
+                    reset_shot(p,shi,slo,ihi,ilo); run_mcache(p);
+                    double dt=now_ns()-ts; v2_slow_sum+=dt; v2_slow_cnt++;
+                } else if(tsample){ v2_walk_sum+=now_ns()-t0; v2_walk_cnt++; }
+            }
+            std::memcpy(out_record+(size_t)sh*nm, record.bits.data(), nm);
+            if(err){ if(out_err){ std::strncpy(out_err,err,errlen-1); out_err[errlen-1]=0; } return 1; }
+            w_shots++;
+            if(policy==0 && (sh & 63)==63){
+                if(v2_slow_cnt>=8)  v2_t_slow = v2_slow_sum/(double)v2_slow_cnt;
+                if(v2_walk_cnt>=8)  v2_t_walk = v2_walk_sum/(double)v2_walk_cnt;
+                size_t mem=ad_mem_est_live();
+                if((long)mem>ad_mem_cap){
+                    if(v2_pool_evict_shot<0){
+                        // pool-first eviction: the walk never reads the pool; drop it, keep LEAN.
+                        v2_tr_push((double)(sh+1),(double)(ln_fb_count-w_fb0)/std::max(1.0,(double)w_shots),1,-1);
+                        mc_pool_free(); mc_pool_off=1; v2_pool_evict_shot=(long)sh;
+                        v2_slow_sum=0; v2_slow_cnt=0; v2_t_slow=-1;      // slow regime changed: re-measure
+                        v2_ref_shots=0; v2_ref_miss=0;
+                    } else if(v2_freeze_shot<0){
+                        // essential tables over cap: freeze learning iff frozen-LEAN still beats AUTH now.
+                        double fbr = v2_ref_shots>0 ? (double)v2_ref_miss/(double)v2_ref_shots : 1.0;
+                        bool ok = v2_t_auth>0 && v2_t_slow>0 && v2_t_walk>0 &&
+                                  (fbr*v2_t_slow + (1.0-fbr)*v2_t_walk) < v2_t_auth;
+                        v2_tr_push((double)(sh+1),fbr,ok?2:3,-1);
+                        if(ok){ sg_shadow=0; v2_freeze_shot=(long)sh; }
+                        else do_demote((long)sh);
+                    }
+                }
+                // identity fast path: zero completed walks AND measured slow >= auth => dominated now with
+                // no evidence of learnability (heavy-core all-miss, e.g. d5_r5).  Circuits whose fallback is
+                // CHEAPER than auth (boundary hits inside the miss shot) never fire this.
+                if(policy==0 && v2_ref_shots>=128 && v2_ref_miss==v2_ref_shots &&
+                   v2_t_auth>0 && v2_slow_cnt>=8 && v2_t_slow>=v2_t_auth){
+                    v2_tr_push((double)(sh+1),1.0,3,-1); do_demote((long)sh); }
+            }
+            if(policy==0 && w_shots>=ad_window){
+                double fb_w=(double)(ln_fb_count-w_fb0)/(double)w_shots;
+                double node_rate=(double)(ln_id.size()-w_node0)/(double)w_shots;
+                ad_windows++;
+                if(ad_node_rate_init<0) ad_node_rate_init=node_rate;
+                ad_node_rate_last=node_rate; ad_fb_rate_last=fb_w;
+                ad_lean_ns_last=v2_t_walk; ad_slow_ns_last=v2_t_slow;
+                double lnN=std::log((double)(sh+1));
+                v2_push(v2d_x,v2d_y,v2d_n,lnN,std::log((double)(ln_id.size()>0?ln_id.size():1)));
+                if(fb_w>0) v2_push(v2f_x,v2f_y,v2f_n,lnN,std::log(fb_w));
+                double sD,iD,rD; if(v2d_n>=4){ v2_ols(v2d_x,v2d_y,v2d_n,sD,iD,rD); v2_beta_D=sD; }
+                if(v2f_n>=4){ double s,i,r; v2_ols(v2f_x,v2f_y,v2f_n,s,i,r);
+                              v2_beta_fb=s+1.0; v2_phi=std::exp(i); v2_r2=r; }
+                if(v2_t_auth>0 && v2_t_walk>0 && v2_t_slow>v2_t_walk)
+                    v2_fb_be=(v2_t_auth-v2_t_walk)/(v2_t_slow-v2_t_walk);
+                double w_ns=(now_ns()-w_t0)/(double)w_shots;   // measured LEAN wall this window (hits+misses)
+                v2_tr_push((double)(sh+1),fb_w,0,w_ns);
+                // magicless early-localization exit (unchanged from legacy)
+                bool loc_demote = !engine.magic_ever && fb_w>ad_fb_demote && node_rate>ad_node_floor;
+                if(loc_demote){ v2_tr_push((double)(sh+1),fb_w,3,-1); do_demote((long)sh); }
+                // cost criterion: only relevant when LOSING now (fb_w above the break-even miss rate).
+                else if(v2_fb_be>0 && fb_w>v2_fb_be && ad_windows>=(long)v2_min_windows){
+                    bool fit_ok = v2f_n>=v2_min_windows && v2_r2>=v2_r2_min &&
+                                  v2_beta_fb>0.0 && v2_beta_fb<1.0;
+                    bool keep=false;
+                    if(fit_ok){
+                        double n=(double)(sh+1), Nn=(double)num_shots;
+                        v2_crit_lhs=v2_phi*(std::pow(Nn,v2_beta_fb)-std::pow(n,v2_beta_fb))/v2_beta_fb
+                                    *(v2_t_slow-v2_t_walk);
+                        v2_crit_rhs=(v2_t_auth-v2_t_walk)*(Nn-n);
+                        keep = v2_crit_lhs<=v2_crit_rhs;
+                    }
+                    if(!keep){ v2_tr_push((double)(sh+1),fb_w,3,-1); do_demote((long)sh); }  // losing + no recovery model
+                }
+                w_fb0=ln_fb_count; w_node0=ln_id.size(); w_shots=0; w_t0=now_ns();
+            }
+        }
+        ad_final_policy=policy; if(out_err) out_err[0]=0; return 0;
+    }
+
     int run_lean_adapt_batch(const MdamProgram& p, uint64_t num_shots,
                              uint64_t mshi, uint64_t mslo, uint64_t mihi, uint64_t milo,
                              uint8_t* out_record, char* out_err, int errlen){
+        if(ad_v2) return run_lean_adapt_batch_v2(p,num_shots,mshi,mslo,mihi,milo,out_record,out_err,errlen);
         NativeRng master; master.seed_from_state(mshi, mslo, mihi, milo);
         const uint64_t RNG_EXCL = ((uint64_t)1 << 63) - 1;
         const size_t nm = (size_t)p.num_measurements;

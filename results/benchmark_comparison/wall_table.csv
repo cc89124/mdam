@@ -1,0 +1,12 @@
+bench,k,maxM,nmeas,clifft_ns,mdam_ns,mdam_vs_clifft,route,shots,bitexact,auth_only_ns,auth_only_vs_clifft,lean_only_ns,lean_only_vs_clifft,lean_fb_pct,nocompile_ns,regime
+coherent_rx_d3_r1,14,10,17,131084.0,2301.9,56.95x,LEAN(compiled),7180469,OK,165294.8,0.79x,2318.7,56.53x,0.3,2786.9,off-axis-saturates
+coherent_rx_d3_r3,14,11,33,393710.8,124362.6,3.17x,LEAN(interp),546760,OK,974037.6,0.40x,119483.2,3.30x,8.9,127979.2,off-axis-saturates
+distillation,5,3,85,11713.9,5865.9,2.00x,LEAN(interp),3053797,OK,17875.3,0.66x,6018.0,1.95x,0.0,5814.6,magic-saturates
+cultivation_d3,4,3,21,2348.4,1477.2,1.59x,LEAN(compiled)(retry2),1000000,OK,14914.2,0.16x,1573.1,1.49x,0.4,2094.2,magic-sat-saturates
+coherent_d3_r1,5,0,17,1390.3,939.2,1.48x,LEAN(compiled),10000000,OK,4540.4,0.31x,950.9,1.46x,0.0,1278.9,small-k-saturates
+surface_d7_r7,0,0,385,8993.8,8990.5,1.00x,LEAN(compiled),1038961,OK,21096.4,0.43x,8821.1,1.02x,0.0,9320.1,k0-pure-Clifford
+cultivation_d5,10,9,112,82109.8,111223.3,0.74x,LEAN(interp),157654,OK,191335.6,0.43x,109263.3,0.75x,36.8,115206.6,magic-nonsat
+coherent_d3_r3,8,4,33,14098.8,4129.4,3.41x,LEAN(compiled),3774217,OK,46602.6,0.30x,4167.1,3.38x,2.0,4718.2,small-k-saturates
+coherent_d5_r1,13,0,49,205263.3,30729.4,6.68x,AUTH,167085,OK,29980.3,6.85x,102999.3,1.99x,99.1,28552.1,r<<k-localization
+coherent_d7_r1,25,0,97,3996135191.4,114697.5,34840.64x,AUTH,150000,OK,112357.7,35566.19x,387283.7,10318.37x,100.0,108623.2,r<<k-localization
+coherent_d5_r5,24,12,145,8695465444.5,10668029.5,815.10x,AUTH,8000,OK*,10608325.9,819.68x,13326972.9,652.47x,100.0,10634107.9,r<k-loc-heavycore

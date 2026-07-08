@@ -1,43 +1,59 @@
-# bench	k	maxM	nmeas	clifft_ns	auth_ns	speedup_auth	lean_ns	speedup_lean	fallback_pct	adapt_ns	speedup_adapt	adapt_policy	best_path	best_speedup	regime	bitexact
-# THREE MDAM paths, cold-amortized ns/shot (total_wall/N), taskset -c 2, single-thread BLAS.  speedup_X = clifft_ns/X_ns.
-#   auth  = authoritative (run()/sample_batch): no cache, constant. Wins via r<<k localization.
-#   lean  = lean-walk (run_lean_fb_batch): skip engine gate-walk via runtime-lazy magic-core automaton; miss -> run_mcache.
-#   adapt = ADAPTIVE executor (run_lean_adapt_batch), DEFAULT config, cold single-call.  EXACTLY TWO production policies:
-#           LEAN and AUTH.  run_mcache is NOT a policy -- it is only the LEAN-miss recovery fallback (recover the shot +
-#           fill the cache).  On demote the policy goes straight to AUTH (run(), == sample_batch), and frees the lean
-#           tables + the dense-core mcache (mc_pool) + turns off shadow interning -> AUTH at constant memory.
-#           adapt_policy: LEAN, or AUTH@<demote_shot>.
-# K reduction: k=nominal magic (Clifft dense=2^k); maxM=MDAM peak materialized magic (maxM<<k => strong localization).
-# ADAPTIVE demote triggers (node_rate = new lean-nodes/shot):
-#   (1) MEMORY BUDGET (every 64 shots, O(1) via a running dense-core byte counter): cache bytes > ad_mem_cap (512MB
-#       default) AND still non-saturating (new nodes this 64-window).  This is the SINGLE OOM/size backstop -- it counts
-#       lean-table bytes too, so it also catches node-table explosions (the old node/edge COUNT cap was removed as
-#       redundant).  No fb gate: fires for BOTH heavy-core all-miss (coherent_d5_r5, ~3.75MB/shot -> AUTH@191) AND
-#       light-core hitting-but-non-saturating caches (cultivation_d5, ~0.029MB/shot -> AUTH@~20k, peak RSS 4.5GB->0.86GB).
-#       Bounding the cache makes shot-parallel scaling safe (else RSS = budget x workers).
-#   (2) !engine.magic_ever EARLY-LOCALIZATION demote (first window, no horizon wait): never-materialized-magic AND
-#       miss-rate>0.95 AND node_rate>floor.  !magic_ever excludes every magic circuit; the fb gate excludes maxM=0
-#       circuits that DO saturate (surface_d7_r7, coherent_d3_r1: fb=0).  Fires for d7_r1/d5_r1 (pure r<<k localization).
-#   (3) conservative perf path (past horizon AND node_rate>floor AND windowed lean_ns>1.10*slow_ns over >=3 windows).
-#       node_rate-DECAY (not fallback%) protects slow-saturating lean winners (cult_d3: node_rate -> ~0 => never demoted).
-# RESULTS: every SATURATING lean winner stays LEAN (no regression); coherent_d5_r5 OOM SOLVED (was SIGKILL at ~3.6GB from
-#   the dense-core mcache growing unbounded; now AUTH@191, peak RSS 1.74GB, tables freed) and recovers auth; cultivation_d5
-#   NON-saturating cache is now MEMORY-BOUNDED (AUTH@~20k: peak RSS 4.5GB->0.86GB, speed 0.72x lean -> 0.41x auth = the
-#   memory-for-speed trade on a circuit that loses to Clifft either way); d7_r1/d5_r1 demote AUTH@4095 in the FIRST window
-#   (were run_mcache-bound 1.94x/10145x); coherent_d3_r3 demotes to lazy-AUTH 0.42x which BEATS its own lean 0.36x.
-# NOTES: coherent_d5_r5 adapt measured at N=8000 (probation = 191 heavy run_mcache shots dominates the finite-N average
-#   -> 764x; steady-state N->inf converges to auth 819x since the probation is a one-time 191-shot cost).  best_path =
-#   argmin over auth/lean/adapt (oracle).  Clifft = external paper baseline only (never referenced inside MDAM); ratios
-#   factual, losses (<1x) included, no "beats" framing.
-# bit-exact = adaptive output is bit-identical to authoritative sample_batch across any LEAN->AUTH switch (spot 2x2000).
-coherent_rx_d3_r1	14	10	17	131084.0	165294.8	0.79x	2506.8	52.29x	0.2	2678.3	48.94x	LEAN	lean	52.29x	off-axis-saturates	OK
-coherent_rx_d3_r3	14	11	33	393710.8	974037.6	0.40x	32921.2	11.96x	7.2	41623.6	9.46x	LEAN	lean	11.96x	off-axis-saturates	OK
-distillation	5	3	85	11713.9	17875.3	0.66x	5894.3	1.99x	0.0	6058.8	1.93x	LEAN	lean	1.99x	magic-saturates	OK
-cultivation_d3	4	3	21	2348.4	14914.2	0.16x	2142.5	1.10x	0.1	2153.9	1.09x	LEAN	lean	1.10x	magic-sat-saturates	OK
-coherent_d3_r1	5	0	17	1390.3	4540.4	0.31x	1356.1	1.03x	0.0	1459.5	0.95x	LEAN	lean	1.03x	small-k-saturates	OK
-surface_d7_r7	0	0	385	8993.8	21096.4	0.43x	8985.2	1.00x	0.0	9963.1	0.90x	LEAN	lean	1.00x	k0-pure-Clifford	OK
-cultivation_d5	10	9	112	82109.8	191335.6	0.43x	114173.6	0.72x	34.2	202466.0	0.41x	AUTH@19903	lean	0.72x	magic-nonsat-membudget	OK
-coherent_d3_r3	8	4	33	14098.8	46602.6	0.30x	39230.3	0.36x	100.0	33196.3	0.42x	AUTH@4095	adapt	0.42x	small-k-loc-nonsat	OK
-coherent_d5_r1	13	0	49	205263.3	29980.3	6.85x	107729.5	1.91x	98.4	36694.0	5.59x	AUTH@4095	auth	6.85x	r<<k-localization	OK
-coherent_d7_r1	25	0	97	3996135191.4	112357.7	35566.63x	402481.1	9928.75x	100.0	145996.5	27371.44x	AUTH@4095	auth	35566.63x	r<<k-localization	OK
-coherent_d5_r5	24	12	145	8695465444.5	10608325.9	819.68x	OOM	NA	100.0	11374680.0	764.49x	AUTH@191	auth	819.68x	r<k-loc-heavycore	OK
+# bench k maxM nmeas clifft_ns auth_ns speedup_auth lean_ns speedup_lean fallback_pct adapt_ns speedup_adapt adapt_policy best_path best_speedup regime bitexact cg_N cg_ns speedup_cg cg_route cg_bitexact
+# FOUR MDAM paths, cold-amortized ns/shot (total_wall/N), taskset -c 2, single-thread BLAS.  speedup_X = clifft_ns/X_ns.
+# ============================ POOL-FREE BASELINE (2026-07-07) ============================
+# MDAM's ONLY cache is BoundaryKey -> boundary-transition result (the sg tables).  The former dense-STATE
+# snapshot pool (mc_pool, fallback-restore shortcut) is REMOVED FROM THE ALGORITHM (compiled default
+# mc_pool_off=1): caching state contradicts the MDAM principle (state is materialized only at measurement
+# time).  Ablation (pool_ablate.tsv, bit-exact 22/22): pool OFF is win-or-parity on 9/11 benches
+# (d3_r3 2.76x->2.99x, cult_d5 0.69x->0.71x), costs -6..-12% only on the two off-axis rx benches
+# (expensive dense-core rebuild on miss), eliminates every 296-533MB pool peak and EVERY memory-budget
+# event.  Peak cache memory is now the BoundaryKey tables alone (max 63MB, cultivation_d5); the adaptive
+# memory ladder reduces to freeze-vs-AUTH (pool-evict rung is vacuous).  lean/adapt/cg columns re-measured
+# on this build; auth untouched (never used the pool).
+# =========================================================================================
+#   auth  = authoritative (run()/sample_batch): no cache, constant memory.  Wins via r<<k localization.
+#   lean  = LEAN-FORCED ablation of the production entry (FORCE_LEAN cfg): the AUTH route is disabled and
+#           everything else is IDENTICAL to cg -- pure-LEAN probe, self-relative compile gate, race
+#           (interpreted vs compiled walk), cruise; miss -> run_mcache same-seed replay (recomputes; no
+#           state restore).  Same N and cold-single-call protocol as cg, so (cg - lean) isolates exactly
+#           the value of the AUTH option, and (lean vs nocompile-adapt) the value of compilation.
+#           fallback_pct = overall miss fraction of the forced-LEAN run.
+#   adapt = ADAPTIVE executor v2 (run_lean_adapt_batch, MEASURED-CRITERION, cold single call, DEFAULT config).
+#           All decisions from measured quantities -- no tuned demote thresholds:
+#           [0] T_auth calibrated on the first min(512, N/4, ~1s) shots via run() (those shots are normal output);
+#           [1] LEAN runs with sampled T_walk (hit shots) + T_slow (miss shots) + per-window fb/D history;
+#           [2] fb_be = (T_auth-T_walk)/(T_slow-T_walk): below it LEAN is faster than AUTH *now* (cost identity);
+#           [3] if LOSING (fb_w > fb_be): keep LEAN iff the Heaps-law fit (fb ~ phi*N^(beta-1), log-log OLS, R2- and
+#               dual-slope-checked) projects recoupment inside the batch: phi*(N^b-n^b)/b*(T_slow-T_walk) <=
+#               (T_auth-T_walk)*(N-n); else demote to AUTH.  Identity fast path: zero completed walks AND measured
+#               T_slow >= T_auth -> demote immediately (heavy-core all-miss, e.g. d5_r5 @255).  Magicless
+#               early-localization exit unchanged (d7_r1/d5_r1 @639).
+#           [4] MEMORY NEVER DECIDES THE REGIME: tables over the (optional) resource guard -> freeze learning
+#               (inserts stop; walk + fallback continue) iff frozen-LEAN still beats T_auth, else demote.
+#               No bench reaches the guard on this build.
+#   cg    = full production entry (mdam_run.run_batch on the v2 executor): probe(adaptive) ->
+#           route(AUTH/adaptive) -> self-relative gate -> race(interpreted vs circuit-compiled walk) -> cruise.
+#           Measured cold single-call with the per-circuit .so PRE-CACHED (circuit-lifetime scenario; first-ever run
+#           adds one g++ ~5-6s only when the gate engages).  cg_route: ENG=compiled walk cruised, leanfb=race kept
+#           interpreted, adaptive=fb stayed above the gate, AUTH=probe demoted.
+# K reduction: k=nominal magic (Clifft dense=2^k); maxM=MDAM peak materialized magic.
+# VERIFIED on the pool-free build: adapt vs authoritative sample_batch bit-exact 11/11 benches (2x2000);
+#   lean vs sample_batch bit-exact on all re-measured rows; cg spot 2x2000 per row.
+# NOTES: cultivation_d3 adapt/cg at N=1e6 (native reduce_full gap ~1/2M shots blocks larger single streams; fires on
+#   ALL native paths incl authoritative; cg seed-retries disclosed in cg_route).  coherent_d5_r5 at N=8000.
+#   best_path = argmin over auth/lean/adapt/cg (oracle; lean is memory-UNBOUNDED so quote adapt/cg for production).
+#   Clifft = external paper baseline only (never referenced inside MDAM; every runtime gate is self-relative);
+#   ratios factual, losses (<1x) included, no "beats" framing.
+# bit-exact = adapt vs sample_batch spot 2x2000; cg_bitexact = run_batch vs sample_batch spot 2x2000
+#   (OK* = coherent_d5_r5 skipped: its 8000-shot run IS the verified adaptive probe path by construction).
+coherent_rx_d3_r1	14	10	17	131084.0	165294.8	0.79x	2318.7	56.53x	0.3	2786.9	47.04x	LEAN	cg	56.95x	off-axis-saturates	OK	7180469	2301.9	56.95x	ENG	OK
+coherent_rx_d3_r3	14	11	33	393710.8	974037.6	0.40x	119483.2	3.30x	8.9	127979.2	3.08x	LEAN	lean	3.30x	off-axis-saturates	OK	546760	124362.6	3.17x	adaptive	OK
+distillation	5	3	85	11713.9	17875.3	0.66x	6018.0	1.95x	0.0	5814.6	2.01x	LEAN	adapt	2.01x	magic-saturates	OK	3053797	5865.9	2.00x	leanfb	OK
+cultivation_d3	4	3	21	2348.4	14914.2	0.16x	1573.1	1.49x	0.4	2094.2	1.12x	LEAN	cg	1.59x	magic-sat-saturates	OK	1000000	1477.2	1.59x	ENG(retry2)	OK
+coherent_d3_r1	5	0	17	1390.3	4540.4	0.31x	950.9	1.46x	0.0	1278.9	1.09x	LEAN	cg	1.48x	small-k-saturates	OK	10000000	939.2	1.48x	ENG	OK
+surface_d7_r7	0	0	385	8993.8	21096.4	0.43x	8821.1	1.02x	0.0	9320.1	0.96x	LEAN	lean	1.02x	k0-pure-Clifford	OK	1038961	8990.5	1.00x	ENG	OK
+cultivation_d5	10	9	112	82109.8	191335.6	0.43x	109263.3	0.75x	36.8	115206.6	0.71x	LEAN	lean	0.75x	magic-nonsat	OK	157654	111223.3	0.74x	adaptive	OK
+coherent_d3_r3	8	4	33	14098.8	46602.6	0.30x	4167.1	3.38x	2.0	4718.2	2.99x	LEAN	cg	3.41x	small-k-saturates	OK	3774217	4129.4	3.41x	ENG	OK
+coherent_d5_r1	13	0	49	205263.3	29980.3	6.85x	102999.3	1.99x	99.1	28552.1	7.19x	AUTH@639	adapt	7.19x	r<<k-localization	OK	167085	30729.4	6.68x	AUTH	OK
+coherent_d7_r1	25	0	97	3996135191.4	112357.7	35566.63x	387283.7	10318.37x	100.0	108623.2	36788.97x	AUTH@639	adapt	36788.97x	r<<k-localization	OK	150000	114697.5	34840.64x	AUTH	OK
+coherent_d5_r5	24	12	145	8695465444.5	10608325.9	819.68x	13326972.9	652.47x	100.0	10634107.9	817.70x	AUTH@255	auth	819.68x	r<k-loc-heavycore	OK	8000	10668029.5	815.10x	AUTH	OK*

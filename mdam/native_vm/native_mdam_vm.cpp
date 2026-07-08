@@ -607,6 +607,9 @@ void nvm_mcache_cyc_get(void* vm, uint64_t* out){ auto& s=*reinterpret_cast<Mdam
 void nvm_mcache_set_skip(void* vm, int mask){ reinterpret_cast<MdamShot*>(vm)->mc_skip=mask; }
 void nvm_mcache_set_optime(void* vm, int t){ reinterpret_cast<MdamShot*>(vm)->mc_optime=(t!=0); }
 void nvm_mcache_set_fblock(void* vm, int t){ reinterpret_cast<MdamShot*>(vm)->mc_fblock=(t!=0); }
+// mc_pool_off: skip run_mcache's pool-snapshot interning (lean-walk builds need only the sg tables; the pool
+// is the memory hog that trips the adaptive budget).  Records bit-identical (fallback boundaries stay live).
+void nvm_mc_pool_off(void* vm, int t){ reinterpret_cast<MdamShot*>(vm)->mc_pool_off=(t!=0); }
 void nvm_mcache_opcyc_get(void* vm, uint64_t* out){ auto& s=*reinterpret_cast<MdamShot*>(vm); for(int i=0;i<8;i++) out[i]=s.mc_opcyc[i]; }
 int nvm_mdam_run_mcache(void* prog, void* vm, uint64_t shi, uint64_t slo, uint64_t ihi, uint64_t ilo,
                         uint8_t* out_record, char* out_err, int errlen){
@@ -713,6 +716,27 @@ void nvm_adapt_stats(void* vm, double* out){ auto& s=*reinterpret_cast<MdamShot*
     out[6]=s.ad_lean_ns_last; out[7]=s.ad_slow_ns_last; out[8]=s.ad_fb_rate_last;
     out[9]=(double)s.ln_id.size(); out[10]=(double)s.ln_edge.size(); out[11]=(double)s.ad_mem_est();
     out[12]=(double)s.mc_pool.size(); out[13]=(double)s.mc_pool_bytes(); }
+// v2 measured-criterion executor toggle (DEFAULT ON; 0 = legacy trigger set, kept for A/B).
+void nvm_adapt_v2(void* vm, int t){ reinterpret_cast<MdamShot*>(vm)->ad_v2=(t!=0); }
+// Extended stats with EXPLICIT length (writes min(n,26) doubles — safe for any caller buffer):
+//  [0..13] identical to nvm_adapt_stats;  14 pool_evict_shot, 15 freeze_shot, 16 beta_fb, 17 beta_D,
+//  18 fit_r2, 19 phi, 20 fb_be, 21 t_auth_ns, 22 t_walk_ns, 23 t_slow_ns, 24 crit_lhs, 25 crit_rhs.
+void nvm_adapt_stats2(void* vm, double* out, int n){ auto& s=*reinterpret_cast<MdamShot*>(vm);
+    double v[26];
+    v[0]=s.ad_final_policy; v[1]=(double)s.ad_demote_shot; v[2]=(double)s.ad_windows;
+    v[3]=(double)s.ad_slow_shots; v[4]=s.ad_node_rate_init; v[5]=s.ad_node_rate_last;
+    v[6]=s.ad_lean_ns_last; v[7]=s.ad_slow_ns_last; v[8]=s.ad_fb_rate_last;
+    v[9]=(double)s.ln_id.size(); v[10]=(double)s.ln_edge.size(); v[11]=(double)s.ad_mem_est();
+    v[12]=(double)s.mc_pool.size(); v[13]=(double)s.mc_pool_bytes();
+    v[14]=(double)s.v2_pool_evict_shot; v[15]=(double)s.v2_freeze_shot;
+    v[16]=s.v2_beta_fb; v[17]=s.v2_beta_D; v[18]=s.v2_r2; v[19]=s.v2_phi; v[20]=s.v2_fb_be;
+    v[21]=s.v2_t_auth; v[22]=s.v2_t_walk; v[23]=s.v2_t_slow; v[24]=s.v2_crit_lhs; v[25]=s.v2_crit_rhs;
+    for(int i=0;i<n && i<26;i++) out[i]=v[i]; }
+// per-window decision trace of the last adapt_v2 batch (13 doubles/row, layout in native_mdam_shot.hpp).
+long nvm_adapt_trace_n(void* vm){ return (long)(reinterpret_cast<MdamShot*>(vm)->v2_tr.size()/13); }
+void nvm_adapt_trace(void* vm, double* out, long cap_rows){ auto& s=*reinterpret_cast<MdamShot*>(vm);
+    long n=(long)(s.v2_tr.size()/13); if(n>cap_rows) n=cap_rows;
+    std::memcpy(out, s.v2_tr.data(), (size_t)n*13*sizeof(double)); }
 // out: 0 distinct_edges, 1 edge_checks, 2 edge_viol, 3 boundaries, 4 p0_checks, 5 p0_viol,
 //      6 antis_checks, 7 antis_viol, 8 distinct_nodes(p0 map size)
 void nvm_sg_stats(void* vm, long* out){ auto& s=*reinterpret_cast<MdamShot*>(vm);
