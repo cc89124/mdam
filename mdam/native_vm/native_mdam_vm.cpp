@@ -718,6 +718,20 @@ void nvm_adapt_stats(void* vm, double* out){ auto& s=*reinterpret_cast<MdamShot*
     out[12]=(double)s.mc_pool.size(); out[13]=(double)s.mc_pool_bytes(); }
 // v2 measured-criterion executor toggle (DEFAULT ON; 0 = legacy trigger set, kept for A/B).
 void nvm_adapt_v2(void* vm, int t){ reinterpret_cast<MdamShot*>(vm)->ad_v2=(t!=0); }
+// v2 T_auth calibration caps.  max_shots=0 disables calibration: T_auth stays unmeasured, every
+// measured demote trigger is inert, and the batch becomes a pure forced-LEAN run from shot 0
+// (single call, per-window walls in the trace) — the measurement-protocol twin of the adaptive run.
+void nvm_adapt_cal(void* vm, long max_shots, double max_ns){ auto& s=*reinterpret_cast<MdamShot*>(vm);
+    if(max_shots>=0) s.v2_cal_max_shots=max_shots; if(max_ns>0) s.v2_cal_max_ns=max_ns; }
+// Pre-size the growing tables (buckets/capacity only; contents untouched) so that no mid-run
+// rehash/realloc lands inside a timed window.  Measurement aid: removes implementation-artifact
+// spikes from per-window walls; results are unchanged (same inserts, same lookups).
+void nvm_lean_reserve(void* vm, long nodes, long edges){ auto& s=*reinterpret_cast<MdamShot*>(vm);
+    if(nodes>0){ s.ln_id.reserve(nodes); s.sg_p0.reserve(nodes); s.sg_antis.reserve(nodes);
+                 s.sg_trans.reserve(nodes); s.bcap_intern.reserve(nodes);
+                 s.ln_p0v.reserve(nodes); s.ln_antisv.reserve(nodes); s.bcap_amp.reserve(nodes); }
+    if(edges>0){ s.ln_edge.reserve(edges);
+                 for(auto& m : s.mc_edges) m.reserve(edges/std::max((size_t)1,s.mc_edges.size())); } }
 // Extended stats with EXPLICIT length (writes min(n,26) doubles — safe for any caller buffer):
 //  [0..13] identical to nvm_adapt_stats;  14 pool_evict_shot, 15 freeze_shot, 16 beta_fb, 17 beta_D,
 //  18 fit_r2, 19 phi, 20 fb_be, 21 t_auth_ns, 22 t_walk_ns, 23 t_slow_ns, 24 crit_lhs, 25 crit_rhs.

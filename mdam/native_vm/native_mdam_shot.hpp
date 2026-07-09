@@ -1636,6 +1636,12 @@ struct MdamShot {
                    v2_t_auth>0 && v2_slow_cnt>=8 && v2_t_slow>=v2_t_auth){
                     v2_tr_push((double)(sh+1),1.0,3,-1); do_demote((long)sh); }
             }
+            if(policy==1 && w_shots>=ad_window){
+                // post-demote windows: keep logging the measured per-window wall so the whole
+                // adaptive run stays traceable (figures need no synthetic segments)
+                v2_tr_push((double)(sh+1),1.0,0,(now_ns()-w_t0)/(double)w_shots);
+                w_fb0=ln_fb_count; w_node0=ln_id.size(); w_shots=0; w_t0=now_ns();
+            }
             if(policy==0 && w_shots>=ad_window){
                 double fb_w=(double)(ln_fb_count-w_fb0)/(double)w_shots;
                 double node_rate=(double)(ln_id.size()-w_node0)/(double)w_shots;
