@@ -13,7 +13,7 @@ argv: bench N   -> saves all512_<bench>.npz"""
 import os, sys, time, ctypes
 for v in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","NUMEXPR_NUM_THREADS"): os.environ.setdefault(v,"1")
 import numpy as np
-ROOT="/home/jung/clifft-paper"; NV=ROOT+"/mdam/native_vm"
+ROOT=os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),"..","..","..")); NV=ROOT+"/mdam/native_vm"
 sys.path.insert(0,NV); sys.path.insert(0,ROOT+"/mdam"); sys.path.insert(0,ROOT)
 import clifft
 from verify_mdam_oneshot import translate, make_prog, pcg, load_lib

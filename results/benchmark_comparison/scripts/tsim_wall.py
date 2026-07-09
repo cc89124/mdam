@@ -12,7 +12,8 @@ for v in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","NUMEXPR_NU
 import numpy as np
 SC=os.path.dirname(os.path.abspath(__file__))
 bench=sys.argv[1]; target_s=float(sys.argv[2]) if len(sys.argv)>2 else 20.0
-text=open(f"/home/jung/clifft-paper/qec_bench/circuits/{bench}.stim").read()
+ROOT=os.path.abspath(os.path.join(SC,"..","..",".."))
+text=open(f"{ROOT}/qec_bench/circuits/{bench}.stim").read()
 
 import tsim
 t0=time.perf_counter(); samp=tsim.Circuit(text).compile_sampler(); build_s=time.perf_counter()-t0

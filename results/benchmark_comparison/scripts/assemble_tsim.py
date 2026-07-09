@@ -2,7 +2,7 @@
 Benches with no tsim row (crash/timeout) get 'infeasible'."""
 import csv, os
 SC=os.path.dirname(os.path.abspath(__file__))
-CSV="/home/jung/clifft-paper/results/benchmark_comparison/wall_table.csv"
+CSV=os.path.join(SC,"..","wall_table.csv")
 tsim={}
 for ln in open(f"{SC}/tsim_rows.tsv"):
     f=ln.split("\t")

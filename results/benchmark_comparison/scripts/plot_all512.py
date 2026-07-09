@@ -9,7 +9,7 @@ import numpy as np
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 SC=os.path.dirname(os.path.abspath(__file__))
-OUT="/home/jung/clifft-paper/results/benchmark_comparison/adaptive_algorithm_results"
+OUT=os.path.join(os.path.dirname(os.path.abspath(__file__)),"..","adaptive_algorithm_results")
 BLUE="#1f77b4"; RED="#c44e52"; GREEN="#2ca02c"
 
 def break_even(fb,wl,T_auth):
