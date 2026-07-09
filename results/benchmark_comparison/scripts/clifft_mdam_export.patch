@@ -1,0 +1,466 @@
+diff --git a/src/clifft/CMakeLists.txt b/src/clifft/CMakeLists.txt
+index e19417e..37c23bd 100644
+--- a/src/clifft/CMakeLists.txt
++++ b/src/clifft/CMakeLists.txt
+@@ -26,6 +26,7 @@ add_library(clifft_core STATIC
+     svm/svm_forced_kernels.cc
+     svm/svm_scalar.cc
+     svm/svm_state.cc
++    util/cost_meter.cc
+     util/introspection.cc
+ )
+ 
+diff --git a/src/clifft/svm/svm_kernels.inl b/src/clifft/svm/svm_kernels.inl
+index 6ecd114..69dd1b7 100644
+--- a/src/clifft/svm/svm_kernels.inl
++++ b/src/clifft/svm/svm_kernels.inl
+@@ -21,6 +21,8 @@
+ #include <numbers>
+ #include <utility>
+ 
++#include "clifft/util/cost_meter.h"
++
+ namespace clifft {
+ namespace CLIFFT_SIMD_NAMESPACE {
+ 
+@@ -122,6 +124,7 @@ static inline void exec_frame_swap(SchrodingerState& state, uint16_t a, uint16_t
+ // CNOT on active axes (c=control, t=target): permutes the amplitude array
+ // using branchless bit-weaving to iterate only over the 2^{k-2} relevant pairs.
+ static inline void exec_array_cnot(SchrodingerState& state, uint16_t c, uint16_t t) {
++    CLIFFT_COST(CostKernel::ARRAY_CNOT, state.active_k, CLIFFT_POW2K(state.active_k), 0, 0, 0, 0, 0);
+     assert(c != t && "Control and Target axes must be distinct");
+     assert(c < state.active_k && c < 64 && "ARRAY_CNOT: control axis out of range");
+     assert(t < state.active_k && t < 64 && "ARRAY_CNOT: target axis out of range");
+@@ -253,6 +256,8 @@ static inline void exec_array_cnot(SchrodingerState& state, uint16_t c, uint16_t
+ 
+ // CZ on active axes (c, t): applies diag(1,1,1,-1) in the computational basis.
+ static inline void exec_array_cz(SchrodingerState& state, uint16_t c, uint16_t t) {
++    CLIFFT_COST(CostKernel::ARRAY_CZ, state.active_k, CLIFFT_POW2K(state.active_k), 0,
++                CLIFFT_QUARTER(state.active_k), 0, 0, 0);
+     assert(c != t && "Control and Target axes must be distinct");
+     assert(c < state.active_k && c < 64 && "ARRAY_CZ: control axis out of range");
+     assert(t < state.active_k && t < 64 && "ARRAY_CZ: target axis out of range");
+@@ -367,6 +372,7 @@ static inline void exec_array_cz(SchrodingerState& state, uint16_t c, uint16_t t
+ // SWAP on active axes (a, b): permutes the amplitude array by swapping the
+ // |01> and |10> quadrants.
+ static inline void exec_array_swap(SchrodingerState& state, uint16_t a, uint16_t b) {
++    CLIFFT_COST(CostKernel::ARRAY_SWAP, state.active_k, CLIFFT_POW2K(state.active_k), 0, 0, 0, 0, 0);
+     assert(a != b && "ARRAY_SWAP: axes a and b must be distinct");
+     assert(a < state.active_k && a < 64 && "ARRAY_SWAP: axis a out of range");
+     assert(b < state.active_k && b < 64 && "ARRAY_SWAP: axis b out of range");
+@@ -463,6 +469,8 @@ static inline void exec_array_swap(SchrodingerState& state, uint16_t a, uint16_t
+ // is odd: |x> -> |x XOR (popcount(x & ctrl_mask) % 2) << target>.
+ static inline void exec_array_multi_cnot(SchrodingerState& state, uint16_t target,
+                                          uint64_t ctrl_mask) {
++    CLIFFT_COST(CostKernel::ARRAY_MULTI_CNOT, state.active_k, CLIFFT_POW2K(state.active_k), 0, 0, 0,
++                0, 0);
+     assert(target < state.active_k && target < 64);
+ 
+     uint64_t t_bit = 1ULL << target;
+@@ -558,6 +566,8 @@ static inline void exec_array_multi_cnot(SchrodingerState& state, uint16_t targe
+ // scatter_bits_1 to skip the control-bit-unset indices entirely.
+ static inline void exec_array_multi_cz(SchrodingerState& state, uint16_t control,
+                                        uint64_t target_mask) {
++    CLIFFT_COST(CostKernel::ARRAY_MULTI_CZ, state.active_k, CLIFFT_POW2K(state.active_k), 0,
++                CLIFFT_QUARTER(state.active_k), 0, 0, 0);
+     assert(control < state.active_k && control < 64);
+ 
+     uint64_t c_bit = 1ULL << control;
+@@ -637,6 +647,9 @@ static inline void exec_array_multi_cz(SchrodingerState& state, uint16_t control
+ // ARRAY_H on active axis v: applies the Hadamard butterfly transform,
+ // then updates the Pauli frame.
+ static inline void exec_array_h(SchrodingerState& state, uint16_t v) {
++    // per pair (2^(k-1) pairs): 1 cadd + 1 csub + 2 real*1/sqrt2 -> cadd=2^k, rcmul=2^k
++    CLIFFT_COST(CostKernel::ARRAY_H, state.active_k, CLIFFT_POW2K(state.active_k), 0,
++                CLIFFT_POW2K(state.active_k), CLIFFT_POW2K(state.active_k), 0, 0);
+     assert(v < state.active_k && v < 64 && "ARRAY_H: axis out of range");
+     uint64_t v_bit = 1ULL << v;
+     auto* __restrict arr = state.v();
+@@ -852,6 +865,8 @@ static inline void apply_phase_waterfall(SchrodingerState& state, uint16_t v, do
+ // ARRAY_S on active axis v: applies diag(1, i) to the amplitude array,
+ // then updates the Pauli frame identically to FRAME_S.
+ static inline void exec_array_s(SchrodingerState& state, uint16_t v) {
++    CLIFFT_COST(CostKernel::ARRAY_S, state.active_k, CLIFFT_HALF(state.active_k),
++                CLIFFT_HALF(state.active_k), 0, 0, 0, 0);
+     assert(v < state.active_k && v < 64 && "ARRAY_S: axis out of range");
+     apply_phase_waterfall(state, v, 0.0, 1.0);
+     exec_frame_s(state, v);
+@@ -860,6 +875,8 @@ static inline void exec_array_s(SchrodingerState& state, uint16_t v) {
+ // ARRAY_S_DAG on active axis v: applies diag(1, -i) to the amplitude array,
+ // then updates the Pauli frame identically to FRAME_S_DAG.
+ static inline void exec_array_s_dag(SchrodingerState& state, uint16_t v) {
++    CLIFFT_COST(CostKernel::ARRAY_S_DAG, state.active_k, CLIFFT_HALF(state.active_k),
++                CLIFFT_HALF(state.active_k), 0, 0, 0, 0);
+     assert(v < state.active_k && v < 64 && "ARRAY_S_DAG: axis out of range");
+     apply_phase_waterfall(state, v, 0.0, -1.0);
+     exec_frame_s_dag(state, v);
+@@ -874,6 +891,8 @@ static inline void exec_array_s_dag(SchrodingerState& state, uint16_t v) {
+ // for all i < 2^k, producing |phi> tensor |+> on the new axis.
+ // gamma /= sqrt(2) to maintain normalization.
+ static inline void exec_expand(SchrodingerState& state, uint16_t v) {
++    // pure copy of 2^k amplitudes (0 arithmetic); 1/sqrt2 scale is O(1) via gamma_
++    CLIFFT_COST(CostKernel::EXPAND, state.active_k, CLIFFT_POW2K(state.active_k), 0, 0, 0, 0, 0);
+     assert(v == state.active_k && "EXPAND must target the next dormant axis");
+     assert(state.v_size() <= state.array_size() / 2 && "EXPAND exceeded AOT peak_rank allocation!");
+     (void)v;
+@@ -949,6 +968,8 @@ static inline void expand_with_phase(std::complex<double>* __restrict arr, uint6
+ // the array gets T_dag instead and gamma absorbs e^{i*pi/4} to preserve
+ // the factored state identity.
+ static inline void exec_array_t(SchrodingerState& state, uint16_t v) {
++    CLIFFT_COST(CostKernel::ARRAY_T, state.active_k, CLIFFT_HALF(state.active_k),
++                CLIFFT_HALF(state.active_k), 0, 0, 0, 0);
+     assert(v < 64 && "ARRAY_T: axis out of range");
+     bool px = bit_get(state.p_x, v);
+ 
+@@ -970,6 +991,8 @@ static inline void exec_array_t(SchrodingerState& state, uint16_t v) {
+ // Mirror of T: if p_x[v]=1, the array gets T instead and gamma absorbs
+ // e^{-i*pi/4}.
+ static inline void exec_array_t_dag(SchrodingerState& state, uint16_t v) {
++    CLIFFT_COST(CostKernel::ARRAY_T_DAG, state.active_k, CLIFFT_HALF(state.active_k),
++                CLIFFT_HALF(state.active_k), 0, 0, 0, 0);
+     assert(v < 64 && "ARRAY_T_DAG: axis out of range");
+     bool px = bit_get(state.p_x, v);
+ 
+@@ -993,6 +1016,9 @@ static inline void exec_array_t_dag(SchrodingerState& state, uint16_t v) {
+ // v[idx] by exp(i*pi/4) for all idx with the new bit set.  By fusing,
+ // we write v[i + half] = v[i] * phase in one loop instead of two.
+ static inline void exec_expand_t(SchrodingerState& state, uint16_t v) {
++    // copy-with-phase of 2^k amplitudes: 1 cmul each
++    CLIFFT_COST(CostKernel::EXPAND_T, state.active_k, CLIFFT_POW2K(state.active_k),
++                CLIFFT_POW2K(state.active_k), 0, 0, 0, 0);
+     assert(v == state.active_k && "EXPAND_T must target the next dormant axis");
+     assert(state.v_size() <= state.array_size() / 2);
+     uint64_t half = 1ULL << state.active_k;
+@@ -1014,6 +1040,8 @@ static inline void exec_expand_t(SchrodingerState& state, uint16_t v) {
+ 
+ // Fused EXPAND + ARRAY_T_DAG: same fusion but with T-dagger phase.
+ static inline void exec_expand_t_dag(SchrodingerState& state, uint16_t v) {
++    CLIFFT_COST(CostKernel::EXPAND_T_DAG, state.active_k, CLIFFT_POW2K(state.active_k),
++                CLIFFT_POW2K(state.active_k), 0, 0, 0, 0);
+     assert(v == state.active_k && "EXPAND_T_DAG must target the next dormant axis");
+     assert(state.v_size() <= state.array_size() / 2);
+     uint64_t half = 1ULL << state.active_k;
+@@ -1042,6 +1070,8 @@ static inline void exec_expand_t_dag(SchrodingerState& state, uint16_t v) {
+ // the array gets z* instead and gamma absorbs z to preserve the factored
+ // state identity.
+ static inline void exec_array_rot(SchrodingerState& state, uint16_t v, double z_re, double z_im) {
++    CLIFFT_COST(CostKernel::ARRAY_ROT, state.active_k, CLIFFT_HALF(state.active_k),
++                CLIFFT_HALF(state.active_k), 0, 0, 0, 0);
+     assert(v < 64 && "ARRAY_ROT: axis out of range");
+     bool px = bit_get(state.p_x, v);
+     std::complex<double> z(z_re, z_im);
+@@ -1063,6 +1093,8 @@ static inline void exec_array_rot(SchrodingerState& state, uint16_t v, double z_
+ // Fused EXPAND + ARRAY_ROT: duplicates the array into the upper half while
+ // applying the continuous phase to the new axis in a single pass.
+ static inline void exec_expand_rot(SchrodingerState& state, uint16_t v, double z_re, double z_im) {
++    CLIFFT_COST(CostKernel::EXPAND_ROT, state.active_k, CLIFFT_POW2K(state.active_k),
++                CLIFFT_POW2K(state.active_k), 0, 0, 0, 0);
+     assert(v == state.active_k && "EXPAND_ROT must target the next dormant axis");
+     assert(state.v_size() <= state.array_size() / 2);
+     uint64_t half = 1ULL << state.active_k;
+@@ -1107,6 +1139,10 @@ static inline void exec_array_u2(SchrodingerState& state, const ConstantPool& po
+     if (axis >= state.active_k)
+         return;
+ 
++    // 2x2 butterfly per pair (2^(k-1) pairs): 4 cmul + 2 cadd -> cmul=2^(k+1), cadd=2^k
++    CLIFFT_COST(CostKernel::ARRAY_U2, state.active_k, CLIFFT_POW2K(state.active_k),
++                2 * CLIFFT_POW2K(state.active_k), 0, CLIFFT_POW2K(state.active_k), 0, 0);
++
+     uint64_t iters = 1ULL << (state.active_k - 1);
+     uint64_t v_bit = 1ULL << axis;
+     uint64_t pdep_mask = ~v_bit;
+@@ -1330,6 +1366,10 @@ static inline void exec_array_u4(SchrodingerState& state, const ConstantPool& po
+     bit_set(state.p_x, axis_hi, (out & 4) != 0);
+     bit_set(state.p_z, axis_hi, (out & 8) != 0);
+ 
++    // 4x4 matvec per block (2^(k-2) blocks): 16 cmul + 12 cadd -> cmul=4*2^k, cadd=3*2^k
++    CLIFFT_COST(CostKernel::ARRAY_U4, state.active_k, CLIFFT_POW2K(state.active_k),
++                4 * CLIFFT_POW2K(state.active_k), 0, 3 * CLIFFT_POW2K(state.active_k), 0, 0);
++
+     // Array sweep: apply the 4x4 matrix to every block of 4 elements.
+     // Block indices: {base, base|lo_bit, base|hi_bit, base|lo_bit|hi_bit}
+     uint64_t lo_bit = 1ULL << axis_lo;
+@@ -1572,6 +1612,10 @@ static inline void exec_meas_dormant_random(SchrodingerState& state, uint16_t v,
+ // (-1)^(p_z[v]*b). Physical outcome m = b XOR p_x[v].
+ static inline void exec_meas_active_diagonal(SchrodingerState& state, uint16_t v,
+                                              uint32_t classical_idx, bool sign) {
++    // Born sweep reads 2^k amplitudes (2 |z|^2 per pair); compaction is a copy;
++    // renorm is O(1) via gamma_ (only sweeps in the rare overflow guard).
++    CLIFFT_COST(CostKernel::MEAS_DIAGONAL, state.active_k, CLIFFT_POW2K(state.active_k), 0, 0, 0,
++                CLIFFT_POW2K(state.active_k), 0);
+     assert(v == state.active_k - 1 && "Active diagonal measurement must target axis k-1");
+ 
+     uint64_t half = 1ULL << (state.active_k - 1);
+@@ -1633,6 +1677,11 @@ static inline void exec_meas_active_diagonal(SchrodingerState& state, uint16_t v
+ // m = b_x XOR p_z[v], with phase extraction (-1)^(p_x[v]*m).
+ static inline void exec_meas_active_interfere(SchrodingerState& state, uint16_t v,
+                                               uint32_t classical_idx, bool sign) {
++    // Born sweep: 2^(k-1) pairs x (1 cadd + 1 csub + 2 |z|^2); fold: 2^(k-1) x (1 cadd + 1 real*);
++    // renorm O(1) via gamma_.  -> cadd=2^k+2^(k-1), rcmul=2^(k-1), sqmag=2^k
++    CLIFFT_COST(CostKernel::MEAS_INTERFERE, state.active_k, CLIFFT_POW2K(state.active_k), 0,
++                CLIFFT_HALF(state.active_k), CLIFFT_POW2K(state.active_k) + CLIFFT_HALF(state.active_k),
++                CLIFFT_POW2K(state.active_k), 0);
+     assert(v == state.active_k - 1 && "Active interfere measurement must target axis k-1");
+ 
+     uint64_t half = 1ULL << (state.active_k - 1);
+@@ -1734,6 +1783,12 @@ static inline void exec_swap_meas_interfere(SchrodingerState& state, uint16_t f,
+         return;
+     }
+ 
++    // Same arithmetic as MEAS_INTERFERE (Born sweep + fold), index-remapped to
++    // fuse the SWAP; renorm O(1) via gamma_.
++    CLIFFT_COST(CostKernel::SWAP_MEAS_INTERFERE, state.active_k, CLIFFT_POW2K(state.active_k), 0,
++                CLIFFT_HALF(state.active_k), CLIFFT_POW2K(state.active_k) + CLIFFT_HALF(state.active_k),
++                CLIFFT_POW2K(state.active_k), 0);
++
+     // Frame update: equivalent to FRAME_SWAP(f, t) before measurement
+     exec_frame_swap(state, f, t);
+     bool px_v = bit_get(state.p_x, t);
+@@ -2132,6 +2187,12 @@ exec_exp_val(SchrodingerState& state, const ConstantPool& pool, uint32_t cp_exp_
+     const auto* arr = state.v();
+     uint64_t dim = uint64_t{1} << k;
+ 
++    // Read-only sweep of 2^k amplitudes: 1 |z|^2 (denom) + 1 real*complex (z_sign)
++    // + 1 conj-mul-acc (vdot) per amplitude.
++    CLIFFT_COST(CostKernel::EXP_VAL, state.active_k, CLIFFT_POW2K(state.active_k), 0,
++                CLIFFT_POW2K(state.active_k), 0, CLIFFT_POW2K(state.active_k),
++                CLIFFT_POW2K(state.active_k));
++
+     // Reduce on primitive doubles for MSVC OpenMP 2.0 compatibility
+     // (no custom reductions on std::complex).
+     double num_re = 0.0, num_im = 0.0, denominator = 0.0;
+diff --git a/src/python/bindings.cc b/src/python/bindings.cc
+index 549a983..0dc968a 100644
+--- a/src/python/bindings.cc
++++ b/src/python/bindings.cc
+@@ -18,6 +18,7 @@
+ #include "clifft/optimizer/tile_axis_fusion_pass.h"
+ #include "clifft/svm/svm.h"
+ #include "clifft/util/config.h"
++#include "clifft/util/cost_meter.h"
+ #include "clifft/util/introspection.h"
+ #include "clifft/util/version.h"
+ 
+@@ -28,6 +29,7 @@
+ #include <nanobind/make_iterator.h>
+ #include <nanobind/nanobind.h>
+ #include <nanobind/ndarray.h>
++#include <nanobind/stl/complex.h>
+ #include <nanobind/stl/optional.h>
+ #include <nanobind/stl/string.h>
+ #include <nanobind/stl/string_view.h>
+@@ -101,6 +103,61 @@ NB_MODULE(_clifft_core, m) {
+         "(statevector >= 4 MB).\n\n"
+         "Returns 1 if Clifft was built without OpenMP support.");
+ 
++    // -------------------------------------------------------------------------
++    // CostMeter: read-only algorithmic-FLOP / work accounting (benchmarking).
++    // Records one event per SVM dense-kernel call; never alters numerics.
++    // -------------------------------------------------------------------------
++    m.def("cost_meter_enable", [](bool e) { clifft::cost_meter().enabled = e; }, nb::arg("enable"),
++          "Enable/disable the SVM dense-kernel CostMeter (read-only work accounting).");
++    m.def("cost_meter_enabled", []() { return clifft::cost_meter().enabled; },
++          "Return whether the CostMeter is currently enabled.");
++    m.def("cost_meter_reset", []() { clifft::cost_meter().reset(); },
++          "Zero all CostMeter per-kernel counters.");
++    m.def(
++        "cost_meter_snapshot",
++        []() {
++            nb::dict out;
++            const auto& cm = clifft::cost_meter();
++            for (int i = 0; i < static_cast<int>(clifft::CostKernel::COUNT); ++i) {
++                const auto& s = cm.stats[i];
++                if (s.calls == 0)
++                    continue;
++                nb::dict d;
++                d["calls"] = s.calls;
++                d["sum_pow2k"] = s.sum_pow2k;
++                d["processed"] = s.processed;
++                d["cmul"] = s.cmul;
++                d["rcmul"] = s.rcmul;
++                d["cadd"] = s.cadd;
++                d["sqmag"] = s.sqmag;
++                d["vdot"] = s.vdot;
++                d["rank_sum"] = s.rank_sum;
++                d["rank_max"] = s.rank_max;
++                out[clifft::cost_kernel_name(i)] = d;
++            }
++            return out;
++        },
++        "Snapshot per-kernel CostMeter counters as {kernel_name: {calls, sum_pow2k, processed, "
++        "cmul, rcmul, cadd, sqmag, vdot, rank_sum, rank_max}}. Apply the FLOP convention "
++        "(cmul=6, rcmul=2, cadd=2, sqmag=4, vdot=8) in Python to get algorithmic FLOPs.");
++    m.def(
++        "cost_meter_rank_histogram",
++        []() {
++            nb::dict out;
++            const auto& cm = clifft::cost_meter();
++            for (int r = 0; r < clifft::CostMeter::kMaxRank; ++r) {
++                if (cm.events_by_rank[r] == 0)
++                    continue;
++                nb::dict d;
++                d["events"] = cm.events_by_rank[r];
++                d["sum_pow2k"] = cm.pow2k_by_rank[r];
++                d["flop"] = cm.flop_by_rank[r];
++                out[nb::int_(r)] = d;
++            }
++            return out;
++        },
++        "Global rank histogram {rank: {events, sum_pow2k, flop}} over all dense-kernel calls.");
++
+     // Sentinel-based enum counts for defensive binding tests.
+     // If a new enum value is added in C++ but not bound in Python,
+     // the test_introspection.py tripwire will catch it.
+@@ -693,6 +750,8 @@ NB_MODULE(_clifft_core, m) {
+                     d["weight_im"] = i.math.weight_im;
+                 } else if (i.opcode == clifft::Opcode::OP_ARRAY_U2) {
+                     d["cp_idx"] = i.u2.cp_idx;
++                } else if (i.opcode == clifft::Opcode::OP_ARRAY_U4) {
++                    d["cp_idx"] = i.u4.cp_idx;
+                 } else if (i.opcode == clifft::Opcode::OP_EXP_VAL) {
+                     d["cp_exp_val_idx"] = i.exp_val.cp_exp_val_idx;
+                     d["exp_val_idx"] = i.exp_val.exp_val_idx;
+@@ -711,6 +770,8 @@ NB_MODULE(_clifft_core, m) {
+         .def_prop_ro("num_qubits", [](const clifft::CompiledModule& p) { return p.num_qubits; })
+         .def_prop_ro("num_measurements",
+                      [](const clifft::CompiledModule& p) { return p.num_measurements; })
++        .def_prop_ro("total_meas_slots",
++                     [](const clifft::CompiledModule& p) { return p.total_meas_slots; })
+         .def_prop_ro("num_detectors",
+                      [](const clifft::CompiledModule& p) { return p.num_detectors; })
+         .def_prop_ro("num_observables",
+@@ -793,6 +854,108 @@ NB_MODULE(_clifft_core, m) {
+             nb::rv_policy::move,
+             "Per-site total fault probabilities: quantum noise sites followed by\n"
+             "readout noise entries. Use for Poisson-Binomial PMF computation.")
++        .def_prop_ro(
++            "pauli_masks",
++            [](const clifft::CompiledModule& p) {
++                nb::list masks;
++                for (size_t i = 0; i < p.constant_pool.pauli_masks.size(); ++i) {
++                    auto m = p.constant_pool.pauli_masks.at(
++                        static_cast<clifft::PauliMaskHandle>(i));
++                    nb::dict d;
++                    d["x_words"] = std::vector<uint64_t>(m.x().words.begin(), m.x().words.end());
++                    d["z_words"] = std::vector<uint64_t>(m.z().words.begin(), m.z().words.end());
++                    d["sign"] = m.sign();
++                    masks.append(d);
++                }
++                return masks;
++            },
++            "Constant-pool Pauli masks used by OP_APPLY_PAULI.")
++        .def_prop_ro(
++            "noise_sites",
++            [](const clifft::CompiledModule& p) {
++                nb::list sites;
++                for (const auto& site : p.constant_pool.noise_sites) {
++                    nb::list channels;
++                    for (const auto& ch : site.channels) {
++                        auto m = p.constant_pool.noise_channel_masks.at(ch.mask);
++                        nb::dict d;
++                        d["prob"] = ch.prob;
++                        d["x_words"] =
++                            std::vector<uint64_t>(m.x().words.begin(), m.x().words.end());
++                        d["z_words"] =
++                            std::vector<uint64_t>(m.z().words.begin(), m.z().words.end());
++                        channels.append(d);
++                    }
++                    sites.append(channels);
++                }
++                return sites;
++            },
++            "Noise sites as channel lists with per-channel probability and Pauli mask words.")
++        .def_prop_ro(
++            "fused_u2_nodes",
++            [](const clifft::CompiledModule& p) {
++                nb::list nodes;
++                for (const auto& node : p.constant_pool.fused_u2_nodes) {
++                    nb::dict d;
++                    nb::list matrices;
++                    nb::list gammas;
++                    nb::list out_states;
++                    for (int state = 0; state < 4; ++state) {
++                        nb::list mat;
++                        for (const auto& z : node.matrices[state])
++                            mat.append(z);
++                        matrices.append(mat);
++                        gammas.append(node.gamma_multipliers[state]);
++                        out_states.append(node.out_states[state]);
++                    }
++                    d["matrices"] = matrices;
++                    d["gamma_multipliers"] = gammas;
++                    d["out_states"] = out_states;
++                    nodes.append(d);
++                }
++                return nodes;
++            },
++            "Fused OP_ARRAY_U2 constant-pool nodes.")
++        .def_prop_ro(
++            "fused_u4_nodes",
++            [](const clifft::CompiledModule& p) {
++                nb::list nodes;
++                for (const auto& node : p.constant_pool.fused_u4_nodes) {
++                    nb::dict d;
++                    nb::list entries;
++                    for (const auto& entry : node.entries) {
++                        nb::dict e;
++                        nb::list mat;
++                        for (int r = 0; r < 4; ++r) {
++                            nb::list row;
++                            for (int c = 0; c < 4; ++c)
++                                row.append(entry.matrix[r][c]);
++                            mat.append(row);
++                        }
++                        e["matrix"] = mat;
++                        e["gamma_multiplier"] = entry.gamma_multiplier;
++                        e["out_state"] = entry.out_state;
++                        entries.append(e);
++                    }
++                    d["entries"] = entries;
++                    nodes.append(d);
++                }
++                return nodes;
++            },
++            "Fused OP_ARRAY_U4 constant-pool nodes.")
++        .def_prop_ro(
++            "readout_noise",
++            [](const clifft::CompiledModule& p) {
++                nb::list entries;
++                for (const auto& entry : p.constant_pool.readout_noise) {
++                    nb::dict d;
++                    d["meas_idx"] = entry.meas_idx;
++                    d["prob"] = entry.prob;
++                    entries.append(d);
++                }
++                return entries;
++            },
++            "Readout-noise entries as measurement-index/probability dictionaries.")
+         .def("__repr__", [](const clifft::CompiledModule& p) {
+             return "Program(" + std::to_string(p.bytecode.size()) +
+                    " instructions, peak_rank=" + std::to_string(p.peak_rank) + ", " +
+@@ -1034,19 +1197,21 @@ NB_MODULE(_clifft_core, m) {
+         "filled when keep_records=True; otherwise they are empty (rows=0).");
+ 
+     nb::class_<clifft::SchrodingerState>(m, "State", "Schrodinger VM execution state")
+-        .def(nb::new_([](uint32_t peak_rank, uint32_t num_measurements, uint32_t num_detectors,
+-                         uint32_t num_observables, uint32_t num_exp_vals,
++        .def(nb::new_([](uint32_t peak_rank, uint32_t num_measurements, uint32_t num_qubits,
++                         uint32_t num_detectors, uint32_t num_observables, uint32_t num_exp_vals,
+                          std::optional<uint64_t> seed) {
+                  return clifft::SchrodingerState({.peak_rank = peak_rank,
+                                                   .num_measurements = num_measurements,
++                                                  .num_qubits = num_qubits,
+                                                   .num_detectors = num_detectors,
+                                                   .num_observables = num_observables,
+                                                   .num_exp_vals = num_exp_vals,
+                                                   .seed = seed});
+              }),
+              nb::kw_only(), nb::arg("peak_rank"), nb::arg("num_measurements"),
+-             nb::arg("num_detectors") = 0, nb::arg("num_observables") = 0,
+-             nb::arg("num_exp_vals") = 0, nb::arg("seed") = nb::none())
++             nb::arg("num_qubits") = 0, nb::arg("num_detectors") = 0,
++             nb::arg("num_observables") = 0, nb::arg("num_exp_vals") = 0,
++             nb::arg("seed") = nb::none())
+         .def("reset", &clifft::SchrodingerState::reset)
+         .def("reseed", &clifft::SchrodingerState::reseed, nb::arg("seed"))
+         .def_prop_ro("dust_clamps", [](const clifft::SchrodingerState& s) { return s.dust_clamps; })
