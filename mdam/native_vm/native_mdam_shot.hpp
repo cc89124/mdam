@@ -195,9 +195,36 @@ struct MdamShot {
     // two ids, which would read as a spurious "key insufficient").  Persists across shots -> stable global ids.
     std::unordered_map<uint64_t,std::vector<int>> bcap_intern; std::vector<std::vector<cd>> bcap_amp;
     std::vector<cd> bcap_buf;
+    // mc_canon (default OFF): intern sids by the global-phase-canonical form rounded to a 1e-9 grid,
+    // so representation variants (global phase / FP-path ulp) of one physical state share one sid and
+    // the boundary automaton merges their nodes/edges.  The STORED state stays the raw FIRST member
+    // (representative): a merge-hit adopts the representative's exact amplitudes, so the per-hit state
+    // deviation is bounded by the intra-class spread (typ. ~1e-15, grid-worst ~1e-9) and records are
+    // exact up to Born draws landing inside that window (~1e-8/run scale).  Set BEFORE any shot runs;
+    // do not flip mid-run (grid and raw fingerprints share bcap_intern).
+    int mc_canon=0;
+    std::vector<std::vector<long long>> bcap_canon; std::vector<long long> bcap_cbuf;
     int bcap_sid(const cd* a, int rank){
         size_t N=(size_t)1<<rank; bcap_buf.resize(N);
         for(size_t j=0;j<N;j++) bcap_buf[j]=cd(a[j].real()+0.0, a[j].imag()+0.0);   // canonicalize signed zero
+        if(mc_canon){
+            bcap_cbuf.resize(2*N);
+            size_t j0=0; while(j0<N && std::norm(bcap_buf[j0])<1e-18) j0++;      // same rule as nvm_diag_compress
+            cd ph=(j0<N)? bcap_buf[j0]/std::abs(bcap_buf[j0]) : cd(1,0);
+            // z = amp * conj(ph) * 1e9 (grid scale folded), manual round-half-away -> vectorizable
+            // (complex division per amplitude was the dominant cost of the canonical transform)
+            const double pr=ph.real()*1e9, pi=-ph.imag()*1e9;
+            const double* b=reinterpret_cast<const double*>(bcap_buf.data());
+            for(size_t j=0;j<N;j++){ double ar=b[2*j], ai=b[2*j+1];
+                double zr=ar*pr-ai*pi, zi=ai*pr+ar*pi;
+                bcap_cbuf[2*j]  =(long long)(zr+(zr>=0.0?0.5:-0.5));
+                bcap_cbuf[2*j+1]=(long long)(zi+(zi>=0.0?0.5:-0.5)); }
+            uint64_t fp=dfnv(1469598103934665603ULL, bcap_cbuf.data(), sizeof(long long)*2*N);
+            auto& cand=bcap_intern[fp];
+            for(int id:cand){ if(bcap_canon[id].size()==2*N){ bool eq=true;
+                for(size_t j=0;j<2*N;j++) if(bcap_canon[id][j]!=bcap_cbuf[j]){eq=false;break;} if(eq) return id; } }
+            int id=(int)bcap_amp.size(); bcap_amp.emplace_back(bcap_buf); bcap_canon.emplace_back(bcap_cbuf);
+            cand.push_back(id); return id; }
         uint64_t fp=dfnv(1469598103934665603ULL, bcap_buf.data(), sizeof(cd)*N);
         auto& cand=bcap_intern[fp];
         for(int id:cand){ if(bcap_amp[id].size()==N){ bool eq=true; for(size_t j=0;j<N;j++) if(bcap_amp[id][j]!=bcap_buf[j]){eq=false;break;} if(eq) return id; } }
@@ -262,7 +289,7 @@ struct MdamShot {
     void mc_reset(){ mc_pool.clear(); mc_pool_idx.clear(); mc_edges.clear(); mc_pool_bytes_live=0;
         mc_hit=mc_miss=mc_partial=mc_antis=mc_verify=mc_mismatch=mc_restore=0;
         for(int i=0;i<8;i++){ mc_cyc[i]=0; mc_opcyc[i]=0; }
-        bcap_intern.clear(); bcap_amp.clear(); }
+        bcap_intern.clear(); bcap_amp.clear(); bcap_canon.clear(); }
     // Actual heavy memory of the mcache: each pooled EngSnap holds a 2^r dense core (dominant term, 16B/amp).
     // A non-saturating circuit grows mc_pool one snapshot per distinct post-boundary state -> unbounded.  Used
     // by the adaptive memory guard so a runaway probation demotes to AUTH BEFORE OOM (not just ln_id count).

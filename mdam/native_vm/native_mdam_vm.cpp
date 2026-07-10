@@ -610,6 +610,10 @@ void nvm_mcache_set_fblock(void* vm, int t){ reinterpret_cast<MdamShot*>(vm)->mc
 // mc_pool_off: skip run_mcache's pool-snapshot interning (lean-walk builds need only the sg tables; the pool
 // is the memory hog that trips the adaptive budget).  Records bit-identical (fallback boundaries stay live).
 void nvm_mc_pool_off(void* vm, int t){ reinterpret_cast<MdamShot*>(vm)->mc_pool_off=(t!=0); }
+// mc_canon (default OFF): canonical (phase + 1e-9 grid) sid interning -> boundary automaton merges
+// representation variants of one physical state.  Records exact up to ~1e-8/run Born-window flips
+// (see bcap_sid comment).  Set on a fresh VM before any shot; do not flip mid-run.
+void nvm_mc_canon(void* vm, int t){ reinterpret_cast<MdamShot*>(vm)->mc_canon=(t!=0); }
 void nvm_mcache_opcyc_get(void* vm, uint64_t* out){ auto& s=*reinterpret_cast<MdamShot*>(vm); for(int i=0;i<8;i++) out[i]=s.mc_opcyc[i]; }
 int nvm_mdam_run_mcache(void* prog, void* vm, uint64_t shi, uint64_t slo, uint64_t ihi, uint64_t ilo,
                         uint8_t* out_record, char* out_err, int errlen){
@@ -681,6 +685,29 @@ void nvm_diag_compress(void* vm, long* out){
         se.insert(he); sr.insert(hr); sp.insert(hp); sm.insert(hm);
     }
     out[0]=(long)se.size(); out[1]=(long)sr.size(); out[2]=(long)sp.size(); out[3]=(long)sm.size();
+}
+// DIAGNOSTIC companion: per-sid canonical-class map over bcap_amp, so the caller can rewrite
+// captured boundary-key tuples (mp,kind,sid,inv,pend,m) with sid -> class and count merged keys.
+// mode 0 = rounded(1e-9) only; mode 1 = global-phase-canonical + rounded(1e-9) (same rule as
+// nvm_diag_compress out[2]).  Returns nsids; if cap<nsids fills nothing and returns -nsids.
+long nvm_diag_canon_map(void* vm, int mode, long* out_map, long cap){
+    auto& s=*reinterpret_cast<MdamShot*>(vm);
+    long n=(long)s.bcap_amp.size();
+    if(!out_map || cap<n) return -n;
+    const double g=1e-9; auto rnd=[&](double x){ return (long long)std::llround(x/g); };
+    auto fnv=[&](uint64_t h,long long v){ h^=(uint64_t)v; h*=1099511628211ULL; return h; };
+    std::unordered_map<uint64_t,long> cls;
+    for(long i=0;i<n;i++){ auto& blk=s.bcap_amp[i]; size_t N=blk.size();
+        std::complex<double> ph(1,0);
+        if(mode==1){ size_t j0=0; while(j0<N && std::norm(blk[j0])<1e-18) j0++;
+            if(j0<N) ph=blk[j0]/std::abs(blk[j0]); }
+        uint64_t h=fnv(1469598103934665603ULL,(long long)N);
+        for(size_t j=0;j<N;j++){ std::complex<double> z=blk[j]/ph;
+            h=fnv(fnv(h,rnd(z.real())),rnd(z.imag())); }
+        auto it=cls.find(h); long c;
+        if(it==cls.end()){ c=(long)cls.size(); cls.emplace(h,c); } else c=it->second;
+        out_map[i]=c; }
+    return n;
 }
 void nvm_lean_reset_counts(void* vm){ auto& s=*reinterpret_cast<MdamShot*>(vm); s.ln_incomplete_shots=0; s.ln_miss=0; s.ln_fb_count=0; }
 void nvm_lean_stats(void* vm, long* out){ auto& s=*reinterpret_cast<MdamShot*>(vm);
