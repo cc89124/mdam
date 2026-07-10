@@ -176,7 +176,7 @@ def run_batch(stim_text, N, seed=40000, cfg=None, cache_dir=None, log=lambda s: 
             seg("cruise/leanfb",n_rem,run_leanfb); return
         so,hit2,cw=cg.get_so_cached(cpp,cache_dir=d); info.update(cache_hit=hit2, compile_s=cw)
         g=ctypes.CDLL(so); g.gen_run_lean_fb_batch.restype=C; g.gen_run_lean_fb_batch.argtypes=[P_,P_,U]+[U]*4+[P_,P_,C]
-        run_genfb=lambda n,buf: g.gen_run_lean_fb_batch(ph,vm,n,*pcg(seed+done),buf.ctypes.data,eb,256)
+        run_genfb=lambda n,buf: g.gen_run_lean_fb_batch(ph,vm,n,*pcg(seed+done+bump*7919),buf.ctypes.data,eb,256)
         # RACE (both chunks are real output shots)
         r=min(c["RACE"],(N-done)//2)
         if r>0:
